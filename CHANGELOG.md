@@ -4,6 +4,25 @@ All notable changes to **hermes-livekit** are documented here, in the format
 of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-05-15
+
+### Fixed
+
+- **Adapter operational logs now actually reach `gateway.log`**. v0.2.0's
+  `logger.setLevel(INFO)` was the right idea but the wrong fix: hermes
+  core installs a component filter on the gateway log handler that only
+  admits records from loggers whose name starts with one of the registered
+  component prefixes (`gateway`, `agent`, `tools`, `cli`, `cron`). Our
+  `hermes_livekit.adapter` logger fell outside the allowlist and records
+  were dropped at the handler stage regardless of level. The logger is
+  now created with the explicit name `gateway.platforms.livekit`,
+  matching the convention every built-in platform adapter uses (and
+  what the kortexa branch's core-resident version uses). Output is
+  byte-identical whether the platform lives in core or as this plugin.
+- `HERMES_LIVEKIT_LOG_LEVEL` semantics adjusted accordingly: unset →
+  inherit from hermes's root logger config (INFO under the standard
+  gateway setup); a value override-sets the level only when present.
+
 ## [0.2.0] — 2026-05-15
 
 ### Added
@@ -80,5 +99,6 @@ of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
   toolset registration. Zero core hermes-agent edits required to install.
 - Pinned dependencies: `livekit==1.1.7`, `livekit-api==1.1.0`.
 
+[0.2.1]: https://github.com/kortexa-ai/hermes-livekit/releases/tag/v0.2.1
 [0.2.0]: https://github.com/kortexa-ai/hermes-livekit/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kortexa-ai/hermes-livekit/releases/tag/v0.1.0

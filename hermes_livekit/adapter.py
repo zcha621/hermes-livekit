@@ -64,31 +64,39 @@ from gateway.platforms.base import (
     SendResult,
 )
 
-logger = logging.getLogger(__name__)
+# Use the ``gateway.platforms.livekit`` namespace rather than ``__name__``.
+# Hermes core's gateway.log handler installs a component filter that only
+# admits records from loggers whose name starts with one of the component
+# prefixes (``gateway`` is one of them — see ``hermes_logging.py``
+# ``COMPONENT_PREFIXES``). Loggers outside that allowlist get dropped at
+# the handler stage regardless of their own level. Adopting the
+# ``gateway.platforms.<adapter>`` convention is also what the kortexa
+# branch's core-resident version does, so the log output is
+# byte-identical whether the LiveKit platform lives in core or here.
+logger = logging.getLogger("gateway.platforms.livekit")
 
-# Hermes-agent core modules inherit INFO from hermes's logging config. As a
-# pip-installed third-party package we don't, so without an explicit setLevel
-# our adapter's INFO-level operational logs ("Audio track subscribed",
-# "captured frame...", "Utterance from ...") get filtered out at WARNING and
-# never reach gateway.log.
-#
-# Default to INFO to match the rest of hermes. Override via
-# ``HERMES_LIVEKIT_LOG_LEVEL=DEBUG`` (or WARNING / ERROR / a numeric value)
-# in the env when you need a different verbosity without touching code.
-def _resolve_log_level() -> int:
+
+# Allow operators to dial verbosity without editing code:
+#   HERMES_LIVEKIT_LOG_LEVEL=DEBUG    # noisy
+#   HERMES_LIVEKIT_LOG_LEVEL=WARNING  # quiet
+#   HERMES_LIVEKIT_LOG_LEVEL=20       # numeric also accepted
+# Unset → inherit from hermes's root logger config (INFO under the standard
+# gateway setup), matching every other built-in adapter.
+def _apply_env_log_level() -> None:
     raw = os.getenv("HERMES_LIVEKIT_LOG_LEVEL", "").strip()
     if not raw:
-        return logging.INFO
-    # numeric? (e.g. HERMES_LIVEKIT_LOG_LEVEL=20)
+        return
     try:
-        return int(raw)
+        logger.setLevel(int(raw))
+        return
     except ValueError:
         pass
     level = logging.getLevelName(raw.upper())
-    return level if isinstance(level, int) else logging.INFO
+    if isinstance(level, int):
+        logger.setLevel(level)
 
 
-logger.setLevel(_resolve_log_level())
+_apply_env_log_level()
 
 # Voice detection
 SILENCE_THRESHOLD_SECONDS = 1.5   # seconds of silence → end of utterance
