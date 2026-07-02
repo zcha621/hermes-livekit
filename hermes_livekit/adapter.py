@@ -320,13 +320,18 @@ class LiveKitAdapter(BasePlatformAdapter):
 
     # -- Connection lifecycle -----------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Start the LiveKit adapter.
 
         Presence-aware: if the room already has at least one remote
         participant, join immediately. Otherwise stay out and run a
         presence watcher that joins as soon as someone arrives. Either
         way the adapter is "connected" from the gateway's point of view.
+
+        ``is_reconnect`` is part of the BasePlatformAdapter.connect
+        contract (the gateway's reconnection watcher passes it); this
+        adapter has no cold-boot vs reconnect distinction, so it is
+        accepted and ignored.
         """
         if not LIVEKIT_AVAILABLE:
             logger.warning("[%s] livekit SDK not installed. Run: pip install hermes-livekit", self.name)
