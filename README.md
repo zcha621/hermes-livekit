@@ -2,9 +2,9 @@
 
 Hermes LiveKit is a platform plugin that connects the Hermes agent gateway to a LiveKit room over WebRTC. It lets the agent listen to speech from room participants, accept typed text from the LiveKit data channel, send the text into the Hermes LLM pipeline, and play the response back into the room as audio.
 
-This repo is meant to live directly under your Hermes plugins folder, which matches your current setup:
+This repo is meant to live directly under your Hermes plugins folder, using the repository root as the plugin folder:
 
-`C:\Users\zcha621\AppData\Local\hermes\plugins\livekit`
+`C:\Users\zcha621\AppData\Local\hermes\plugins\hermes-livekit`
 
 ## What it does
 
@@ -23,9 +23,9 @@ This repo is meant to live directly under your Hermes plugins folder, which matc
 
 ## Setup
 
-If you already copied this folder into `C:\Users\zcha621\AppData\Local\hermes\plugins\livekit`, you do not need to move it anywhere else.
+If you already copied this repository into `C:\Users\zcha621\AppData\Local\hermes\plugins\hermes-livekit`, you do not need to move it anywhere else.
 
-1. Keep the plugin files in the Hermes plugins directory.
+1. Keep the repository root in the Hermes plugins directory.
 2. Make sure Hermes knows about the plugin in `C:\Users\zcha621\AppData\Local\hermes\config.yaml`:
 
 ```yaml

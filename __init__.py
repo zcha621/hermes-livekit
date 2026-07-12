@@ -7,9 +7,15 @@ point uses an existing ``register_platform()`` hook.
 
 import logging
 import os
+import sys
+from pathlib import Path
 from typing import Optional
 
-from .adapter import LIVE_ADAPTERS, LiveKitAdapter, check_livekit_requirements
+_PLUGIN_DIR = str(Path(__file__).resolve().parent)
+if _PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, _PLUGIN_DIR)
+
+from adapter import LIVE_ADAPTERS, LiveKitAdapter, check_livekit_requirements
 
 logger = logging.getLogger("gateway.platforms.livekit")
 
