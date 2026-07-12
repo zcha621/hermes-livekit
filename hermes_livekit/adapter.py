@@ -202,6 +202,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._audio_buffers: Dict[str, bytearray] = {}
         self._last_audio_time: Dict[str, float] = {}
         self._audio_streams: Dict[str, asyncio.Task] = {}
+        self._audio_stream_handles: Dict[str, Any] = {}
 
         # Pause audio capture during TTS playback
         self._paused = False
@@ -487,6 +488,8 @@ class LiveKitAdapter(BasePlatformAdapter):
                 pass
             self._silence_task = None
 
+        await self._close_all_audio_streams()
+
         # Cancel all audio stream tasks
         for task in self._audio_streams.values():
             task.cancel()
@@ -612,6 +615,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             # silence would accrue a stale timestamp and eventually trip an
             # utterance.
             stream = rtc.AudioStream(track)
+            self._audio_stream_handles[identity] = stream
             task = asyncio.create_task(self._audio_receive_loop(stream, identity))
             self._audio_streams[identity] = task
             return
@@ -686,6 +690,8 @@ class LiveKitAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._silence_task = None
+
+        await self._close_all_audio_streams()
 
         for task in self._audio_streams.values():
             task.cancel()
@@ -833,9 +839,24 @@ class LiveKitAdapter(BasePlatformAdapter):
         task = self._audio_streams.pop(identity, None)
         if task:
             task.cancel()
+        stream = self._audio_stream_handles.pop(identity, None)
+        if stream is not None:
+            try:
+                asyncio.create_task(stream.aclose())
+            except RuntimeError:
+                pass
         self._audio_buffers.pop(identity, None)
         self._last_audio_time.pop(identity, None)
         self._speaking_participants.discard(identity)
+
+    async def _close_all_audio_streams(self) -> None:
+        """Close all subscribed LiveKit audio streams."""
+        for identity, stream in list(self._audio_stream_handles.items()):
+            try:
+                await stream.aclose()
+            except Exception as e:
+                logger.debug("[%s] audio stream close failed for %s: %s", self.name, identity, e)
+        self._audio_stream_handles.clear()
 
     # -- Audio capture and processing ---------------------------------------
 
