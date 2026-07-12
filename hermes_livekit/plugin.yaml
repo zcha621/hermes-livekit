@@ -1,0 +1,21 @@
+# plugin.yaml
+name: hermes-livekit
+label: LiveKit WebRTC
+kind: platform
+version: 1.0.0
+description: LiveKit WebRTC voice gateway plugin for Hermes
+author: kortexa-ai
+
+requires_env:
+  - name: LIVEKIT_URL
+    description: "The WebSocket URL for your LiveKit server"
+    prompt: "LiveKit URL (e.g., wss://your-instance.livekit.cloud)"
+    password: false
+  - name: LIVEKIT_API_KEY
+    description: "Your LiveKit Project API Key"
+    prompt: "LiveKit API Key"
+    password: false
+  - name: LIVEKIT_API_SECRET
+    description: "Your LiveKit Project API Secret"
+    prompt: "LiveKit API Secret"
+    password: true # Hides the input in the CLI UI

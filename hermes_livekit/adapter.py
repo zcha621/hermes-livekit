@@ -1,4 +1,4 @@
-"""LiveKit voice platform adapter using WebRTC.
+﻿"""LiveKit voice platform adapter using WebRTC.
 
 Joins a LiveKit room as a participant, transcribes inbound audio via
 Hermes's STT pipeline, feeds transcripts into the agent loop, and publishes
@@ -535,6 +535,55 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         logger.info("[%s] Disconnected", self.name)
 
+    async def handle_message(self, event) -> None:
+        """Process incoming text messages (from voice STT or direct browser chatbox).
+        
+        Accepts either a LiveKit DataPacket (voice input path) or a Hermes MessageEvent 
+        (direct text message from browser chatbox).
+        """
+        # Determine if this is a DataPacket (voice path) or MessageEvent (text path).
+        # The base platform adapter owns actual message dispatch; this method
+        # only normalizes LiveKit packets into MessageEvent objects.
+        if hasattr(event, "data") and hasattr(event, "topic"):
+            # This is a LiveKit DataPacket - voice input path
+            packet = event
+            participant = getattr(packet, "participant", None)
+            identity = getattr(participant, "identity", "") if participant else ""
+            
+            try:
+                import json as _json
+                msg = _json.loads(packet.data.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                logger.debug("[%s] handle_message: undecodable DataPacket payload", self.name)
+                return
+            
+            transcript = msg.get("transcript", "")
+            if not transcript.strip():
+                logger.debug("[%s] handle_message: empty transcript", self.name)
+                return
+
+            msg_event = MessageEvent(
+                text=transcript,
+                message_type=MessageType.VOICE,
+                source=self.build_source(
+                    chat_id=self._room_name,
+                    chat_name=self._room_name,
+                    chat_type="group",
+                    user_id=identity,
+                    user_name=identity,
+                ),
+                message_id=getattr(packet, "id", uuid.uuid4().hex[:12]),
+                media_urls=[],
+                media_types=[],
+                timestamp=datetime.now(tz=timezone.utc),
+            )
+            await super().handle_message(msg_event)
+            return
+
+        await super().handle_message(event)
+
+
+
     # -- LiveKit event handlers ---------------------------------------------
 
     def _on_track_subscribed(
@@ -986,7 +1035,6 @@ class LiveKitAdapter(BasePlatformAdapter):
 
     def _on_data_received(self, packet) -> None:
         """Route inbound data-channel packets.
-
         Called synchronously by the SDK's event thread; heavy work is
         kicked off as asyncio tasks. JSON payloads on the
         ``hermes-control`` topic are dispatched by their ``type`` field;
@@ -994,26 +1042,45 @@ class LiveKitAdapter(BasePlatformAdapter):
         unrelated apps sharing the same data channel without spamming logs).
         """
         topic = getattr(packet, "topic", None) or ""
-        if topic != self.DATA_CHANNEL_CONTROL_TOPIC:
-            return
-
+        # Handle all topics - browser chatbox sends text on any topic
         participant = getattr(packet, "participant", None)
         participant_identity = (
             getattr(participant, "identity", "") if participant is not None else ""
         )
 
+        raw_payload = b""
+        try:
+            raw_payload = bytes(packet.data)
+        except Exception:
+            raw_payload = b""
+        raw_text = raw_payload.decode("utf-8", errors="replace").strip()
+
         try:
             import json as _json
-            msg = _json.loads(packet.data.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError) as exc:
-            logger.warning(
-                "[%s] %s: undecodable payload from %s: %s",
-                self.name, self.DATA_CHANNEL_CONTROL_TOPIC,
-                participant_identity or "?", exc,
-            )
+            msg = _json.loads(raw_text) if raw_text.startswith(("{", "[")) else None
+        except (UnicodeDecodeError, ValueError):
+            msg = None
+
+        # Check if this is a text message (from browser chatbox) vs voice transcript.
+        # Support both JSON envelopes and plain string payloads because browser
+        # textbox clients may publish raw text directly on the data channel.
+        msg_type = msg.get("type", "") if isinstance(msg, dict) else ""
+        text_content = ""
+        if isinstance(msg, dict):
+            text_content = (
+                str(msg.get("content") or msg.get("text") or msg.get("message") or "")
+            ).strip()
+        elif raw_text:
+            text_content = raw_text
+
+        is_text_message = bool(text_content) or msg_type == "text" or bool(participant_identity)
+
+        if not is_text_message:
+            logger.debug("[%s] %s: ignoring non-text message from %s", self.name, topic, participant_identity or "?")
             return
 
-        msg_type = msg.get("type", "") if isinstance(msg, dict) else ""
+        if not msg_type:
+            msg_type = "text" if text_content else ""
         if not msg_type:
             logger.debug("[%s] %s: payload missing 'type'", self.name, self.DATA_CHANNEL_CONTROL_TOPIC)
             return
@@ -1028,6 +1095,24 @@ class LiveKitAdapter(BasePlatformAdapter):
             "client:tool-unregister": lambda: self._unregister_client_tool(msg, participant_identity),
             "client:tool-result": lambda: self._handle_tool_result(msg, participant_identity),
         }
+
+        # Handle direct text messages (browser chatbox input)
+        if is_text_message and msg_type == "text":
+            asyncio.create_task(self.handle_message(MessageEvent(
+                text=text_content,
+                message_type=MessageType.VOICE,
+                source=self.build_source(
+                    chat_id=self._room_name,
+                    chat_name=self._room_name,
+                    chat_type="direct",
+                    user_id=participant_identity,
+                    user_name=participant_identity,
+                ),
+                message_id=msg.get("id", uuid.uuid4().hex[:12]),
+                media_urls=[],
+                media_types=[],
+                timestamp=datetime.now(tz=timezone.utc),
+            )))
         handler = handlers.get(msg_type)
         if handler is None:
             logger.debug("[%s] unknown control type %r from %s", self.name, msg_type, participant_identity or "?")
@@ -1514,6 +1599,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         audio_path: str,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        caption: Optional[str] = None,
     ) -> SendResult:
         """Play TTS audio into the LiveKit room via the published audio track."""
         if not self._audio_source or not self._room:
@@ -1522,6 +1608,12 @@ class LiveKitAdapter(BasePlatformAdapter):
         try:
             # Pause capture to avoid echo
             self._paused = True
+
+            if caption:
+                await self._publish_agent_event(
+                    "agent:agent-transcript",
+                    {"transcript": caption, "final": True},
+                )
 
             # Decode audio file to raw PCM using ffmpeg
             pcm_data = await asyncio.to_thread(
@@ -1648,3 +1740,4 @@ class LiveKitAdapter(BasePlatformAdapter):
             "chat_id": chat_id,
             "participants": participants,
         }
+

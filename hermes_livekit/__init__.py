@@ -53,13 +53,13 @@ def _on_agent_loop_stopped_hook(**kwargs) -> None:
             logger.debug("loop-stopped cleanup failed for %s: %s", adapter, exc)
 
 
-_LIVEKIT_PLATFORM_HINT = (
-    "You are communicating via a LiveKit voice channel (WebRTC). "
-    "The user speaks to you and hears your replies as audio. "
-    "Keep responses concise and conversational — they will be read aloud via TTS. "
-    "Avoid markdown formatting, long lists, code blocks, or URLs. "
-    "Do not include MEDIA: tags. Focus on clear, spoken-word responses."
-)
+_LIVEKIT_PLATFORM_HINT = """You can communicate with the user via voice or text. The user may speak or type messages.
+
+Keep responses concise and natural. Use voice for detailed explanations, text for quick confirmations or sharing links/code.
+
+Use simple formatting; avoid excessive markdown when speaking via TTS.
+
+You can respond with text messages that appear in the chat box alongside voice replies."""
 
 
 def _env_enablement() -> Optional[dict]:
@@ -103,7 +103,9 @@ def _env_enablement() -> Optional[dict]:
 def _is_connected(cfg) -> bool:
     """True when the gateway should consider LiveKit configured.
 
-    Mirrors the ``cfg.extra.get('url')`` check that the kortexa branch
+    Mirrors the ``cfg.extra.get(
+
+url)`` check that the kortexa branch
     inlined in ``_PLATFORM_CONNECTED_CHECKERS``. The url is the load-bearing
     field — without it, neither the SDK nor presence polling can run.
     """
@@ -131,7 +133,7 @@ def _interactive_setup() -> None:
         print("  LIVEKIT_ROOM (default: hermes)")
         return
 
-    print("\nLiveKit setup (press Enter to skip a value)")
+    print("\\nLiveKit setup (press Enter to skip a value)")
     url = input("  LIVEKIT_URL (wss://...): ").strip()
     if url:
         set_env_value("LIVEKIT_URL", url)
@@ -174,7 +176,7 @@ def register(ctx) -> None:
         allowed_users_env="LIVEKIT_ALLOWED_USERS",
         allow_all_env="LIVEKIT_ALLOW_ALL_USERS",
         # Display
-        emoji="🎙️",
+        emoji="🤖‍♂️",
         # LiveKit identities are not phone numbers / emails
         pii_safe=False,
         # /update from a voice channel makes no sense
@@ -208,3 +210,4 @@ def register(ctx) -> None:
         ctx.register_hook("agent_loop_stopped", _on_agent_loop_stopped_hook)
     except Exception as exc:
         logger.debug("hook registration failed: %s", exc)
+

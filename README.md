@@ -1,211 +1,150 @@
-# hermes-livekit
+# Hermes LiveKit Plugin
 
-LiveKit WebRTC voice gateway plugin for [hermes-agent](https://github.com/NousResearch/hermes-agent).
+Hermes LiveKit is a platform plugin that connects the Hermes agent gateway to a LiveKit room over WebRTC. It lets the agent listen to speech from room participants, accept typed text from the LiveKit data channel, send the text into the Hermes LLM pipeline, and play the response back into the room as audio.
 
-Lets a Hermes gateway join a LiveKit room as an agent participant, transcribe
-participant speech via Hermes's STT pipeline, run the agent loop, and publish
-TTS replies back to the room as audio.
+This repo is meant to live directly under your Hermes plugins folder, which matches your current setup:
+
+`C:\Users\zcha621\AppData\Local\hermes\plugins\livekit`
+
+## What it does
+
+- Joins a LiveKit room as a participant.
+- Captures inbound participant audio and turns it into Hermes voice messages.
+- Accepts text messages from the LiveKit data channel and routes them into the same Hermes message pipeline.
+- Publishes agent speech back into the room through a local LiveKit audio track.
+- Emits lightweight lifecycle events for UI state such as listening, thinking, and speaking.
+- Supports optional video frame capture and remote-tool registration from clients.
+
+## Files in this plugin
+
+- `adapter.py` - the LiveKit platform adapter implementation.
+- `plugin.yaml` - plugin metadata and required environment variables.
+- `__init__.py` - package entry point.
+
+## Setup
+
+If you already copied this folder into `C:\Users\zcha621\AppData\Local\hermes\plugins\livekit`, you do not need to move it anywhere else.
+
+1. Keep the plugin files in the Hermes plugins directory.
+2. Make sure Hermes knows about the plugin in `C:\Users\zcha621\AppData\Local\hermes\config.yaml`:
+
+```yaml
+plugins:
+	enabled:
+		- hermes-livekit
+platforms:
+	livekit:
+		enabled: true
+		group_sessions_per_user: false
+		extra:
+			url: ${LIVEKIT_URL}
+			api_key: ${LIVEKIT_API_KEY}
+			api_secret: ${LIVEKIT_API_SECRET}
+			room: ${LIVEKIT_ROOM}
+```
+
+3. Set the LiveKit environment variables in `C:\Users\zcha621\AppData\Local\hermes\.env` or in your shell.
+4. Start the gateway with the usual Hermes command, then join the LiveKit room from a browser or client.
+
+If Hermes cannot import the LiveKit SDK packages yet, install the plugin dependencies in the same Python environment that runs Hermes. The easiest path is:
+
+```bash
+pip install hermes-livekit
+```
+
+If you prefer to keep the local folder copy and only install dependencies, you can use that package as a convenience install for the LiveKit Python SDKs.
 
 ## Requirements
 
-- An existing `hermes-agent` install (this plugin attaches to it; it does not
-  vendor hermes itself).
-- `ffmpeg` on `PATH` — used to decode TTS audio for the WebRTC publish path.
-  - macOS: `brew install ffmpeg`
-  - Debian / Ubuntu: `sudo apt install ffmpeg`
-- A reachable LiveKit server (LiveKit Cloud or self-hosted) with an API key /
-  secret pair.
+Hermes must be able to load this local plugin folder and import the LiveKit runtime dependencies.
 
-## Install
+At minimum, the runtime needs the LiveKit SDKs that `adapter.py` imports, plus `ffmpeg` on `PATH` for TTS decoding.
 
-Install into the **same Python environment** as your `hermes-agent`:
+The plugin also expects these LiveKit environment variables:
 
-```bash
-pip install git+https://github.com/kortexa-ai/hermes-livekit.git
+- `LIVEKIT_URL`
+- `LIVEKIT_API_KEY`
+- `LIVEKIT_API_SECRET`
+
+Optional variables:
+
+- `LIVEKIT_ROOM` - room name, defaults to `hermes`
+- `LIVEKIT_AGENT_NAME` - display name for the agent, defaults to `Hermes`
+- `LIVEKIT_AGENT_AVATAR` - avatar URL or local file path
+- `LIVEKIT_PRESENCE_POLL_INTERVAL` - override the room presence poll interval
+- `HERMES_LIVEKIT_LOG_LEVEL` - logging verbosity for this adapter
+- `HERMES_LIVEKIT_TOOL_TIMEOUT_SEC` - timeout for remote tool calls
+
+## Configuration
+
+The plugin metadata is defined in `plugin.yaml`. It declares the required LiveKit credentials and identifies this plugin as a Hermes platform plugin.
+
+The plugin entry point in `__init__.py` registers the `livekit` platform, seeds configuration from your `LIVEKIT_*` env vars, and exposes a small interactive setup helper for Hermes when available.
+
+If you want to set the values manually, you can use environment variables like this:
+
+```powershell
+$env:LIVEKIT_URL = "wss://your-instance.livekit.cloud"
+$env:LIVEKIT_API_KEY = "your-key"
+$env:LIVEKIT_API_SECRET = "your-secret"
 ```
 
-pip resolves the pinned `livekit` / `livekit-api` SDK versions automatically.
-The plugin is auto-discovered through the `hermes_agent.plugins` entry-point
-group — no edits to hermes-agent's source tree are required.
+Your current `.env` already follows this pattern and only needs valid values for the LiveKit connection fields.
 
-> Note: `hermes plugins install kortexa-ai/hermes-livekit` is **not** the
-> right path for this plugin. That command `git clone`s into
-> `~/.hermes/plugins/` without resolving pip deps; you'd then have to
-> `pip install 'livekit==1.1.7' 'livekit-api==1.1.0'` by hand. The pip
-> install above is one command and keeps the SDK pins in sync with the
-> plugin version.
+## How message flow works
 
-### Local / editable install
+### Speech input
 
-For development on a checkout (e.g. `~/src/hermes-livekit/`):
+1. A participant in the LiveKit room publishes an audio track.
+2. The adapter subscribes to that track and buffers the PCM audio.
+3. Silence detection decides when the user has finished speaking.
+4. The buffered audio is written to a temporary WAV file.
+5. Hermes STT transcribes the audio into text.
+6. The adapter wraps the transcript in a Hermes `MessageEvent` and passes it to the gateway base handler.
+7. The Hermes agent runs the LLM, tools, and response logic.
+8. If the response is voice-enabled, Hermes generates TTS audio and the adapter publishes it back into LiveKit.
 
-```bash
-pip install -e ~/src/hermes-livekit
-```
+### Text input
 
-## Enable
+1. A client sends text over the LiveKit data channel.
+2. The adapter normalizes the payload into a Hermes `MessageEvent`.
+3. The same gateway message pipeline runs as for speech.
+4. The response is delivered back to the LiveKit room as text, audio, or both depending on the platform logic.
 
-After install, add `livekit` to the enabled-plugins list:
+## TTS playback
 
-```bash
-hermes plugins enable livekit
-```
+When the gateway decides to speak a response, it calls the adapter's `play_tts()` method with an audio file path. The adapter:
 
-(Or edit `~/.hermes/config.yaml` and add `livekit` to `plugins.enabled`.)
+1. Temporarily pauses inbound capture to reduce echo.
+2. Decodes the TTS audio file to raw PCM using `ffmpeg`.
+3. Feeds the PCM into a LiveKit `AudioSource` in 20 ms frames.
+4. Publishes speaking lifecycle events for client UIs.
+5. Resumes normal capture after playback ends.
 
-Then enable the platform in the same config:
+## Troubleshooting
 
-```yaml
-platforms:
-  livekit:
-    enabled: true
-plugins:
-  enabled:
-    - livekit
-```
+### The adapter does not connect
 
-## Configure
+Check that the LiveKit SDK is installed and the credentials are correct.
 
-Set these env vars (or supply equivalents under `platforms.livekit.extra`
-in `~/.hermes/config.yaml`):
+- `LIVEKIT_URL`
+- `LIVEKIT_API_KEY`
+- `LIVEKIT_API_SECRET`
 
-| Var                              | Required | Notes                                                              |
-|----------------------------------|----------|--------------------------------------------------------------------|
-| `LIVEKIT_URL`                    | yes      | `wss://your-project.livekit.cloud` or `wss://your-self-hosted/`    |
-| `LIVEKIT_API_KEY`                | yes      | from your LiveKit project / server config                          |
-| `LIVEKIT_API_SECRET`             | yes      | from your LiveKit project / server config                          |
-| `LIVEKIT_ROOM`                   | no       | room the agent joins; default `hermes`                             |
-| `LIVEKIT_AGENT_NAME`             | no       | display name; default `Hermes` (asks the LLM if unset)             |
-| `LIVEKIT_AGENT_AVATAR`           | no       | avatar URL or local image path (encoded as data URI)               |
-| `LIVEKIT_HOME_CHANNEL`           | no       | cron / cross-platform delivery target; defaults to `LIVEKIT_ROOM`  |
-| `LIVEKIT_ALLOWED_USERS`          | no       | comma-separated participant identities                             |
-| `LIVEKIT_ALLOW_ALL_USERS`        | no       | `1`/`true` allows any participant (dev only)                       |
-| `LIVEKIT_PRESENCE_POLL_INTERVAL` | no       | seconds; auto-picked (cloud 30s, local 5s)                         |
+### Speech is not transcribed
 
-Or run the interactive prompt:
+Make sure the room participant is actually publishing audio and that silence detection is not filtering out very short or very quiet utterances.
 
-```bash
-hermes config
-```
+### Audio playback is silent
 
-## Verify
+Verify that `ffmpeg` is installed and available on `PATH`, because the adapter uses it to decode the TTS file before publishing audio frames.
 
-```bash
-hermes gateway restart
-hermes gateway status      # should show 🎙️ LiveKit as connected
-```
+### Browser text works but voice does not
 
-Join the configured room from any LiveKit client (web, mobile, voice-agent
-desktop). The agent watches the room when empty and joins as soon as a real
-participant arrives, then transcribes incoming audio and replies via TTS.
+Check that the participant has an audio track subscribed and that the adapter can connect to the room long enough to receive it.
 
-## Data channel protocol
+## Notes
 
-Outbound (agent → client) is unchanged from earlier voice-only versions —
-final text replies on topic `hermes-chat`, `agent:*` lifecycle events with
-no topic. The 0.2.0 release adds an **inbound** channel for client-driven
-control + camera snapshots.
+This plugin is designed to work on top of the upstream Hermes gateway without core patches. It follows the gateway platform contract and keeps the LiveKit-specific logic isolated in the plugin folder.
 
-### Outbound (agent → client)
-
-| Topic | Payload | When |
-|---|---|---|
-| `hermes-chat` | UTF-8 text | After agent generates a reply |
-| _(no topic)_ | JSON `{"type": "agent:<...>", "payload": {...}}` | Lifecycle events (see below) |
-
-Agent lifecycle event types:
-
-- `agent:listening-start` / `agent:listening-stop` — VAD detected speech start/end
-- `agent:user-transcript` — STT (or typed message) finalized; payload `{transcript, final, identity, source?}`
-- `agent:thinking-start` — agent about to invoke the LLM
-- `agent:speaking-start` / `agent:speaking-stop` — TTS playback boundary
-- `agent:agent-transcript` — assistant reply text mirrored on data channel
-- `agent:frame-captured` — a video frame was sampled and queued; payload `{identity, width, height, bytes, timestamp}`
-- `agent:frame-capture-failed` — `client:capture-frame` could not be honored; payload `{reason, identity?, detail?}`
-
-Remote-tool events (0.3.0+, flat envelope — no `payload` wrapper, sent
-only to the owning participant via `destination_identities`):
-
-- `agent:tool-registered` — ack to `client:tool-register`; `{name, success, reason?, detail?}`
-- `agent:tool-unregistered` — ack to `client:tool-unregister`; `{name, success, reason?}`
-- `agent:tool-call` — agent invoking a client-registered tool; `{call_id, name, arguments}`
-- `agent:tool-call-cancelled` — agent loop unwound while the call was in flight; `{call_id, name}`
-- `agent:tool-call-timeout` — plugin timed out waiting for a result (default 30s, override via `HERMES_LIVEKIT_TOOL_TIMEOUT_SEC`); `{call_id, name}`
-
-### Inbound (client → agent), topic `hermes-control`
-
-JSON payloads of the form `{"type": "client:<...>", ...}`:
-
-```jsonc
-// sample the next frame from this client's published video track
-{"type": "client:capture-frame"}
-
-// inject a typed message (skips STT). Pending captures attach automatically.
-{"type": "client:message", "text": "what's in this picture?"}
-
-// runtime control hooks
-{"type": "client:control", "action": "pause"}    // stop sampling audio
-{"type": "client:control", "action": "resume"}   // resume sampling audio
-```
-
-Remote-tool messages (0.3.0+):
-
-```jsonc
-// register a tool the agent can call. input_schema is JSON Schema for
-// the tool's arguments (`type: object`, with `properties` and `required`).
-{
-  "type": "client:tool-register",
-  "name": "desktop_notify",
-  "description": "Show a desktop notification.",
-  "input_schema": {
-    "type": "object",
-    "properties": {"title": {"type": "string"}, "body": {"type": "string"}},
-    "required": ["title", "body"]
-  }
-}
-
-// give back a tool the client no longer wants to offer
-{"type": "client:tool-unregister", "name": "desktop_notify"}
-
-// respond to an inbound agent:tool-call (exactly one of result/error)
-{"type": "client:tool-result", "call_id": "tc_abc123", "result": {"shown": true}}
-{"type": "client:tool-result", "call_id": "tc_abc123", "error": "permission denied"}
-```
-
-For tools to be visible to the LLM, add `hermes-livekit-tools` to the
-livekit toolset list in `~/.hermes/config.yaml`
-(`platform_toolsets.livekit`). The plugin does not auto-activate the
-toolset.
-
-Tools and pending calls are cleaned up automatically when the registering
-participant disconnects. Full design and roadmap (large/binary results,
-multi-client coexistence, native LiveKit RPC pivot) in
-[`docs/remote-tools-design.md`](docs/remote-tools-design.md).
-
-Unknown `type` values are ignored silently — keeps the topic compatible
-with apps that share the same data channel for unrelated control traffic.
-
-### Video / camera-frame semantics
-
-The agent does **not** consume video tracks continuously. When you
-publish a camera as a video track, the adapter just subscribes to it —
-no frames are decoded until you ask. Send `{"type": "client:capture-frame"}`
-on `hermes-control` and the agent samples the **very next** frame, encodes
-it as JPEG (quality 85), and queues it locally.
-
-The frame attaches to **the next user message** dispatched by the adapter
-(either a closed voice utterance or a `client:message`). The hermes agent
-loop then processes it through its existing `image_input_mode: auto`
-vision path — exactly the same code path used by image attachments on
-other platforms.
-
-Frames captured but never claimed by a message are cleaned up on
-disconnect. Frames attached to a message stay on disk through the agent
-turn (the agent loop is fire-and-forget after `handle_message`).
-
-## Status
-
-Experimental. Carved out of the `kortexa/gateway-livekit` branch on the
-[kortexa-ai/hermes-agent](https://github.com/kortexa-ai/hermes-agent) fork
-(PR [NousResearch/hermes-agent#3894](https://github.com/NousResearch/hermes-agent/pull/3894))
-so it can be installed on top of upstream `main` without patching core.
+If you move this plugin to another machine, copy the whole `livekit` folder, then update that machine's Hermes config and `.env` values to match its LiveKit room and credentials.
