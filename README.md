@@ -1,150 +1,212 @@
-# Hermes LiveKit Plugin
+# MiRA Hermes + LiveKit
 
-Hermes LiveKit is a platform plugin that connects the Hermes agent gateway to a LiveKit room over WebRTC. It lets the agent listen to speech from room participants, accept typed text from the LiveKit data channel, send the text into the Hermes LLM pipeline, and play the response back into the room as audio.
+This repository is the source of MiRA's Hermes LiveKit integration. MiRA pins
+it as the Git submodule `agents/hermes-livekit`. It contains:
 
-This repo is meant to live directly under your Hermes plugins folder, using the repository root as the plugin folder:
+- `adapter.py`, `__init__.py`, and `plugin.yaml` — the Hermes platform plugin
+  for audio, text, barge-in, camera and screen-share vision, work
+  acknowledgements, and progress notifications.
+- `Setup-HermesLiveKit.ps1` — repeatable Windows installation and configuration.
+- `control_bridge.py` — the authenticated, allow-listed control plane used by
+  the MiRA web portal.
+- `tests/` — control-plane and adapter tests.
 
-`C:\Users\zcha621\AppData\Local\hermes\plugins\hermes-livekit`
+The plugin runs beside Hermes on a Windows host. The portal never reads or
+writes that host's files directly:
 
-## What it does
-
-- Joins a LiveKit room as a participant.
-- Captures inbound participant audio and turns it into Hermes voice messages.
-- Accepts text messages from the LiveKit data channel and routes them into the same Hermes message pipeline.
-- Publishes agent speech back into the room through a local LiveKit audio track.
-- Emits lightweight lifecycle events for UI state such as listening, thinking, and speaking.
-- Supports optional video frame capture and remote-tool registration from clients.
-
-## Files in this plugin
-
-- `adapter.py` - the LiveKit platform adapter implementation.
-- `plugin.yaml` - plugin metadata and required environment variables.
-- `__init__.py` - package entry point.
-
-## Setup
-
-If you already copied this repository into `C:\Users\zcha621\AppData\Local\hermes\plugins\hermes-livekit`, you do not need to move it anywhere else.
-
-1. Keep the repository root in the Hermes plugins directory.
-2. Make sure Hermes knows about the plugin in `C:\Users\zcha621\AppData\Local\hermes\config.yaml`:
-
-```yaml
-plugins:
-	enabled:
-		- hermes-livekit
-platforms:
-	livekit:
-		enabled: true
-		group_sessions_per_user: false
-		extra:
-			url: ${LIVEKIT_URL}
-			api_key: ${LIVEKIT_API_KEY}
-			api_secret: ${LIVEKIT_API_SECRET}
-			room: ${LIVEKIT_ROOM}
+```text
+browser -> authenticated Next.js API -> bearer-authenticated control bridge
+                                             |
+                                             +-> Hermes .env/config/gateway
+                                             +-> LiveKit room
 ```
 
-3. Set the LiveKit environment variables in `C:\Users\zcha621\AppData\Local\hermes\.env` or in your shell.
-4. Start the gateway with the usual Hermes command, then join the LiveKit room from a browser or client.
+## Prerequisites
 
-If Hermes cannot import the LiveKit SDK packages yet, install the plugin dependencies in the same Python environment that runs Hermes. The easiest path is:
+- Windows PowerShell 5.1 or PowerShell 7
+- A LiveKit URL, API key, and API secret
+- A configured Hermes model/provider
+- Network reachability from the portal server to the control bridge
 
-```bash
-pip install hermes-livekit
-```
+The setup script can install Hermes and ffmpeg when the explicit
+`-InstallHermes` and `-InstallFfmpeg` switches are supplied. Hermes itself is
+downloaded from the official Nous Research Windows installer. Run `hermes
+setup` afterward if a model provider has not yet been configured.
 
-If you prefer to keep the local folder copy and only install dependencies, you can use that package as a convenience install for the LiveKit Python SDKs.
+## Developer quick start
 
-## Requirements
-
-Hermes must be able to load this local plugin folder and import the LiveKit runtime dependencies.
-
-At minimum, the runtime needs the LiveKit SDKs that `adapter.py` imports, plus `ffmpeg` on `PATH` for TTS decoding.
-
-The plugin also expects these LiveKit environment variables:
-
-- `LIVEKIT_URL`
-- `LIVEKIT_API_KEY`
-- `LIVEKIT_API_SECRET`
-
-Optional variables:
-
-- `LIVEKIT_ROOM` - room name, defaults to `hermes`
-- `LIVEKIT_AGENT_NAME` - display name for the agent, defaults to `Hermes`
-- `LIVEKIT_AGENT_AVATAR` - avatar URL or local file path
-- `LIVEKIT_PRESENCE_POLL_INTERVAL` - override the room presence poll interval
-- `HERMES_LIVEKIT_LOG_LEVEL` - logging verbosity for this adapter
-- `HERMES_LIVEKIT_TOOL_TIMEOUT_SEC` - timeout for remote tool calls
-
-## Configuration
-
-The plugin metadata is defined in `plugin.yaml`. It declares the required LiveKit credentials and identifies this plugin as a Hermes platform plugin.
-
-The plugin entry point in `__init__.py` registers the `livekit` platform, seeds configuration from your `LIVEKIT_*` env vars, and exposes a small interactive setup helper for Hermes when available.
-
-If you want to set the values manually, you can use environment variables like this:
+Clone MiRA with its submodules:
 
 ```powershell
-$env:LIVEKIT_URL = "wss://your-instance.livekit.cloud"
-$env:LIVEKIT_API_KEY = "your-key"
-$env:LIVEKIT_API_SECRET = "your-secret"
+git clone --recurse-submodules https://github.com/zcha621/MiRA.git
+Set-Location MiRA
 ```
 
-Your current `.env` already follows this pattern and only needs valid values for the LiveKit connection fields.
+From the MiRA repository root on the Windows host:
 
-## How message flow works
+```powershell
+.\agents\hermes-livekit\Setup-HermesLiveKit.ps1 `
+  -InstallHermes `
+  -InstallFfmpeg `
+  -LiveKitUrl "ws://livekit-host:7880" `
+  -LiveKitApiKey "development-key" `
+  -LiveKitApiSecret "development-secret" `
+  -Room "hermes" `
+  -StartControlBridge `
+  -RestartGateway
+```
 
-### Speech input
+For login auto-start, add `-InstallAutoStart`. This installs Hermes's gateway
+task and a current-user scheduled task called `MiRA Hermes Control Bridge`.
 
-1. A participant in the LiveKit room publishes an audio track.
-2. The adapter subscribes to that track and buffers the PCM audio.
-3. Silence detection decides when the user has finished speaking.
-4. The buffered audio is written to a temporary WAV file.
-5. Hermes STT transcribes the audio into text.
-6. The adapter wraps the transcript in a Hermes `MessageEvent` and passes it to the gateway base handler.
-7. The Hermes agent runs the LLM, tools, and response logic.
-8. If the response is voice-enabled, Hermes generates TTS audio and the adapter publishes it back into LiveKit.
+The script:
 
-### Text input
+1. backs up existing Hermes `.env` and `config.yaml`;
+2. copies the runtime plugin files to
+   `%LOCALAPPDATA%\hermes\plugins\hermes-livekit`;
+3. copies the control bridge to `%LOCALAPPDATA%\hermes\control`;
+4. installs pinned LiveKit SDKs, Pillow, and PyYAML in Hermes's virtualenv;
+5. enables the plugin and applies the MiRA voice/vision/interrupt settings;
+6. creates a random 256-bit control token unless one was supplied;
+7. validates imports and `hermes config check`;
+8. optionally starts the bridge and gateway.
 
-1. A client sends text over the LiveKit data channel.
-2. The adapter normalizes the payload into a Hermes `MessageEvent`.
-3. The same gateway message pipeline runs as for speech.
-4. The response is delivered back to the LiveKit room as text, audio, or both depending on the platform logic.
+At the end it prints `HERMES_CONTROL_TOKEN`. Treat this value like a password.
+Copy it to the portal server's ignored `.env.local`; do not commit it.
 
-## TTS playback
+To update an existing developer host after pulling repository changes, rerun
+the same command. The old plugin and configuration are retained as
+timestamped backups.
 
-When the gateway decides to speak a response, it calls the adapter's `play_tts()` method with an audio file path. The adapter:
+## Pair the web portal
 
-1. Temporarily pauses inbound capture to reduce echo.
-2. Decodes the TTS audio file to raw PCM using `ffmpeg`.
-3. Feeds the PCM into a LiveKit `AudioSource` in 20 ms frames.
-4. Publishes speaking lifecycle events for client UIs.
-5. Resumes normal capture after playback ends.
+Add these server-only values to `apps/web-portal/.env.local`:
 
-## Troubleshooting
+```env
+HERMES_CONTROL_URL=http://127.0.0.1:8790
+HERMES_CONTROL_TOKEN=replace-with-the-token-printed-by-setup
+HERMES_CONTROL_TIMEOUT_MS=10000
+```
 
-### The adapter does not connect
+If the portal and Hermes are on separate machines, terminate TLS at a private
+reverse proxy and use an `https://` URL. Plain remote HTTP is rejected by
+default because it would expose the bearer token and write-only LiveKit
+credentials. For an isolated development network only:
 
-Check that the LiveKit SDK is installed and the credentials are correct.
+```env
+HERMES_CONTROL_ALLOW_INSECURE=true
+```
+
+Start the bridge on an externally reachable interface only when the network
+and firewall are appropriately restricted:
+
+```powershell
+.\agents\hermes-livekit\Setup-HermesLiveKit.ps1 `
+  -LiveKitUrl "ws://livekit-host:7880" `
+  -LiveKitApiKey "development-key" `
+  -LiveKitApiSecret "development-secret" `
+  -ControlHost "0.0.0.0" `
+  -StartControlBridge
+```
+
+Grant a portal user `hermes_manage` in **User Management**. Administrators have
+the permission implicitly. The **Hermes Control** dashboard then provides:
+
+- bridge, gateway, and platform monitoring every five seconds;
+- start, stop, and restart actions;
+- setup/configuration for URL, write-only credentials, room, participant name,
+  TTS, silence, work acknowledgement, progress, and vision;
+- room-scoped switching between Hermes and a MiRA Python LiveKit agent.
+
+## Agent switching semantics
+
+Hermes currently watches one configured room at a time. The portal therefore
+treats Hermes ownership as global while the MiRA Python agent remains
+room-scoped.
+
+- Switching to **Hermes** enables the Hermes LiveKit platform, assigns the
+  selected room, restarts the gateway, and then deactivates any active MiRA
+  Python agent in that room.
+- Switching to **MiRA LiveKit agent** disables the Hermes LiveKit platform,
+  restarts the gateway, and activates the selected database-backed Python
+  agent for the supplied Tourism AI session UUID.
+- If Python activation fails, the API attempts to restore the previous Hermes
+  room and enabled state.
+- Switch requests are serialized within each portal server process to prevent
+  overlapping lifecycle mutations.
+
+The gateway restart briefly reconnects other configured Hermes platforms.
+
+## Security boundary
+
+The bridge:
+
+- requires `Authorization: Bearer ...` for every `/v1/*` route;
+- uses constant-time token comparison and a minimum 32-character token;
+- accepts JSON bodies of at most 64 KiB;
+- validates all rooms, URLs, booleans, and numeric ranges;
+- updates only an explicit environment/config allow-list;
+- never returns the LiveKit API key, API secret, or control token;
+- creates a timestamped `.env` backup before portal updates;
+- binds to loopback by default;
+- sends no permissive browser CORS headers.
+
+The browser talks only to authenticated same-origin Next.js routes. Portal
+routes enforce `hermes_manage`; the control token exists only on the portal
+server and Hermes host.
+
+## Plugin behavior
+
+Required environment variables:
 
 - `LIVEKIT_URL`
 - `LIVEKIT_API_KEY`
 - `LIVEKIT_API_SECRET`
 
-### Speech is not transcribed
+Important optional settings:
 
-Make sure the room participant is actually publishing audio and that silence detection is not filtering out very short or very quiet utterances.
+- `LIVEKIT_ROOM` (default `hermes`)
+- `LIVEKIT_AGENT_NAME` (default `Hermes`)
+- `HERMES_LIVEKIT_SILENCE_SECONDS` (default `0.8`)
+- `HERMES_LIVEKIT_AUTO_VISION` (default `true`)
+- `HERMES_LIVEKIT_VIDEO_SAMPLE_SECONDS` (default `1.0`)
+- `HERMES_LIVEKIT_VIDEO_MAX_AGE_SECONDS` (default `10`)
+- `HERMES_LIVEKIT_WORK_ACK_SECONDS` (default `2.5`)
+- `HERMES_AGENT_NOTIFY_INTERVAL` (default `20`)
 
-### Audio playback is silent
+Camera and screen-share tracks are sampled continuously and the freshest
+relevant frame is attached to visual turns. Speech barge-in clears active TTS.
+The adapter also accepts text/data messages and MiRA-compatible image streams.
 
-Verify that `ffmpeg` is installed and available on `PATH`, because the adapter uses it to decode the TTS file before publishing audio frames.
+## Validation
 
-### Browser text works but voice does not
+From this directory:
 
-Check that the participant has an audio track subscribed and that the adapter can connect to the room long enough to receive it.
+```powershell
+& "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\python.exe" `
+  -m unittest discover -s tests -v
+```
 
-## Notes
+From MiRA's `apps/web-portal`:
 
-This plugin is designed to work on top of the upstream Hermes gateway without core patches. It follows the gateway platform contract and keeps the LiveKit-specific logic isolated in the plugin folder.
+```powershell
+npm install
+npm run test:auth
+npm run typecheck
+npm run build
+```
 
-If you move this plugin to another machine, copy the whole `livekit` folder, then update that machine's Hermes config and `.env` values to match its LiveKit room and credentials.
+Operational checks:
+
+```powershell
+hermes gateway status
+Invoke-RestMethod http://127.0.0.1:8790/health
+```
+
+An authenticated status check can be made from the Hermes host without
+printing the token:
+
+```powershell
+$headers = @{ Authorization = "Bearer $env:HERMES_CONTROL_TOKEN" }
+Invoke-RestMethod http://127.0.0.1:8790/v1/status -Headers $headers
+```

@@ -64,6 +64,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.session import build_session_key
 
 # Use the ``gateway.platforms.livekit`` namespace rather than ``__name__``.
 # Hermes core's gateway.log handler installs a component filter that only
@@ -100,11 +101,35 @@ def _apply_env_log_level() -> None:
 _apply_env_log_level()
 
 # Voice detection
-SILENCE_THRESHOLD_SECONDS = 1.5   # seconds of silence → end of utterance
+SILENCE_THRESHOLD_SECONDS = float(os.getenv("HERMES_LIVEKIT_SILENCE_SECONDS", "0.8"))
 MIN_SPEECH_DURATION = 0.5         # minimum seconds to process (skip noise)
 RMS_SILENCE_FLOOR = 50            # PCM RMS below this is silence
 POLL_INTERVAL = 0.2               # silence check interval when active
 IDLE_POLL_INTERVAL = 2.0          # silence check interval when no remote participants
+VIDEO_SAMPLE_INTERVAL = float(os.getenv("HERMES_LIVEKIT_VIDEO_SAMPLE_SECONDS", "1.0"))
+VIDEO_FRAME_MAX_AGE = float(os.getenv("HERMES_LIVEKIT_VIDEO_MAX_AGE_SECONDS", "10.0"))
+AUTO_VISION = os.getenv("HERMES_LIVEKIT_AUTO_VISION", "true").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+WORK_ACK_DELAY = float(os.getenv("HERMES_LIVEKIT_WORK_ACK_SECONDS", "2.5"))
+WORK_ACK_TEXT = os.getenv(
+    "HERMES_LIVEKIT_WORK_ACK_TEXT", "I’m working on that. One moment."
+).strip()
+IMAGE_STREAM_TOPICS = tuple(
+    topic.strip()
+    for topic in os.getenv("HERMES_LIVEKIT_IMAGE_STREAM_TOPICS", "test,hermes-image").split(",")
+    if topic.strip()
+)
+MAX_IMAGE_STREAM_BYTES = 12 * 1024 * 1024
+VISUAL_UTTERANCE_RE = re.compile(
+    r"\b("
+    r"see|look|watch|show|visible|visual|camera|face|screen|share|"
+    r"image|photo|picture|video|frame|read|sign|menu|page|app|"
+    r"button|click|tap|wearing|colour|color|object|view|"
+    r"this|that|these|those|here|there"
+    r")\b",
+    re.IGNORECASE,
+)
 
 # LiveKit audio defaults
 SAMPLE_RATE = 48000
@@ -204,16 +229,27 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._audio_streams: Dict[str, asyncio.Task] = {}
         self._audio_stream_handles: Dict[str, Any] = {}
 
-        # Pause audio capture during TTS playback
+        # Explicit client-side input pause. TTS never toggles this flag:
+        # remote microphone tracks are independent of our published audio and
+        # must remain live so users can barge in while Hermes is speaking.
         self._paused = False
+        self._is_playing = False
+        self._playback_interrupt = asyncio.Event()
+        self._playback_lock = asyncio.Lock()
+        self._stt_lock = asyncio.Lock()
+        self._work_ack_tasks: set[asyncio.Task] = set()
+        self._work_ack_audio_path: Optional[str] = None
 
         # Per-participant speech state (for listening-start/stop events)
         self._speaking_participants: set[str] = set()
 
-        # Per-participant video streams (subscribed but NOT eagerly iterated —
-        # frames are only sampled when a client sends client:capture-frame on
-        # the hermes-control data-channel topic).
+        # Video streams are continuously drained to avoid native queue
+        # overflows. Only a throttled latest frame is JPEG-encoded in memory.
+        # Track SID keys allow camera and screen share to coexist.
         self._video_streams: Dict[str, "rtc.VideoStream"] = {}
+        self._video_tasks: Dict[str, asyncio.Task] = {}
+        self._video_track_meta: Dict[str, tuple[str, str]] = {}
+        self._latest_video_frames: Dict[str, tuple[bytes, float, str, int, int]] = {}
 
         # Frames captured-but-not-yet-dispatched. Drained into the next
         # MessageEvent built by _process_voice_input or _handle_client_message.
@@ -416,6 +452,11 @@ class LiveKitAdapter(BasePlatformAdapter):
             # Inbound data-channel: clients send control messages (capture-frame,
             # typed text, runtime control hooks) on the hermes-control topic.
             self._room.on("data_received", self._on_data_received)
+            for topic in IMAGE_STREAM_TOPICS:
+                try:
+                    self._room.register_byte_stream_handler(topic, self._on_image_stream)
+                except Exception as exc:
+                    logger.debug("[%s] image stream topic %s unavailable: %s", self.name, topic, exc)
 
             # Create access token
             import json as _json
@@ -499,13 +540,25 @@ class LiveKitAdapter(BasePlatformAdapter):
                 pass
         self._audio_streams.clear()
 
-        # Close video streams (sampling-on-trigger, no background task).
+        for task in self._video_tasks.values():
+            task.cancel()
+        if self._video_tasks:
+            await asyncio.gather(*self._video_tasks.values(), return_exceptions=True)
+        self._video_tasks.clear()
+
+        # Close video streams after their consumer tasks have exited.
         for stream in self._video_streams.values():
             try:
                 await stream.aclose()
             except Exception:
                 pass
         self._video_streams.clear()
+        self._video_track_meta.clear()
+        self._latest_video_frames.clear()
+
+        for task in list(self._work_ack_tasks):
+            task.cancel()
+        self._work_ack_tasks.clear()
 
         if self._room:
             self._graceful_leave = True
@@ -583,7 +636,21 @@ class LiveKitAdapter(BasePlatformAdapter):
             await super().handle_message(msg_event)
             return
 
+        if not isinstance(event, MessageEvent):
+            await super().handle_message(event)
+            return
+
+        session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        was_active = session_key in self._active_sessions
         await super().handle_message(event)
+        if not was_active and session_key in self._active_sessions and WORK_ACK_DELAY > 0:
+            task = asyncio.create_task(self._send_work_ack_if_needed(session_key, event.source.chat_id))
+            self._work_ack_tasks.add(task)
+            task.add_done_callback(self._work_ack_tasks.discard)
 
 
 
@@ -627,15 +694,27 @@ class LiveKitAdapter(BasePlatformAdapter):
                     self.name, identity,
                 )
                 return
-            # Replace any prior stream for this participant (e.g. camera toggled).
-            old = self._video_streams.pop(identity, None)
+            track_key = self._video_track_key(track, publication, identity)
+            source_name = self._video_source_name(publication)
+            old = self._video_streams.pop(track_key, None)
             if old is not None:
                 try:
                     asyncio.create_task(old.aclose())
                 except Exception:
                     pass
-            self._video_streams[identity] = rtc.VideoStream(track)
-            logger.info("[%s] Video track subscribed: %s (sampling-on-trigger)", self.name, identity)
+            old_task = self._video_tasks.pop(track_key, None)
+            if old_task is not None:
+                old_task.cancel()
+            stream = rtc.VideoStream(track, capacity=1)
+            self._video_streams[track_key] = stream
+            self._video_track_meta[track_key] = (identity, source_name)
+            self._video_tasks[track_key] = asyncio.create_task(
+                self._video_receive_loop(track_key, stream)
+            )
+            logger.info(
+                "[%s] Video track subscribed: %s source=%s (continuous latest-frame sampling)",
+                self.name, identity, source_name,
+            )
             return
 
     def _on_track_unsubscribed(
@@ -654,7 +733,12 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         if track.kind == rtc.TrackKind.KIND_VIDEO:
             logger.debug("[%s] Video track unsubscribed: %s", self.name, identity)
-            stream = self._video_streams.pop(identity, None)
+            track_key = self._video_track_key(track, publication, identity)
+            task = self._video_tasks.pop(track_key, None)
+            if task is not None:
+                task.cancel()
+            stream = self._video_streams.pop(track_key, None)
+            self._video_track_meta.pop(track_key, None)
             if stream is not None:
                 try:
                     asyncio.create_task(stream.aclose())
@@ -672,6 +756,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         identity = participant.identity
         logger.info("[%s] Participant disconnected: %s", self.name, identity)
         self._cleanup_participant(identity)
+        self._cleanup_participant_video(identity)
         # Drop any tools this client had registered + fail their pending calls.
         self._cleanup_client_tools(identity)
 
@@ -699,6 +784,18 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._audio_buffers.clear()
         self._last_audio_time.clear()
         self._speaking_participants.clear()
+
+        for task in self._video_tasks.values():
+            task.cancel()
+        self._video_tasks.clear()
+        for stream in self._video_streams.values():
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
+        self._video_streams.clear()
+        self._video_track_meta.clear()
+        self._latest_video_frames.clear()
 
         # Clients will be gone after we drop the room — clear their tools.
         self._cleanup_all_client_tools()
@@ -885,6 +982,133 @@ class LiveKitAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[%s] Audio receive error for %s: %s", self.name, identity, e)
 
+    @staticmethod
+    def _video_track_key(track: Any, publication: Any, identity: str) -> str:
+        return str(
+            getattr(publication, "sid", "")
+            or getattr(track, "sid", "")
+            or f"{identity}:{id(track)}"
+        )
+
+    @staticmethod
+    def _video_source_name(publication: Any) -> str:
+        source = getattr(publication, "source", None)
+        try:
+            return str(rtc.TrackSource.Name(source)).lower()
+        except Exception:
+            return str(source or "video").lower()
+
+    def _encode_video_frame(self, frame: Any) -> bytes:
+        from livekit.rtc import VideoBufferType
+
+        rgba = frame.convert(VideoBufferType.RGBA)
+        img = Image.frombytes("RGBA", (rgba.width, rgba.height), bytes(rgba.data))
+        img = img.convert("RGB")
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=82)
+        return buf.getvalue()
+
+    async def _video_receive_loop(
+        self, track_key: str, stream: "rtc.VideoStream"
+    ) -> None:
+        """Continuously drain one video track and retain a throttled latest frame."""
+        last_sample = 0.0
+        try:
+            async for frame_event in stream:
+                now = time.monotonic()
+                if now - last_sample < VIDEO_SAMPLE_INTERVAL:
+                    continue
+                last_sample = now
+                meta = self._video_track_meta.get(track_key)
+                if meta is None:
+                    return
+                identity, source_name = meta
+                try:
+                    frame = frame_event.frame
+                    jpeg = self._encode_video_frame(frame)
+                    self._latest_video_frames[track_key] = (
+                        jpeg, now, source_name, frame.width, frame.height
+                    )
+                    logger.debug(
+                        "[%s] sampled %dx%d %s frame from %s",
+                        self.name, frame.width, frame.height, source_name, identity,
+                    )
+                except Exception as exc:
+                    logger.debug("[%s] video sample encode failed: %s", self.name, exc)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.warning("[%s] Video receive error for %s: %s", self.name, track_key, exc)
+
+    def _latest_frame_for_identity(
+        self, identity: str
+    ) -> Optional[tuple[bytes, float, str, int, int]]:
+        candidates = []
+        for key, frame_info in self._latest_video_frames.items():
+            meta = self._video_track_meta.get(key)
+            if meta is not None and (not identity or meta[0] == identity):
+                candidates.append(frame_info)
+        if not candidates and identity:
+            # A text sender may not be the participant publishing the shared
+            # screen. Fall back to the freshest room video.
+            candidates = list(self._latest_video_frames.values())
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[1])
+
+    def _queue_latest_video_frame(self, identity: str) -> Optional[tuple[str, str]]:
+        latest = self._latest_frame_for_identity(identity)
+        if latest is None:
+            return None
+        jpeg, captured_at, source_name, _width, _height = latest
+        if time.monotonic() - captured_at > VIDEO_FRAME_MAX_AGE:
+            return None
+        tmp_dir = os.path.join(tempfile.gettempdir(), "hermes_livekit")
+        os.makedirs(tmp_dir, exist_ok=True)
+        safe_source = re.sub(r"[^a-z0-9_-]+", "-", source_name.lower()).strip("-") or "video"
+        path = os.path.join(
+            tmp_dir, f"{safe_source}_{uuid.uuid4().hex[:12]}.jpg"
+        )
+        with open(path, "wb") as file_handle:
+            file_handle.write(jpeg)
+        capture = (path, "image/jpeg")
+        self._pending_captures.append(capture)
+        return capture
+
+    @staticmethod
+    def _should_attach_video(text: str) -> bool:
+        """Avoid making ordinary voice turns pay the vision-analysis latency."""
+        return bool(VISUAL_UTTERANCE_RE.search(text or ""))
+
+    def _cleanup_participant_video(self, identity: str) -> None:
+        keys = [
+            key for key, meta in self._video_track_meta.items()
+            if meta[0] == identity
+        ]
+        for key in keys:
+            task = self._video_tasks.pop(key, None)
+            if task is not None:
+                task.cancel()
+            stream = self._video_streams.pop(key, None)
+            if stream is not None:
+                try:
+                    asyncio.create_task(stream.aclose())
+                except Exception:
+                    pass
+            self._video_track_meta.pop(key, None)
+            self._latest_video_frames.pop(key, None)
+
+    def _interrupt_playback(self, identity: str) -> None:
+        if not self._is_playing:
+            return
+        logger.info("[%s] Barge-in detected from %s; stopping TTS", self.name, identity)
+        self._playback_interrupt.set()
+        if self._audio_source is not None:
+            try:
+                self._audio_source.clear_queue()
+            except Exception:
+                pass
+
     async def _check_silence_loop(self):
         """Periodically check for completed utterances (silence after speech).
 
@@ -928,6 +1152,7 @@ class LiveKitAdapter(BasePlatformAdapter):
                         # Emit listening-start on first loud chunk of an utterance
                         if identity not in self._speaking_participants:
                             self._speaking_participants.add(identity)
+                            self._interrupt_playback(identity)
                             asyncio.create_task(
                                 self._publish_agent_event(
                                     "agent:listening-start", {"identity": identity}
@@ -997,7 +1222,10 @@ class LiveKitAdapter(BasePlatformAdapter):
             # the model from stt config internally when called with no model
             # arg — same pattern other gateway adapters use.
             from tools.transcription_tools import transcribe_audio
-            result = await asyncio.to_thread(transcribe_audio, wav_path)
+            # The local Whisper backend is not safe or fast under overlapping
+            # calls; serialize utterances to avoid the 20s+ stalls seen in logs.
+            async with self._stt_lock:
+                result = await asyncio.to_thread(transcribe_audio, wav_path)
 
             # Clean up temp file
             try:
@@ -1021,6 +1249,8 @@ class LiveKitAdapter(BasePlatformAdapter):
 
             # Drain any captured frames into this message so the agent's
             # vision pipeline sees them alongside the transcript.
+            if AUTO_VISION and self._should_attach_video(transcript):
+                self._queue_latest_video_frame(identity)
             media_urls, media_types = self._drain_pending_captures()
 
             # Build message event
@@ -1082,7 +1312,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         except (UnicodeDecodeError, ValueError):
             msg = None
 
-        # Check if this is a text message (from browser chatbox) vs voice transcript.
+        # Check if this is a text message (from browser chatbox) vs control data.
         # Support both JSON envelopes and plain string payloads because browser
         # textbox clients may publish raw text directly on the data channel.
         msg_type = msg.get("type", "") if isinstance(msg, dict) else ""
@@ -1094,7 +1324,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         elif raw_text:
             text_content = raw_text
 
-        is_text_message = bool(text_content) or msg_type == "text" or bool(participant_identity)
+        is_text_message = bool(text_content) or msg_type == "text"
 
         if not is_text_message:
             logger.debug("[%s] %s: ignoring non-text message from %s", self.name, topic, participant_identity or "?")
@@ -1119,9 +1349,12 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         # Handle direct text messages (browser chatbox input)
         if is_text_message and msg_type == "text":
+            if AUTO_VISION and self._should_attach_video(text_content):
+                self._queue_latest_video_frame(participant_identity)
+            media_urls, media_types = self._drain_pending_captures()
             asyncio.create_task(self.handle_message(MessageEvent(
                 text=text_content,
-                message_type=MessageType.VOICE,
+                message_type=MessageType.TEXT,
                 source=self.build_source(
                     chat_id=self._room_name,
                     chat_name=self._room_name,
@@ -1129,9 +1362,13 @@ class LiveKitAdapter(BasePlatformAdapter):
                     user_id=participant_identity,
                     user_name=participant_identity,
                 ),
-                message_id=msg.get("id", uuid.uuid4().hex[:12]),
-                media_urls=[],
-                media_types=[],
+                message_id=(
+                    msg.get("id", uuid.uuid4().hex[:12])
+                    if isinstance(msg, dict)
+                    else uuid.uuid4().hex[:12]
+                ),
+                media_urls=media_urls,
+                media_types=media_types,
                 timestamp=datetime.now(tz=timezone.utc),
             )))
         handler = handlers.get(msg_type)
@@ -1159,8 +1396,8 @@ class LiveKitAdapter(BasePlatformAdapter):
             )
             return
 
-        stream = self._video_streams.get(identity)
-        if stream is None:
+        latest = self._latest_frame_for_identity(identity)
+        if latest is None:
             logger.info("[%s] capture-frame from %s but no video track subscribed", self.name, identity)
             await self._publish_agent_event(
                 "agent:frame-capture-failed",
@@ -1168,59 +1405,73 @@ class LiveKitAdapter(BasePlatformAdapter):
             )
             return
 
-        try:
-            # AudioStream/VideoStream are async iterators that yield as new
-            # frames arrive. We take one and break.
-            frame_event = await asyncio.wait_for(stream.__anext__(), timeout=2.0)
-        except (asyncio.TimeoutError, StopAsyncIteration) as exc:
-            logger.warning("[%s] capture-frame from %s timed out: %s", self.name, identity, exc)
+        queued = self._queue_latest_video_frame(identity)
+        if queued is None:
             await self._publish_agent_event(
                 "agent:frame-capture-failed",
-                {"reason": "timeout", "identity": identity},
+                {"reason": "stale-frame", "identity": identity},
             )
             return
-
-        frame = frame_event.frame
-        try:
-            # Convert to RGBA so Pillow can ingest the raw buffer directly.
-            from livekit.rtc import VideoBufferType
-            rgba = frame.convert(VideoBufferType.RGBA)
-            img = Image.frombytes("RGBA", (rgba.width, rgba.height), bytes(rgba.data))
-            # JPEG doesn't carry alpha, so drop to RGB before encoding.
-            img = img.convert("RGB")
-            buf = BytesIO()
-            img.save(buf, format="JPEG", quality=85)
-            jpeg_bytes = buf.getvalue()
-        except Exception as exc:
-            logger.error("[%s] frame encode failed for %s: %s", self.name, identity, exc)
-            await self._publish_agent_event(
-                "agent:frame-capture-failed",
-                {"reason": "encode-error", "identity": identity, "detail": str(exc)},
-            )
-            return
-
-        tmp_dir = os.path.join(tempfile.gettempdir(), "hermes_livekit")
-        os.makedirs(tmp_dir, exist_ok=True)
-        path = os.path.join(tmp_dir, f"frame_{uuid.uuid4().hex[:12]}.jpg")
-        with open(path, "wb") as f:
-            f.write(jpeg_bytes)
-
-        self._pending_captures.append((path, "image/jpeg"))
+        path, _mime = queued
+        jpeg_bytes, _captured_at, source_name, width, height = latest
         logger.info(
-            "[%s] captured %dx%d frame from %s (%d bytes) — pending=%d",
-            self.name, frame.width, frame.height, identity,
+            "[%s] captured latest %dx%d %s frame from %s (%d bytes) — pending=%d",
+            self.name, width, height, source_name, identity,
             len(jpeg_bytes), len(self._pending_captures),
         )
         await self._publish_agent_event(
             "agent:frame-captured",
             {
                 "identity": identity,
-                "width": frame.width,
-                "height": frame.height,
+                "width": width,
+                "height": height,
+                "source": source_name,
+                "path": path,
                 "bytes": len(jpeg_bytes),
                 "timestamp": datetime.now(tz=timezone.utc).isoformat(),
             },
         )
+
+    def _on_image_stream(self, reader: Any, participant_identity: str) -> None:
+        """Accept still images using the same byte-stream pattern as MiRA's sample."""
+        task = asyncio.create_task(
+            self._receive_image_stream(reader, str(participant_identity or "client"))
+        )
+        self._work_ack_tasks.add(task)
+        task.add_done_callback(self._work_ack_tasks.discard)
+
+    async def _receive_image_stream(self, reader: Any, identity: str) -> None:
+        data = bytearray()
+        try:
+            async for chunk in reader:
+                data.extend(bytes(chunk))
+                if len(data) > MAX_IMAGE_STREAM_BYTES:
+                    raise ValueError("image stream exceeds 12 MiB limit")
+            if not data:
+                return
+            info = getattr(reader, "info", None)
+            mime = str(getattr(info, "mime_type", "") or "image/png")
+            suffix = ".jpg" if "jpeg" in mime or "jpg" in mime else ".png"
+            tmp_dir = os.path.join(tempfile.gettempdir(), "hermes_livekit")
+            os.makedirs(tmp_dir, exist_ok=True)
+            path = os.path.join(tmp_dir, f"stream_{uuid.uuid4().hex[:12]}{suffix}")
+            with open(path, "wb") as file_handle:
+                file_handle.write(data)
+            self._pending_captures.append((path, mime))
+            logger.info(
+                "[%s] image byte stream received from %s (%d bytes, %s)",
+                self.name, identity, len(data), mime,
+            )
+            await self._publish_agent_event(
+                "agent:frame-captured",
+                {"identity": identity, "bytes": len(data), "source": "byte-stream"},
+            )
+        except Exception as exc:
+            logger.warning("[%s] image byte stream failed from %s: %s", self.name, identity, exc)
+            await self._publish_agent_event(
+                "agent:frame-capture-failed",
+                {"reason": "byte-stream-error", "identity": identity, "detail": str(exc)},
+            )
 
     async def _handle_client_message(self, msg: Dict[str, Any], identity: str) -> None:
         """Inject a typed text message as if it were a transcribed voice utterance.
@@ -1233,6 +1484,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         if not text:
             return
 
+        if AUTO_VISION and self._should_attach_video(text):
+            self._queue_latest_video_frame(identity)
         media_urls, media_types = self._drain_pending_captures()
 
         source = self.build_source(
@@ -1564,6 +1817,45 @@ class LiveKitAdapter(BasePlatformAdapter):
 
     # -- Outbound messaging -------------------------------------------------
 
+    async def _send_work_ack_if_needed(self, session_key: str, chat_id: str) -> None:
+        """Give a slow turn a brief visible and spoken acknowledgement."""
+        try:
+            await asyncio.sleep(WORK_ACK_DELAY)
+            guard = self._active_sessions.get(session_key)
+            if guard is None or not WORK_ACK_TEXT or not self._room:
+                return
+
+            await self._publish_agent_event(
+                "agent:status",
+                {"status": "working", "message": WORK_ACK_TEXT},
+            )
+            await self.send(chat_id, WORK_ACK_TEXT, metadata={"non_conversational": True})
+
+            # Generate the fixed phrase once and reuse it for later slow turns.
+            if not self._work_ack_audio_path or not os.path.exists(self._work_ack_audio_path):
+                try:
+                    from tools.tts_tool import text_to_speech_tool, check_tts_requirements
+                    if check_tts_requirements():
+                        import json as _json
+                        result = await asyncio.to_thread(
+                            text_to_speech_tool, text=WORK_ACK_TEXT
+                        )
+                        self._work_ack_audio_path = _json.loads(result).get("file_path")
+                except Exception as exc:
+                    logger.debug("[%s] work acknowledgement TTS failed: %s", self.name, exc)
+
+            # The turn may have completed while TTS was being generated.
+            if (
+                session_key in self._active_sessions
+                and self._work_ack_audio_path
+                and os.path.exists(self._work_ack_audio_path)
+            ):
+                await self.play_tts(chat_id, self._work_ack_audio_path)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.debug("[%s] work acknowledgement failed: %s", self.name, exc)
+
     async def _publish_agent_event(
         self, event_type: str, payload: Optional[Dict[str, Any]] = None
     ) -> None:
@@ -1626,58 +1918,57 @@ class LiveKitAdapter(BasePlatformAdapter):
         if not self._audio_source or not self._room:
             return SendResult(success=False, error="Not connected to room")
 
-        try:
-            # Pause capture to avoid echo
-            self._paused = True
+        async with self._playback_lock:
+            try:
+                self._playback_interrupt.clear()
+                self._is_playing = True
 
-            if caption:
-                await self._publish_agent_event(
-                    "agent:agent-transcript",
-                    {"transcript": caption, "final": True},
+                if caption:
+                    await self._publish_agent_event(
+                        "agent:agent-transcript",
+                        {"transcript": caption, "final": True},
+                    )
+
+                pcm_data = await asyncio.to_thread(
+                    self._decode_audio_to_pcm, audio_path
                 )
+                if not pcm_data:
+                    return SendResult(success=False, error="Failed to decode audio")
 
-            # Decode audio file to raw PCM using ffmpeg
-            pcm_data = await asyncio.to_thread(
-                self._decode_audio_to_pcm, audio_path
-            )
-            if not pcm_data:
-                self._paused = False
-                return SendResult(success=False, error="Failed to decode audio")
+                samples_per_frame = SAMPLE_RATE // 50  # 20ms frames
+                bytes_per_frame = samples_per_frame * NUM_CHANNELS * 2
+                await self._publish_agent_event("agent:speaking-start")
 
-            # Publish PCM frames to the audio source
-            # LiveKit expects frames of a specific size
-            samples_per_frame = SAMPLE_RATE // 50  # 20ms frames
-            bytes_per_frame = samples_per_frame * NUM_CHANNELS * 2  # 16-bit
+                offset = 0
+                while offset < len(pcm_data):
+                    if self._playback_interrupt.is_set():
+                        try:
+                            self._audio_source.clear_queue()
+                        except Exception:
+                            pass
+                        await self._publish_agent_event(
+                            "agent:speech-interrupted", {"reason": "user-barge-in"}
+                        )
+                        break
+                    chunk = pcm_data[offset:offset + bytes_per_frame]
+                    if len(chunk) < bytes_per_frame:
+                        chunk += b"\x00" * (bytes_per_frame - len(chunk))
+                    frame = rtc.AudioFrame(
+                        data=chunk,
+                        sample_rate=SAMPLE_RATE,
+                        num_channels=NUM_CHANNELS,
+                        samples_per_channel=samples_per_frame,
+                    )
+                    await self._audio_source.capture_frame(frame)
+                    offset += bytes_per_frame
 
-            await self._publish_agent_event("agent:speaking-start")
-
-            offset = 0
-            while offset < len(pcm_data):
-                chunk = pcm_data[offset:offset + bytes_per_frame]
-                if len(chunk) < bytes_per_frame:
-                    # Pad the last frame with silence
-                    chunk = chunk + b"\x00" * (bytes_per_frame - len(chunk))
-
-                frame = rtc.AudioFrame(
-                    data=chunk,
-                    sample_rate=SAMPLE_RATE,
-                    num_channels=NUM_CHANNELS,
-                    samples_per_channel=samples_per_frame,
-                )
-                await self._audio_source.capture_frame(frame)
-                offset += bytes_per_frame
-
-            # Brief pause after playback before resuming capture
-            await asyncio.sleep(0.3)
-            self._paused = False
-            await self._publish_agent_event("agent:speaking-stop")
-
-            return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
-        except Exception as e:
-            self._paused = False
-            await self._publish_agent_event("agent:speaking-stop")
-            logger.error("[%s] TTS playback error: %s", self.name, e)
-            return SendResult(success=False, error=str(e))
+                return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+            except Exception as e:
+                logger.error("[%s] TTS playback error: %s", self.name, e)
+                return SendResult(success=False, error=str(e))
+            finally:
+                self._is_playing = False
+                await self._publish_agent_event("agent:speaking-stop")
 
     @staticmethod
     def _decode_audio_to_pcm(audio_path: str) -> Optional[bytes]:
