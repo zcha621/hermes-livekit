@@ -137,13 +137,14 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         os.unlink(path)
         published.assert_awaited()
 
-    async def test_slow_turn_gets_visible_and_spoken_acknowledgement(self):
+    async def test_slow_turn_defaults_to_status_only_acknowledgement(self):
         self.adapter._room = object()
         self.adapter._active_sessions["session"] = asyncio.Event()
         self.adapter._work_ack_audio_path = __file__
 
         with (
             patch.object(livekit_adapter, "WORK_ACK_DELAY", 0),
+            patch.object(livekit_adapter, "WORK_ACK_MODE", "status"),
             patch.object(self.adapter, "_publish_agent_event", AsyncMock()) as publish,
             patch.object(self.adapter, "send", AsyncMock()) as send,
             patch.object(self.adapter, "play_tts", AsyncMock()) as play,
@@ -151,8 +152,24 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
             await self.adapter._send_work_ack_if_needed("session", "room")
 
         publish.assert_awaited()
+        send.assert_not_awaited()
+        play.assert_not_awaited()
+
+    async def test_spoken_acknowledgement_remains_opt_in(self):
+        self.adapter._room = object()
+        self.adapter._active_sessions["session"] = asyncio.Event()
+        self.adapter._work_ack_audio_path = __file__
+
+        with (
+            patch.object(livekit_adapter, "WORK_ACK_DELAY", 0),
+            patch.object(livekit_adapter, "WORK_ACK_MODE", "spoken"),
+            patch.object(self.adapter, "_publish_agent_event", AsyncMock()),
+            patch.object(self.adapter, "send", AsyncMock()) as send,
+            patch.object(self.adapter, "play_tts", AsyncMock()) as play,
+        ):
+            await self.adapter._send_work_ack_if_needed("session", "room")
+
         send.assert_awaited_once()
-        self.assertIn("working", send.await_args.args[1].lower())
         play.assert_awaited_once_with("room", __file__)
 
 

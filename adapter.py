@@ -111,9 +111,16 @@ VIDEO_FRAME_MAX_AGE = float(os.getenv("HERMES_LIVEKIT_VIDEO_MAX_AGE_SECONDS", "1
 AUTO_VISION = os.getenv("HERMES_LIVEKIT_AUTO_VISION", "true").strip().lower() in {
     "1", "true", "yes", "on",
 }
-WORK_ACK_DELAY = float(os.getenv("HERMES_LIVEKIT_WORK_ACK_SECONDS", "2.5"))
+WORK_ACK_DELAY = float(os.getenv("HERMES_LIVEKIT_WORK_ACK_SECONDS", "6"))
+WORK_ACK_MODE = os.getenv("HERMES_LIVEKIT_WORK_ACK_MODE", "status").strip().lower()
+if WORK_ACK_MODE not in {"off", "status", "text", "spoken"}:
+    logger.warning(
+        "[livekit] Invalid HERMES_LIVEKIT_WORK_ACK_MODE=%r; using status",
+        WORK_ACK_MODE,
+    )
+    WORK_ACK_MODE = "status"
 WORK_ACK_TEXT = os.getenv(
-    "HERMES_LIVEKIT_WORK_ACK_TEXT", "I’m working on that. One moment."
+    "HERMES_LIVEKIT_WORK_ACK_TEXT", "Let me check that."
 ).strip()
 IMAGE_STREAM_TOPICS = tuple(
     topic.strip()
@@ -647,7 +654,12 @@ class LiveKitAdapter(BasePlatformAdapter):
         )
         was_active = session_key in self._active_sessions
         await super().handle_message(event)
-        if not was_active and session_key in self._active_sessions and WORK_ACK_DELAY > 0:
+        if (
+            not was_active
+            and session_key in self._active_sessions
+            and WORK_ACK_DELAY > 0
+            and WORK_ACK_MODE != "off"
+        ):
             task = asyncio.create_task(self._send_work_ack_if_needed(session_key, event.source.chat_id))
             self._work_ack_tasks.add(task)
             task.add_done_callback(self._work_ack_tasks.discard)
@@ -1818,7 +1830,7 @@ class LiveKitAdapter(BasePlatformAdapter):
     # -- Outbound messaging -------------------------------------------------
 
     async def _send_work_ack_if_needed(self, session_key: str, chat_id: str) -> None:
-        """Give a slow turn a brief visible and spoken acknowledgement."""
+        """Acknowledge a slow turn without interrupting normal conversation."""
         try:
             await asyncio.sleep(WORK_ACK_DELAY)
             guard = self._active_sessions.get(session_key)
@@ -1829,9 +1841,14 @@ class LiveKitAdapter(BasePlatformAdapter):
                 "agent:status",
                 {"status": "working", "message": WORK_ACK_TEXT},
             )
-            await self.send(chat_id, WORK_ACK_TEXT, metadata={"non_conversational": True})
+            if WORK_ACK_MODE == "status":
+                return
 
-            # Generate the fixed phrase once and reuse it for later slow turns.
+            await self.send(chat_id, WORK_ACK_TEXT, metadata={"non_conversational": True})
+            if WORK_ACK_MODE == "text":
+                return
+
+            # Spoken mode is opt-in. Generate the fixed phrase once and reuse it.
             if not self._work_ack_audio_path or not os.path.exists(self._work_ack_audio_path):
                 try:
                     from tools.tts_tool import text_to_speech_tool, check_tts_requirements

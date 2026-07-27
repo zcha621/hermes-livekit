@@ -25,11 +25,15 @@ class ControlBridgeTests(unittest.TestCase):
                 "agent_name": "Hermes",
                 "auto_vision": True,
                 "silence_seconds": 0.8,
+                "work_ack_mode": "status",
+                "work_ack_text": "Let me check that.",
+                "system_prompt": "Respond naturally.",
                 "livekit_enabled": True,
             }
         )
         self.assertEqual(changes["LIVEKIT_ROOM"], "tour-room:1")
         self.assertEqual(changes["HERMES_LIVEKIT_AUTO_VISION"], "true")
+        self.assertEqual(changes["HERMES_LIVEKIT_WORK_ACK_MODE"], "status")
 
     def test_validate_config_rejects_unknown_and_unsafe_values(self):
         with self.assertRaises(BridgeError):
@@ -38,6 +42,8 @@ class ControlBridgeTests(unittest.TestCase):
             validate_config({"room": "../../escape"})
         with self.assertRaises(BridgeError):
             validate_config({"livekit_url": "https://not-websocket.example"})
+        with self.assertRaises(BridgeError):
+            validate_config({"work_ack_mode": "always"})
 
     def test_dotenv_update_preserves_secrets_and_comments(self):
         path = self.test_home / ".env"
@@ -58,7 +64,9 @@ class ControlBridgeTests(unittest.TestCase):
             encoding="utf-8",
         )
         (self.test_home / "config.yaml").write_text(
-            "platforms:\n  livekit:\n    enabled: true\nvoice:\n  auto_tts: true\n",
+            "platforms:\n  livekit:\n    enabled: true\n"
+            "voice:\n  auto_tts: true\n"
+            "agent:\n  system_prompt: Respond naturally.\n",
             encoding="utf-8",
         )
         rendered = json.dumps(HermesController(self.test_home).safe_config())
@@ -66,6 +74,7 @@ class ControlBridgeTests(unittest.TestCase):
         self.assertNotIn("secret-value", rendered)
         self.assertIn('"has_api_key": true', rendered)
         self.assertIn('"has_api_secret": true', rendered)
+        self.assertIn('"system_prompt": "Respond naturally."', rendered)
 
 
 if __name__ == "__main__":

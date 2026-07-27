@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover - setup installs PyYAML.
 LOG = logging.getLogger("mira.hermes_control")
 ROOM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 AGENT_RE = re.compile(r"^[^\r\n]{1,80}$")
+ACK_MODES = {"off", "status", "text", "spoken"}
 
 ENV_FIELDS = {
     "livekit_url": "LIVEKIT_URL",
@@ -49,6 +50,8 @@ ENV_FIELDS = {
     "video_max_age_seconds": "HERMES_LIVEKIT_VIDEO_MAX_AGE_SECONDS",
     "silence_seconds": "HERMES_LIVEKIT_SILENCE_SECONDS",
     "work_ack_seconds": "HERMES_LIVEKIT_WORK_ACK_SECONDS",
+    "work_ack_mode": "HERMES_LIVEKIT_WORK_ACK_MODE",
+    "work_ack_text": "HERMES_LIVEKIT_WORK_ACK_TEXT",
     "notify_interval_seconds": "HERMES_AGENT_NOTIFY_INTERVAL",
 }
 
@@ -62,6 +65,8 @@ PUBLIC_ENV_FIELDS = {
     "video_max_age_seconds",
     "silence_seconds",
     "work_ack_seconds",
+    "work_ack_mode",
+    "work_ack_text",
     "notify_interval_seconds",
 }
 
@@ -162,7 +167,9 @@ def validate_url(value: Any) -> str:
 def validate_config(payload: Any) -> dict[str, str]:
     if not isinstance(payload, dict):
         raise BridgeError("JSON object required")
-    unknown = set(payload) - (set(ENV_FIELDS) | {"livekit_enabled", "auto_tts"})
+    unknown = set(payload) - (
+        set(ENV_FIELDS) | {"livekit_enabled", "auto_tts", "system_prompt"}
+    )
     if unknown:
         raise BridgeError(f"Unsupported configuration field(s): {', '.join(sorted(unknown))}")
 
@@ -182,6 +189,14 @@ def validate_config(payload: Any) -> dict[str, str]:
             if not isinstance(value, str) or not AGENT_RE.fullmatch(value.strip()):
                 raise BridgeError("agent_name must be 1-80 characters without newlines")
             changes[ENV_FIELDS[field]] = value.strip()
+        elif field == "work_ack_mode":
+            if not isinstance(value, str) or value.strip().lower() not in ACK_MODES:
+                raise BridgeError("work_ack_mode must be off, status, text, or spoken")
+            changes[ENV_FIELDS[field]] = value.strip().lower()
+        elif field == "work_ack_text":
+            if not isinstance(value, str) or not 1 <= len(value.strip()) <= 200 or "\n" in value:
+                raise BridgeError("work_ack_text must be 1-200 characters without newlines")
+            changes[ENV_FIELDS[field]] = value.strip()
         elif field in {"livekit_api_key", "livekit_api_secret"}:
             if not isinstance(value, str) or len(value.strip()) < 3 or "\n" in value:
                 raise BridgeError(f"{field} is invalid")
@@ -199,6 +214,9 @@ def validate_config(payload: Any) -> dict[str, str]:
             changes[ENV_FIELDS[field]] = f"{number:g}"
         elif field in {"livekit_enabled", "auto_tts"}:
             parse_bool(value, field)
+        elif field == "system_prompt":
+            if not isinstance(value, str) or not 1 <= len(value.strip()) <= 4000:
+                raise BridgeError("system_prompt must be 1-4000 characters")
     return changes
 
 
@@ -262,6 +280,7 @@ class HermesController:
         config = self._config()
         livekit = ((config.get("platforms") or {}).get("livekit") or {})
         voice = config.get("voice") or {}
+        agent = config.get("agent") or {}
         result: dict[str, Any] = {
             field: values.get(environment_name, "")
             for field, environment_name in ENV_FIELDS.items()
@@ -279,6 +298,7 @@ class HermesController:
             {
                 "livekit_enabled": bool(livekit.get("enabled", False)),
                 "auto_tts": bool(voice.get("auto_tts", False)),
+                "system_prompt": str(agent.get("system_prompt", "")),
                 "has_api_key": bool(values.get("LIVEKIT_API_KEY")),
                 "has_api_secret": bool(values.get("LIVEKIT_API_SECRET")),
             }
@@ -326,6 +346,8 @@ class HermesController:
         if "auto_tts" in payload:
             enabled = parse_bool(payload["auto_tts"], "auto_tts")
             self.command("config", "set", "voice.auto_tts", str(enabled).lower())
+        if "system_prompt" in payload:
+            self.command("config", "set", "agent.system_prompt", payload["system_prompt"].strip())
         self.command("config", "set", "platforms.livekit.group_sessions_per_user", "false")
         self.command("config", "set", "platforms.livekit.extra.url", "${LIVEKIT_URL}")
         self.command("config", "set", "platforms.livekit.extra.api_key", "${LIVEKIT_API_KEY}")

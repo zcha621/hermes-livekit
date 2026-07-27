@@ -171,7 +171,9 @@ Important optional settings:
 - `HERMES_LIVEKIT_AUTO_VISION` (default `true`)
 - `HERMES_LIVEKIT_VIDEO_SAMPLE_SECONDS` (default `1.0`)
 - `HERMES_LIVEKIT_VIDEO_MAX_AGE_SECONDS` (default `10`)
-- `HERMES_LIVEKIT_WORK_ACK_SECONDS` (default `2.5`)
+- `HERMES_LIVEKIT_WORK_ACK_SECONDS` (default `6`)
+- `HERMES_LIVEKIT_WORK_ACK_MODE` (`off`, `status` (default), `text`, or `spoken`)
+- `HERMES_LIVEKIT_WORK_ACK_TEXT` (default `Let me check that.`)
 - `HERMES_AGENT_NOTIFY_INTERVAL` (default `20`)
 
 Camera and screen-share tracks are sampled continuously and the freshest
