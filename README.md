@@ -75,8 +75,59 @@ At the end it prints `HERMES_CONTROL_TOKEN`. Treat this value like a password.
 Copy it to the portal server's ignored `.env.local`; do not commit it.
 
 To update an existing developer host after pulling repository changes, rerun
-the same command. The old plugin and configuration are retained as
-timestamped backups.
+the same command. Existing LiveKit values, room, agent name, control bind
+settings, and control token are reused unless replacements are passed
+explicitly. The old plugin and configuration are retained as timestamped
+backups.
+
+## Recover pairing values from an existing setup
+
+If Hermes LiveKit and its control bridge are already configured, do not run
+the full installer just to obtain the portal URL and token. Use the read-only
+mode on the Hermes host:
+
+```powershell
+.\agents\hermes-livekit\Setup-HermesLiveKit.ps1 `
+  -ShowPortalConfig `
+  -AdvertisedControlUrl "http://127.0.0.1:8790"
+```
+
+The command reads the existing `HERMES_CONTROL_TOKEN`, host, and port from
+`%LOCALAPPDATA%\hermes\.env` and prints a ready-to-copy portal configuration.
+It does not install dependencies, change configuration, rotate the token, or
+restart the gateway or bridge. Use `-HermesHome` if Hermes was installed in a
+non-default location.
+
+For a local portal controlling Hermes on `130.216.208.118`, forward the
+loopback bridge over SSH and use the loopback URL printed above:
+
+```powershell
+ssh -N -L 8790:127.0.0.1:8790 your-user@130.216.208.118
+```
+
+`0.0.0.0` and `::` are bind addresses, not URLs a portal can connect to. When
+the existing bridge uses either wildcard address, `-AdvertisedControlUrl` is
+required. Supply the tunnel's loopback URL or the HTTPS reverse-proxy URL. A
+direct remote `http://130.216.208.118:8790` URL also causes the script to print
+the development-only `HERMES_CONTROL_ALLOW_INSECURE=true` setting and a
+security warning.
+
+If Hermes itself is already configured but the MiRA plugin is not, run the
+full developer quick-start command without `-InstallHermes`. To reuse a
+complete existing environment without prompts:
+
+```powershell
+.\agents\hermes-livekit\Setup-HermesLiveKit.ps1 `
+  -LiveKitEnvFile .\apps\web-portal\.env `
+  -StartControlBridge `
+  -RestartGateway
+```
+
+The script captures `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and
+`LIVEKIT_API_SECRET` without printing them. If `-LiveKitEnvFile` is omitted, it
+auto-discovers a complete `.env` in the current directory or
+`apps/web-portal/.env`. Existing values in the Hermes `.env` take precedence,
+and explicit command-line values take precedence over both sources.
 
 ## Pair the web portal
 
@@ -106,6 +157,7 @@ and firewall are appropriately restricted:
   -LiveKitApiKey "development-key" `
   -LiveKitApiSecret "development-secret" `
   -ControlHost "0.0.0.0" `
+  -AdvertisedControlUrl "http://130.216.208.118:8790" `
   -StartControlBridge
 ```
 
@@ -114,9 +166,13 @@ the permission implicitly. The **Hermes Control** dashboard then provides:
 
 - bridge, gateway, and platform monitoring every five seconds;
 - start, stop, and restart actions;
-- setup/configuration for URL, write-only credentials, room, participant name,
+- setup/configuration for URL, write-only credentials, participant name,
   TTS, silence, work acknowledgement, progress, and vision;
-- room-scoped switching between Hermes and a MiRA Python LiveKit agent.
+- server-side reuse of matching LiveKit credentials from the portal `.env`.
+
+The portal's **Room & Agent Management** screen owns room creation, participant
+access, and room-scoped switching between Hermes and a MiRA Python LiveKit
+agent. The Hermes dashboard links there instead of duplicating those controls.
 
 ## Agent switching semantics
 

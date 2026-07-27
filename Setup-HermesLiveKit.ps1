@@ -4,12 +4,15 @@ param(
     [string]$LiveKitUrl,
     [string]$LiveKitApiKey,
     [string]$LiveKitApiSecret,
+    [string]$LiveKitEnvFile,
     [string]$Room = "hermes",
     [string]$AgentName = "Hermes",
     [string]$ControlHost = "127.0.0.1",
     [ValidateRange(1, 65535)]
     [int]$ControlPort = 8790,
     [string]$ControlToken,
+    [string]$AdvertisedControlUrl,
+    [switch]$ShowPortalConfig,
     [switch]$InstallHermes,
     [switch]$InstallFfmpeg,
     [switch]$RestartGateway,
@@ -18,6 +21,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($ShowPortalConfig -and
+    ($InstallHermes -or $InstallFfmpeg -or $RestartGateway -or $StartControlBridge -or $InstallAutoStart)) {
+    throw "ShowPortalConfig is read-only and cannot be combined with install, start, or restart switches."
+}
 
 function Read-RequiredValue {
     param([string]$CurrentValue, [string]$Prompt, [switch]$Secret)
@@ -54,19 +62,86 @@ function Set-DotEnvValue {
     Set-Content -LiteralPath $Path -Value $lines -Encoding utf8
 }
 
+function Get-DotEnvValues {
+    param([string]$Path)
+    $values = @{}
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $values
+    }
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith("#") -or -not $trimmed.Contains("=")) {
+            continue
+        }
+        $parts = $line.Split([char[]]"=", 2)
+        $name = $parts[0].Trim()
+        if ($name.StartsWith("export ", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $name = $name.Substring(7).Trim()
+        }
+        $value = $parts[1].Trim()
+        if ($value.Length -ge 2 -and
+            (($value.StartsWith('"') -and $value.EndsWith('"')) -or
+             ($value.StartsWith("'") -and $value.EndsWith("'")))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        $values[$name] = $value
+    }
+    return $values
+}
+
+function Format-ControlUrl {
+    param([string]$HostName, [int]$Port)
+    $urlHost = if ($HostName.Contains(":") -and
+        -not ($HostName.StartsWith("[") -and $HostName.EndsWith("]"))) {
+        "[$HostName]"
+    } else {
+        $HostName
+    }
+    return "http://$urlHost`:$Port"
+}
+
+function Resolve-AdvertisedControlUrl {
+    param([string]$ConfiguredUrl, [string]$HostName, [int]$Port)
+    if ([string]::IsNullOrWhiteSpace($ConfiguredUrl)) {
+        if ($HostName -in @("0.0.0.0", "::", "[::]")) {
+            throw "The control bridge uses wildcard bind address '$HostName'. Supply -AdvertisedControlUrl with the URL the portal can reach, for example 'http://130.216.208.118:$Port'."
+        }
+        return Format-ControlUrl $HostName $Port
+    }
+
+    $uri = $null
+    if (-not [uri]::TryCreate($ConfiguredUrl, [System.UriKind]::Absolute, [ref]$uri) -or
+        $uri.Scheme -notin @("http", "https") -or
+        $uri.Host -in @("0.0.0.0", "::", "[::]") -or
+        -not [string]::IsNullOrEmpty($uri.UserInfo) -or
+        -not [string]::IsNullOrEmpty($uri.Query) -or
+        -not [string]::IsNullOrEmpty($uri.Fragment)) {
+        throw "AdvertisedControlUrl must be an absolute HTTP(S) URL without credentials, query, or fragment."
+    }
+    return $ConfiguredUrl.TrimEnd("/")
+}
+
+function Write-PortalConfig {
+    param([string]$Url, [string]$Token)
+    if ([string]::IsNullOrWhiteSpace($Token) -or $Token.Length -lt 32) {
+        throw "No valid existing HERMES_CONTROL_TOKEN was found. Run the full setup once or pass -ControlToken with at least 32 characters."
+    }
+    Write-Host ""
+    Write-Host "Copy these server-only values to apps/web-portal/.env.local:"
+    Write-Output "HERMES_CONTROL_URL=$Url"
+    Write-Output "HERMES_CONTROL_TOKEN=$Token"
+    Write-Output "HERMES_CONTROL_TIMEOUT_MS=10000"
+    $uri = [uri]$Url
+    if ($uri.Scheme -eq "http" -and $uri.Host -notin @("localhost", "127.0.0.1", "::1", "[::1]")) {
+        Write-Output "HERMES_CONTROL_ALLOW_INSECURE=true"
+        Write-Warning "Remote plain HTTP exposes the bearer token in transit. Use it only on a trusted development network; prefer an HTTPS reverse proxy."
+    }
+}
+
 if (-not (Test-Path -LiteralPath $HermesHome) -and $InstallHermes) {
     Write-Host "Installing Hermes from the official Nous Research Windows installer..."
     $installerSource = Invoke-RestMethod -Uri "https://hermes-agent.nousresearch.com/install.ps1"
     & ([scriptblock]::Create($installerSource))
-}
-
-$LiveKitUrl = Read-RequiredValue $LiveKitUrl "LiveKit URL (ws:// or wss://)"
-$LiveKitApiKey = Read-RequiredValue $LiveKitApiKey "LiveKit API key"
-$LiveKitApiSecret = Read-RequiredValue $LiveKitApiSecret "LiveKit API secret" -Secret
-if ([string]::IsNullOrWhiteSpace($LiveKitUrl) -or
-    [string]::IsNullOrWhiteSpace($LiveKitApiKey) -or
-    [string]::IsNullOrWhiteSpace($LiveKitApiSecret)) {
-    throw "LiveKit URL, API key, and API secret are required."
 }
 
 $sourcePlugin = (Resolve-Path -LiteralPath $PSScriptRoot).Path
@@ -84,8 +159,107 @@ $hermesExe = Join-Path $HermesHome "hermes-agent\venv\Scripts\hermes.exe"
 if (-not (Test-Path -LiteralPath $HermesHome)) {
     throw "Hermes is not installed at '$HermesHome'. Install Hermes first, then rerun this script."
 }
+$existingEnv = Get-DotEnvValues $envPath
+if (-not $PSBoundParameters.ContainsKey("ControlHost") -and
+    $existingEnv.ContainsKey("HERMES_CONTROL_HOST") -and
+    -not [string]::IsNullOrWhiteSpace($existingEnv["HERMES_CONTROL_HOST"])) {
+    $ControlHost = $existingEnv["HERMES_CONTROL_HOST"]
+}
+if (-not $PSBoundParameters.ContainsKey("ControlPort") -and $existingEnv.ContainsKey("HERMES_CONTROL_PORT")) {
+    $existingControlPort = 0
+    if ([int]::TryParse($existingEnv["HERMES_CONTROL_PORT"], [ref]$existingControlPort) -and
+        $existingControlPort -ge 1 -and $existingControlPort -le 65535) {
+        $ControlPort = $existingControlPort
+    }
+}
+if ([string]::IsNullOrWhiteSpace($ControlToken) -and $existingEnv.ContainsKey("HERMES_CONTROL_TOKEN")) {
+    $ControlToken = $existingEnv["HERMES_CONTROL_TOKEN"]
+}
+
+if ($ShowPortalConfig) {
+    $portalControlUrl = Resolve-AdvertisedControlUrl $AdvertisedControlUrl $ControlHost $ControlPort
+    Write-PortalConfig $portalControlUrl $ControlToken
+    return
+}
+$portalControlUrl = Resolve-AdvertisedControlUrl $AdvertisedControlUrl $ControlHost $ControlPort
+
 if (-not (Test-Path -LiteralPath $pythonExe) -or -not (Test-Path -LiteralPath $hermesExe)) {
     throw "Hermes Python/CLI was not found under '$HermesHome\hermes-agent\venv\Scripts'."
+}
+
+$existingValueMap = @{
+    LiveKitUrl       = "LIVEKIT_URL"
+    LiveKitApiKey    = "LIVEKIT_API_KEY"
+    LiveKitApiSecret = "LIVEKIT_API_SECRET"
+    Room             = "LIVEKIT_ROOM"
+    AgentName        = "LIVEKIT_AGENT_NAME"
+}
+foreach ($parameterName in $existingValueMap.Keys) {
+    $environmentName = $existingValueMap[$parameterName]
+    if (-not $PSBoundParameters.ContainsKey($parameterName) -and
+        $existingEnv.ContainsKey($environmentName) -and
+        -not [string]::IsNullOrWhiteSpace($existingEnv[$environmentName])) {
+        Set-Variable -Name $parameterName -Value $existingEnv[$environmentName]
+    }
+}
+
+$liveKitSourcePath = $null
+$liveKitSourceEnv = @{}
+if ($PSBoundParameters.ContainsKey("LiveKitEnvFile")) {
+    $resolvedLiveKitEnvFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LiveKitEnvFile)
+    if (-not (Test-Path -LiteralPath $resolvedLiveKitEnvFile -PathType Leaf)) {
+        throw "LiveKitEnvFile was not found: $resolvedLiveKitEnvFile"
+    }
+    $liveKitEnvCandidates = @($resolvedLiveKitEnvFile)
+} else {
+    $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
+    $liveKitEnvCandidates = @(
+        (Join-Path (Get-Location).Path ".env"),
+        (Join-Path $repositoryRoot "apps\web-portal\.env"),
+        (Join-Path $repositoryRoot "infrastructure\livekitserver-docker\.env")
+    ) | Select-Object -Unique
+}
+foreach ($candidate in $liveKitEnvCandidates) {
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+        continue
+    }
+    $candidateValues = Get-DotEnvValues $candidate
+    $hasCompleteTransport = @("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET") |
+        ForEach-Object { -not [string]::IsNullOrWhiteSpace($candidateValues[$_]) } |
+        Where-Object { -not $_ } |
+        Measure-Object
+    if ($hasCompleteTransport.Count -eq 0) {
+        $liveKitSourcePath = $candidate
+        $liveKitSourceEnv = $candidateValues
+        break
+    }
+}
+if ($PSBoundParameters.ContainsKey("LiveKitEnvFile") -and -not $liveKitSourcePath) {
+    throw "LiveKitEnvFile must contain non-empty LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET values."
+}
+
+$capturedLiveKitValues = $false
+foreach ($parameterName in @("LiveKitUrl", "LiveKitApiKey", "LiveKitApiSecret")) {
+    $environmentName = $existingValueMap[$parameterName]
+    $currentValue = Get-Variable -Name $parameterName -ValueOnly
+    if (-not $PSBoundParameters.ContainsKey($parameterName) -and
+        [string]::IsNullOrWhiteSpace($currentValue) -and
+        -not [string]::IsNullOrWhiteSpace($liveKitSourceEnv[$environmentName])) {
+        Set-Variable -Name $parameterName -Value $liveKitSourceEnv[$environmentName]
+        $capturedLiveKitValues = $true
+    }
+}
+if ($capturedLiveKitValues) {
+    Write-Host "Reusing LiveKit transport from '$liveKitSourcePath'."
+}
+
+$LiveKitUrl = Read-RequiredValue $LiveKitUrl "LiveKit URL (ws:// or wss://)"
+$LiveKitApiKey = Read-RequiredValue $LiveKitApiKey "LiveKit API key"
+$LiveKitApiSecret = Read-RequiredValue $LiveKitApiSecret "LiveKit API secret" -Secret
+if ([string]::IsNullOrWhiteSpace($LiveKitUrl) -or
+    [string]::IsNullOrWhiteSpace($LiveKitApiKey) -or
+    [string]::IsNullOrWhiteSpace($LiveKitApiSecret)) {
+    throw "LiveKit URL, API key, and API secret are required."
 }
 
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -257,9 +431,9 @@ Write-Host ""
 Write-Host "Hermes LiveKit setup is complete."
 Write-Host "Plugin: $targetPlugin"
 Write-Host "Room:   $Room"
-Write-Host "Control bridge: http://$ControlHost`:$ControlPort"
-Write-Host "Portal HERMES_CONTROL_TOKEN: $ControlToken"
-Write-Warning "Store the control token in the portal's server-only .env.local file. Do not expose it as NEXT_PUBLIC_*."
+Write-Host "Control bridge bind address: $(Format-ControlUrl $ControlHost $ControlPort)"
+Write-PortalConfig $portalControlUrl $ControlToken
+Write-Warning "Store the control token only in the portal's server-side .env.local file. Do not expose it as NEXT_PUBLIC_*."
 if (-not $RestartGateway) {
     Write-Host "Restart the Hermes gateway to load the new plugin and configuration."
 }
