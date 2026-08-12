@@ -21,17 +21,19 @@ gateway_config._Platform__bundled_plugin_names = (
 ) | {"livekit"}
 
 
-def make_adapter():
+def make_adapter(extra=None):
+    settings = {
+        "url": "ws://example.invalid",
+        "api_key": "key",
+        "api_secret": "secret",
+        "room": "test-room",
+        "agent_name": "Hermes",
+    }
+    settings.update(extra or {})
     return livekit_adapter.LiveKitAdapter(
         PlatformConfig(
             enabled=True,
-            extra={
-                "url": "ws://example.invalid",
-                "api_key": "key",
-                "api_secret": "secret",
-                "room": "test-room",
-                "agent_name": "Hermes",
-            },
+            extra=settings,
         )
     )
 
@@ -86,6 +88,63 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(self.adapter._should_attach_video("Can you see my face?"))
         self.assertTrue(self.adapter._should_attach_video("Which button should I tap?"))
 
+    def test_voice_defaults_match_discord_turn_timing(self):
+        self.assertEqual(self.adapter._silence_threshold_seconds, 1.5)
+        self.assertEqual(self.adapter._min_speech_duration_seconds, 0.5)
+        self.assertEqual(
+            self.adapter._ack_phrases,
+            livekit_adapter.DEFAULT_ACK_PHRASES,
+        )
+
+    def test_behavior_is_loaded_from_hermes_yaml_extra(self):
+        adapter = make_adapter(
+            {
+                "audio": {"silence_threshold_seconds": 1.8},
+                "vision": {"auto_attach": False},
+                "acknowledgements": {
+                    "enabled": True,
+                    "phrases": ["I'm on it."],
+                },
+            }
+        )
+        self.addCleanup(livekit_adapter.LIVE_ADAPTERS.discard, adapter)
+
+        self.assertEqual(adapter._silence_threshold_seconds, 1.8)
+        self.assertFalse(adapter._auto_vision)
+        self.assertEqual(adapter._ack_phrases, ("I'm on it.",))
+
+    def test_only_matching_session_first_tool_schedules_acknowledgement(self):
+        class Loop:
+            def __init__(self):
+                self.calls = []
+
+            def is_running(self):
+                return True
+
+            def call_soon_threadsafe(self, callback, *args):
+                self.calls.append((callback, args))
+
+        loop = Loop()
+        self.adapter._room = object()
+        self.adapter._event_loop = loop
+        self.adapter._tool_ack_pending = True
+        self.adapter.bind_tool_acknowledgement_session("livekit-session")
+
+        self.assertFalse(
+            self.adapter.schedule_tool_acknowledgement(session_id="other-session")
+        )
+        self.assertTrue(
+            self.adapter.schedule_tool_acknowledgement(
+                session_id="livekit-session", turn_id="turn-1", tool_call_id="tool-1"
+            )
+        )
+        self.assertFalse(
+            self.adapter.schedule_tool_acknowledgement(
+                session_id="livekit-session", turn_id="turn-1", tool_call_id="tool-2"
+            )
+        )
+        self.assertEqual(len(loop.calls), 1)
+
 
 class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -137,40 +196,23 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         os.unlink(path)
         published.assert_awaited()
 
-    async def test_slow_turn_defaults_to_status_only_acknowledgement(self):
+    async def test_tool_acknowledgement_is_spoken_without_chat_transcript(self):
         self.adapter._room = object()
         self.adapter._active_sessions["session"] = asyncio.Event()
-        self.adapter._work_ack_audio_path = __file__
+        phrase = livekit_adapter.DEFAULT_ACK_PHRASES[0]
+        self.adapter._tool_ack_audio_paths[phrase] = __file__
 
         with (
-            patch.object(livekit_adapter, "WORK_ACK_DELAY", 0),
-            patch.object(livekit_adapter, "WORK_ACK_MODE", "status"),
-            patch.object(self.adapter, "_publish_agent_event", AsyncMock()) as publish,
-            patch.object(self.adapter, "send", AsyncMock()) as send,
+            patch.object(livekit_adapter.random, "choice", return_value=phrase),
             patch.object(self.adapter, "play_tts", AsyncMock()) as play,
         ):
-            await self.adapter._send_work_ack_if_needed("session", "room")
+            await self.adapter._play_tool_acknowledgement(0)
 
-        publish.assert_awaited()
-        send.assert_not_awaited()
-        play.assert_not_awaited()
-
-    async def test_spoken_acknowledgement_remains_opt_in(self):
-        self.adapter._room = object()
-        self.adapter._active_sessions["session"] = asyncio.Event()
-        self.adapter._work_ack_audio_path = __file__
-
-        with (
-            patch.object(livekit_adapter, "WORK_ACK_DELAY", 0),
-            patch.object(livekit_adapter, "WORK_ACK_MODE", "spoken"),
-            patch.object(self.adapter, "_publish_agent_event", AsyncMock()),
-            patch.object(self.adapter, "send", AsyncMock()) as send,
-            patch.object(self.adapter, "play_tts", AsyncMock()) as play,
-        ):
-            await self.adapter._send_work_ack_if_needed("session", "room")
-
-        send.assert_awaited_once()
-        play.assert_awaited_once_with("room", __file__)
+        play.assert_awaited_once_with(
+            "test-room",
+            __file__,
+            metadata={"non_conversational": True, "tool_acknowledgement": True},
+        )
 
 
 if __name__ == "__main__":

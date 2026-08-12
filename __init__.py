@@ -32,18 +32,54 @@ def _on_session_finalize_hook(**kwargs) -> None:
     """
     for adapter in list(LIVE_ADAPTERS):
         try:
+            adapter._finish_tool_acknowledgement_turn()
             n = adapter.cancel_pending_tool_calls_for_session_reset()
             if n:
                 logger.info("session finalize: cancelled %d in-flight remote tool call(s)", n)
         except Exception as exc:
             logger.debug("session-finalize cleanup failed for %s: %s", adapter, exc)
 
+
+def _livekit_source(event):
+    source = getattr(event, "source", None)
+    platform = getattr(getattr(source, "platform", None), "value", "")
+    return source if platform == "livekit" else None
+
+
+def _on_pre_gateway_dispatch_hook(event=None, session_store=None, **kwargs) -> None:
+    """Bind a new LiveKit turn to Hermes's canonical session ID."""
+    source = _livekit_source(event)
+    if source is None or session_store is None:
+        return
+    try:
+        session_id = session_store.get_or_create_session(source).session_id
+    except Exception as exc:
+        logger.debug("could not bind LiveKit acknowledgement session: %s", exc)
+        return
+
+    chat_id = str(getattr(source, "chat_id", "") or "")
+    for adapter in list(LIVE_ADAPTERS):
+        if not chat_id or adapter._room_name == chat_id:
+            adapter.bind_tool_acknowledgement_session(session_id)
+
+
+def _on_pre_tool_call_hook(
+    session_id="", turn_id="", tool_call_id="", **kwargs
+) -> None:
+    """Mirror Discord: acknowledge once, immediately before the first tool."""
+    for adapter in list(LIVE_ADAPTERS):
+        adapter.schedule_tool_acknowledgement(
+            session_id=session_id,
+            turn_id=turn_id,
+            tool_call_id=tool_call_id,
+        )
+
 _LIVEKIT_PLATFORM_HINT = """You are Hermes LiveKit, a travel assistant for people on live video calls with remote family or friends.
 
 Primary goal: help the user stay natural, helpful, and present during the call. Give practical travel guidance, conversational support, local suggestions, itinerary ideas, and help with what to say or do next.
 
 Interaction rules:
-- Respond immediately with a short acknowledgement when the task may take time, then continue working.
+- Do not narrate routine internal work or add a generic acknowledgement to every turn. The voice adapter supplies one brief cue only when the first tool actually starts.
 - Prefer concise, spoken-friendly answers. Keep wording natural and easy to say aloud.
 - Use text for quick confirmations, links, addresses, code, or details that are easier to read than hear.
 - Avoid heavy markdown or long lists unless the user explicitly asks for them.
@@ -201,6 +237,14 @@ def register(ctx) -> None:
         # Toolset registration is best-effort; the adapter still works
         # without it (resolves through the gateway umbrella toolset).
         pass
+
+    # Match Hermes Discord voice behavior: arm the LiveKit turn at gateway
+    # dispatch and speak one cue only on the first actual tool invocation.
+    try:
+        ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch_hook)
+        ctx.register_hook("pre_tool_call", _on_pre_tool_call_hook)
+    except Exception as exc:
+        logger.debug("acknowledgement hook registration failed: %s", exc)
 
     # Cancel remote-tool futures at session boundaries. Regular spoken
     # interruption is handled by Hermes's busy_input_mode=interrupt path.

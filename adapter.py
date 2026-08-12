@@ -13,10 +13,13 @@ Requires:
 """
 
 import asyncio
+import hashlib
 import io
+import json
 import logging
 import math
 import os
+import random
 import re
 import struct
 import subprocess
@@ -64,7 +67,6 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
-from gateway.session import build_session_key
 
 # Use the ``gateway.platforms.livekit`` namespace rather than ``__name__``.
 # Hermes core's gateway.log handler installs a component filter that only
@@ -100,32 +102,23 @@ def _apply_env_log_level() -> None:
 
 _apply_env_log_level()
 
-# Voice detection
-SILENCE_THRESHOLD_SECONDS = float(os.getenv("HERMES_LIVEKIT_SILENCE_SECONDS", "0.8"))
-MIN_SPEECH_DURATION = 0.5         # minimum seconds to process (skip noise)
-RMS_SILENCE_FLOOR = 50            # PCM RMS below this is silence
+# Voice defaults. Behavioral settings are resolved from
+# ``platforms.livekit.extra`` in Hermes config.yaml for each adapter instance.
+# Keep .env for transport credentials only.
+DEFAULT_SILENCE_THRESHOLD_SECONDS = 1.5  # Discord voice-channel parity
+DEFAULT_MIN_SPEECH_DURATION_SECONDS = 0.5
+DEFAULT_RMS_SILENCE_FLOOR = 50
 POLL_INTERVAL = 0.2               # silence check interval when active
 IDLE_POLL_INTERVAL = 2.0          # silence check interval when no remote participants
-VIDEO_SAMPLE_INTERVAL = float(os.getenv("HERMES_LIVEKIT_VIDEO_SAMPLE_SECONDS", "1.0"))
-VIDEO_FRAME_MAX_AGE = float(os.getenv("HERMES_LIVEKIT_VIDEO_MAX_AGE_SECONDS", "10.0"))
-AUTO_VISION = os.getenv("HERMES_LIVEKIT_AUTO_VISION", "true").strip().lower() in {
-    "1", "true", "yes", "on",
-}
-WORK_ACK_DELAY = float(os.getenv("HERMES_LIVEKIT_WORK_ACK_SECONDS", "6"))
-WORK_ACK_MODE = os.getenv("HERMES_LIVEKIT_WORK_ACK_MODE", "status").strip().lower()
-if WORK_ACK_MODE not in {"off", "status", "text", "spoken"}:
-    logger.warning(
-        "[livekit] Invalid HERMES_LIVEKIT_WORK_ACK_MODE=%r; using status",
-        WORK_ACK_MODE,
-    )
-    WORK_ACK_MODE = "status"
-WORK_ACK_TEXT = os.getenv(
-    "HERMES_LIVEKIT_WORK_ACK_TEXT", "Let me check that."
-).strip()
-IMAGE_STREAM_TOPICS = tuple(
-    topic.strip()
-    for topic in os.getenv("HERMES_LIVEKIT_IMAGE_STREAM_TOPICS", "test,hermes-image").split(",")
-    if topic.strip()
+DEFAULT_VIDEO_SAMPLE_INTERVAL_SECONDS = 1.0
+DEFAULT_VIDEO_FRAME_MAX_AGE_SECONDS = 10.0
+DEFAULT_IMAGE_STREAM_TOPICS = ("test", "hermes-image")
+DEFAULT_ACK_PHRASES = (
+    "Let me look into that.",
+    "One moment.",
+    "Checking on that now.",
+    "Give me a sec.",
+    "On it.",
 )
 MAX_IMAGE_STREAM_BYTES = 12 * 1024 * 1024
 VISUAL_UTTERANCE_RE = re.compile(
@@ -222,6 +215,49 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._agent_name: str = extra.get("agent_name") or os.getenv("LIVEKIT_AGENT_NAME", "Hermes")
         self._agent_avatar: str = extra.get("agent_avatar") or os.getenv("LIVEKIT_AGENT_AVATAR", "") or self._find_default_avatar()
 
+        audio_config = extra.get("audio") if isinstance(extra.get("audio"), dict) else {}
+        vision_config = extra.get("vision") if isinstance(extra.get("vision"), dict) else {}
+        ack_config = (
+            extra.get("acknowledgements")
+            if isinstance(extra.get("acknowledgements"), dict)
+            else {}
+        )
+        self._silence_threshold_seconds = self._positive_float(
+            audio_config.get("silence_threshold_seconds"),
+            DEFAULT_SILENCE_THRESHOLD_SECONDS,
+        )
+        self._min_speech_duration_seconds = self._positive_float(
+            audio_config.get("min_speech_duration_seconds"),
+            DEFAULT_MIN_SPEECH_DURATION_SECONDS,
+        )
+        self._rms_silence_floor = self._nonnegative_float(
+            audio_config.get("rms_silence_floor"), DEFAULT_RMS_SILENCE_FLOOR
+        )
+        self._video_sample_interval_seconds = self._positive_float(
+            vision_config.get("sample_interval_seconds"),
+            DEFAULT_VIDEO_SAMPLE_INTERVAL_SECONDS,
+        )
+        self._video_frame_max_age_seconds = self._positive_float(
+            vision_config.get("frame_max_age_seconds"),
+            DEFAULT_VIDEO_FRAME_MAX_AGE_SECONDS,
+        )
+        self._auto_vision = self._config_bool(vision_config.get("auto_attach"), True)
+        topics = vision_config.get("image_stream_topics", DEFAULT_IMAGE_STREAM_TOPICS)
+        if isinstance(topics, str):
+            topics = topics.split(",")
+        self._image_stream_topics = tuple(
+            str(topic).strip() for topic in topics if str(topic).strip()
+        ) if isinstance(topics, (list, tuple)) else DEFAULT_IMAGE_STREAM_TOPICS
+        self._ack_enabled = self._config_bool(ack_config.get("enabled"), True)
+        phrases = ack_config.get("phrases", DEFAULT_ACK_PHRASES)
+        if isinstance(phrases, str):
+            phrases = [phrases]
+        self._ack_phrases = tuple(
+            str(phrase).strip() for phrase in phrases if str(phrase).strip()
+        ) if isinstance(phrases, (list, tuple)) else DEFAULT_ACK_PHRASES
+        if not self._ack_phrases:
+            self._ack_enabled = False
+
         self._room: Optional["rtc.Room"] = None
         self._audio_source: Optional["rtc.AudioSource"] = None
         self._local_track: Optional["rtc.LocalAudioTrack"] = None
@@ -244,8 +280,12 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._playback_interrupt = asyncio.Event()
         self._playback_lock = asyncio.Lock()
         self._stt_lock = asyncio.Lock()
-        self._work_ack_tasks: set[asyncio.Task] = set()
-        self._work_ack_audio_path: Optional[str] = None
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._tool_ack_generation = 0
+        self._tool_ack_pending = False
+        self._tool_ack_session_id = ""
+        self._tool_ack_tasks: set[asyncio.Task] = set()
+        self._tool_ack_audio_paths: Dict[str, str] = {}
 
         # Per-participant speech state (for listening-start/stop events)
         self._speaking_participants: set[str] = set()
@@ -281,6 +321,131 @@ class LiveKitAdapter(BasePlatformAdapter):
         # Register in module-level set so the plugin's session-finalize hook
         # can reach us. (Multi-room would mean multiple adapters; v1 is one.)
         LIVE_ADAPTERS.add(self)
+
+    @staticmethod
+    def _config_bool(value: Any, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        return bool(value)
+
+    @staticmethod
+    def _positive_float(value: Any, default: float) -> float:
+        try:
+            parsed = float(value)
+            return parsed if parsed > 0 else default
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _nonnegative_float(value: Any, default: float) -> float:
+        try:
+            parsed = float(value)
+            return parsed if parsed >= 0 else default
+        except (TypeError, ValueError):
+            return default
+
+    def _arm_tool_acknowledgement(self) -> None:
+        """Arm one acknowledgement for the next real tool call in this turn."""
+        self._event_loop = asyncio.get_running_loop()
+        self._tool_ack_generation += 1
+        self._tool_ack_pending = self._ack_enabled
+        self._tool_ack_session_id = ""
+
+    def bind_tool_acknowledgement_session(self, session_id: str) -> None:
+        """Bind the armed LiveKit turn to Hermes's persisted session ID."""
+        if self._tool_ack_pending:
+            self._tool_ack_session_id = str(session_id or "")
+
+    def schedule_tool_acknowledgement(
+        self,
+        *,
+        session_id: str = "",
+        turn_id: str = "",
+        tool_call_id: str = "",
+    ) -> bool:
+        """Schedule the Discord-style first-tool acknowledgement thread-safely.
+
+        Hermes tool hooks may execute on a worker thread. The actual TTS and
+        LiveKit work is therefore handed back to the adapter's event loop.
+        """
+        if not self._tool_ack_pending or not self._ack_enabled:
+            return False
+        if self._tool_ack_session_id and str(session_id or "") != self._tool_ack_session_id:
+            return False
+        loop = self._event_loop
+        if loop is None or not loop.is_running() or self._room is None:
+            return False
+
+        self._tool_ack_pending = False
+        generation = self._tool_ack_generation
+        loop.call_soon_threadsafe(self._start_tool_ack_task, generation)
+        logger.debug(
+            "[%s] tool acknowledgement armed for turn=%s tool_call=%s",
+            self.name,
+            turn_id or "?",
+            tool_call_id or "?",
+        )
+        return True
+
+    def _start_tool_ack_task(self, generation: int) -> None:
+        if generation != self._tool_ack_generation or not self._running:
+            return
+        task = asyncio.create_task(self._play_tool_acknowledgement(generation))
+        self._tool_ack_tasks.add(task)
+        task.add_done_callback(self._tool_ack_tasks.discard)
+
+    async def _play_tool_acknowledgement(self, generation: int) -> None:
+        """Speak one short phrase only while the originating turn is active."""
+        phrase = random.choice(self._ack_phrases)
+        try:
+            audio_path = self._tool_ack_audio_paths.get(phrase, "")
+            if not audio_path or not os.path.isfile(audio_path):
+                from tools.tts_tool import check_tts_requirements, text_to_speech_tool
+
+                if not check_tts_requirements():
+                    return
+                digest = hashlib.sha256(phrase.encode("utf-8")).hexdigest()[:12]
+                output_path = os.path.join(
+                    tempfile.gettempdir(), "hermes_livekit", f"tool_ack_{digest}.mp3"
+                )
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                raw_result = await asyncio.to_thread(
+                    text_to_speech_tool,
+                    text=phrase,
+                    output_path=output_path,
+                )
+                result = json.loads(raw_result)
+                audio_path = str(result.get("file_path") or output_path)
+                if not result.get("success", True) or not os.path.isfile(audio_path):
+                    return
+                self._tool_ack_audio_paths[phrase] = audio_path
+
+            # Do not let a late TTS synthesis talk over a response that has
+            # already completed or a newer user turn.
+            if generation != self._tool_ack_generation or not self._active_sessions:
+                return
+            await self.play_tts(
+                self._room_name,
+                audio_path,
+                metadata={"non_conversational": True, "tool_acknowledgement": True},
+            )
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.debug("[%s] tool acknowledgement failed: %s", self.name, exc)
+
+    def _finish_tool_acknowledgement_turn(self) -> None:
+        self._tool_ack_generation += 1
+        self._tool_ack_pending = False
+        self._tool_ack_session_id = ""
 
     def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
         """LiveKit is voice-first — always auto-TTS unless the chat opted out.
@@ -377,6 +542,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         adapter has no cold-boot vs reconnect distinction, so it is
         accepted and ignored.
         """
+        self._event_loop = asyncio.get_running_loop()
         if not LIVEKIT_AVAILABLE:
             logger.warning("[%s] livekit SDK not installed. Run: pip install hermes-livekit", self.name)
             return False
@@ -459,7 +625,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             # Inbound data-channel: clients send control messages (capture-frame,
             # typed text, runtime control hooks) on the hermes-control topic.
             self._room.on("data_received", self._on_data_received)
-            for topic in IMAGE_STREAM_TOPICS:
+            for topic in self._image_stream_topics:
                 try:
                     self._room.register_byte_stream_handler(topic, self._on_image_stream)
                 except Exception as exc:
@@ -563,9 +729,17 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._video_track_meta.clear()
         self._latest_video_frames.clear()
 
-        for task in list(self._work_ack_tasks):
+        for task in list(self._tool_ack_tasks):
             task.cancel()
-        self._work_ack_tasks.clear()
+        self._tool_ack_tasks.clear()
+        self._tool_ack_pending = False
+
+        for path in set(self._tool_ack_audio_paths.values()):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self._tool_ack_audio_paths.clear()
 
         if self._room:
             self._graceful_leave = True
@@ -595,6 +769,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._cleanup_all_client_tools()
 
         LIVE_ADAPTERS.discard(self)
+        self._event_loop = None
 
         logger.info("[%s] Disconnected", self.name)
 
@@ -640,6 +815,7 @@ class LiveKitAdapter(BasePlatformAdapter):
                 media_types=[],
                 timestamp=datetime.now(tz=timezone.utc),
             )
+            self._arm_tool_acknowledgement()
             await super().handle_message(msg_event)
             return
 
@@ -647,22 +823,8 @@ class LiveKitAdapter(BasePlatformAdapter):
             await super().handle_message(event)
             return
 
-        session_key = build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
-        was_active = session_key in self._active_sessions
+        self._arm_tool_acknowledgement()
         await super().handle_message(event)
-        if (
-            not was_active
-            and session_key in self._active_sessions
-            and WORK_ACK_DELAY > 0
-            and WORK_ACK_MODE != "off"
-        ):
-            task = asyncio.create_task(self._send_work_ack_if_needed(session_key, event.source.chat_id))
-            self._work_ack_tasks.add(task)
-            task.add_done_callback(self._work_ack_tasks.discard)
 
 
 
@@ -928,7 +1090,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             # are not.
             speech_end = len(buf)
             duration = speech_end / (SAMPLE_RATE * NUM_CHANNELS * 2)
-            if duration >= MIN_SPEECH_DURATION:
+            if duration >= self._min_speech_duration_seconds:
                 pcm_data = bytes(buf[:speech_end])
                 logger.info(
                     "[%s] Utterance from %s: %.1fs audio (flushed on track end)",
@@ -1028,7 +1190,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         try:
             async for frame_event in stream:
                 now = time.monotonic()
-                if now - last_sample < VIDEO_SAMPLE_INTERVAL:
+                if now - last_sample < self._video_sample_interval_seconds:
                     continue
                 last_sample = now
                 meta = self._video_track_meta.get(track_key)
@@ -1073,7 +1235,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         if latest is None:
             return None
         jpeg, captured_at, source_name, _width, _height = latest
-        if time.monotonic() - captured_at > VIDEO_FRAME_MAX_AGE:
+        if time.monotonic() - captured_at > self._video_frame_max_age_seconds:
             return None
         tmp_dir = os.path.join(tempfile.gettempdir(), "hermes_livekit")
         os.makedirs(tmp_dir, exist_ok=True)
@@ -1158,7 +1320,7 @@ class LiveKitAdapter(BasePlatformAdapter):
                     tail = bytes(buf[-bytes_per_tick:]) if buf_len >= bytes_per_tick else bytes(buf)
                     rms = _compute_rms(tail)
 
-                    if rms > RMS_SILENCE_FLOOR:
+                    if rms > self._rms_silence_floor:
                         # Active speech — update timestamp
                         self._last_audio_time[identity] = time.monotonic()
                         # Emit listening-start on first loud chunk of an utterance
@@ -1180,16 +1342,16 @@ class LiveKitAdapter(BasePlatformAdapter):
                         continue
 
                     elapsed_silence = time.monotonic() - last_time
-                    if elapsed_silence < SILENCE_THRESHOLD_SECONDS:
+                    if elapsed_silence < self._silence_threshold_seconds:
                         continue
 
                     # Trim trailing silence from the buffer (keep only up to
                     # SILENCE_THRESHOLD worth of trailing audio)
-                    silence_bytes = int(SILENCE_THRESHOLD_SECONDS * SAMPLE_RATE * NUM_CHANNELS * 2)
+                    silence_bytes = int(self._silence_threshold_seconds * SAMPLE_RATE * NUM_CHANNELS * 2)
                     speech_end = max(0, buf_len - silence_bytes)
 
                     duration = speech_end / (SAMPLE_RATE * NUM_CHANNELS * 2)
-                    if duration < MIN_SPEECH_DURATION:
+                    if duration < self._min_speech_duration_seconds:
                         # Too short — discard as noise
                         self._audio_buffers[identity] = bytearray()
                         self._last_audio_time.pop(identity, None)
@@ -1261,7 +1423,7 @@ class LiveKitAdapter(BasePlatformAdapter):
 
             # Drain any captured frames into this message so the agent's
             # vision pipeline sees them alongside the transcript.
-            if AUTO_VISION and self._should_attach_video(transcript):
+            if self._auto_vision and self._should_attach_video(transcript):
                 self._queue_latest_video_frame(identity)
             media_urls, media_types = self._drain_pending_captures()
 
@@ -1361,7 +1523,7 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         # Handle direct text messages (browser chatbox input)
         if is_text_message and msg_type == "text":
-            if AUTO_VISION and self._should_attach_video(text_content):
+            if self._auto_vision and self._should_attach_video(text_content):
                 self._queue_latest_video_frame(participant_identity)
             media_urls, media_types = self._drain_pending_captures()
             asyncio.create_task(self.handle_message(MessageEvent(
@@ -1449,8 +1611,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         task = asyncio.create_task(
             self._receive_image_stream(reader, str(participant_identity or "client"))
         )
-        self._work_ack_tasks.add(task)
-        task.add_done_callback(self._work_ack_tasks.discard)
+        self._tool_ack_tasks.add(task)
+        task.add_done_callback(self._tool_ack_tasks.discard)
 
     async def _receive_image_stream(self, reader: Any, identity: str) -> None:
         data = bytearray()
@@ -1496,7 +1658,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         if not text:
             return
 
-        if AUTO_VISION and self._should_attach_video(text):
+        if self._auto_vision and self._should_attach_video(text):
             self._queue_latest_video_frame(identity)
         media_urls, media_types = self._drain_pending_captures()
 
@@ -1829,50 +1991,6 @@ class LiveKitAdapter(BasePlatformAdapter):
 
     # -- Outbound messaging -------------------------------------------------
 
-    async def _send_work_ack_if_needed(self, session_key: str, chat_id: str) -> None:
-        """Acknowledge a slow turn without interrupting normal conversation."""
-        try:
-            await asyncio.sleep(WORK_ACK_DELAY)
-            guard = self._active_sessions.get(session_key)
-            if guard is None or not WORK_ACK_TEXT or not self._room:
-                return
-
-            await self._publish_agent_event(
-                "agent:status",
-                {"status": "working", "message": WORK_ACK_TEXT},
-            )
-            if WORK_ACK_MODE == "status":
-                return
-
-            await self.send(chat_id, WORK_ACK_TEXT, metadata={"non_conversational": True})
-            if WORK_ACK_MODE == "text":
-                return
-
-            # Spoken mode is opt-in. Generate the fixed phrase once and reuse it.
-            if not self._work_ack_audio_path or not os.path.exists(self._work_ack_audio_path):
-                try:
-                    from tools.tts_tool import text_to_speech_tool, check_tts_requirements
-                    if check_tts_requirements():
-                        import json as _json
-                        result = await asyncio.to_thread(
-                            text_to_speech_tool, text=WORK_ACK_TEXT
-                        )
-                        self._work_ack_audio_path = _json.loads(result).get("file_path")
-                except Exception as exc:
-                    logger.debug("[%s] work acknowledgement TTS failed: %s", self.name, exc)
-
-            # The turn may have completed while TTS was being generated.
-            if (
-                session_key in self._active_sessions
-                and self._work_ack_audio_path
-                and os.path.exists(self._work_ack_audio_path)
-            ):
-                await self.play_tts(chat_id, self._work_ack_audio_path)
-        except asyncio.CancelledError:
-            return
-        except Exception as exc:
-            logger.debug("[%s] work acknowledgement failed: %s", self.name, exc)
-
     async def _publish_agent_event(
         self, event_type: str, payload: Optional[Dict[str, Any]] = None
     ) -> None:
@@ -1906,6 +2024,11 @@ class LiveKitAdapter(BasePlatformAdapter):
         """Send text via data channel (best-effort for connected web clients)."""
         if not self._room:
             return SendResult(success=False, error="Not connected to room")
+
+        # A normal response closes the acknowledgement window. Telemetry and
+        # tool cues are explicitly non-conversational and must not do so.
+        if not (metadata or {}).get("non_conversational"):
+            self._finish_tool_acknowledgement_turn()
 
         try:
             data = content.encode("utf-8")

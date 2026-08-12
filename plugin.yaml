@@ -2,7 +2,7 @@
 name: hermes-livekit
 label: LiveKit WebRTC
 kind: platform
-version: 1.1.0
+version: 1.2.0
 description: LiveKit WebRTC voice gateway plugin for Hermes
 author: kortexa-ai
 
