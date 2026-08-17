@@ -20,6 +20,24 @@ LiveKit follows Hermes Discord voice behavior:
 The default end-of-utterance silence threshold is also aligned with Discord at
 1.5 seconds. Barge-in still interrupts playback immediately.
 
+## MiRA domain tools over LiveKit
+
+A trusted room participant such as MiRA's silent Python worker can register a
+bounded tool by publishing a `client:tool-register` JSON envelope on the
+`hermes-control` topic. Hermes validates the name and object input schema, adds
+the tool to its registry, targets `agent:tool-call` envelopes back to the owner,
+and waits for a matching `client:tool-result`. Registrations and results are
+control messages and do not need a fake text/content field.
+
+The MiRA worker currently includes a harmless `content` compatibility marker in
+these envelopes so an installed pre-fix adapter can also route them. Updated
+adapters dispatch on `type` and ignore that marker.
+
+MiRA currently uses this protocol for `find_local_recommendations`. The worker,
+not the LLM, injects the Tourism AI session ID and holds the short-lived backend
+credential. Do not expose arbitrary HTTP, SQL, Cypher, shell, or filesystem
+tools through this protocol.
+
 ## One-click setup on Windows
 
 After Hermes is installed, open the MiRA repository and double-click:
@@ -119,8 +137,13 @@ LIVEKIT_API_KEY=replace-me
 LIVEKIT_API_SECRET=replace-me
 LIVEKIT_ROOM=hermes
 LIVEKIT_AGENT_NAME=MiRA
-LIVEKIT_ALLOW_ALL_USERS=true
+LIVEKIT_ALLOW_ALL_USERS=false
 ```
+
+New installs deny unpaired users by default. If every participant in an
+isolated research room must be accepted, rerun setup with `-AllowAllUsers` after
+reviewing the room-token and participant-admission policy. Upgrades preserve an
+existing explicit `true` or `false` value.
 
 Set `acknowledgements.enabled: false` to disable tool acknowledgements, or edit
 the phrase list to match MiRA's voice. Restart the gateway after changing YAML.

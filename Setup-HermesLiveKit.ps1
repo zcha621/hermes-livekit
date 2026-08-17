@@ -7,6 +7,7 @@ param(
     [string]$LiveKitEnvFile,
     [string]$Room = "hermes",
     [string]$AgentName = "Hermes",
+    [switch]$AllowAllUsers,
     [switch]$InstallHermes,
     [switch]$InstallFfmpeg,
     [switch]$RestartGateway,
@@ -171,6 +172,14 @@ if (-not (Test-Path -LiteralPath $pythonExe) -or -not (Test-Path -LiteralPath $h
 }
 
 $existingEnv = Get-DotEnvValues $envPath
+$allowAllUsersValue = "false"
+if ($PSBoundParameters.ContainsKey("AllowAllUsers")) {
+    $allowAllUsersValue = "true"
+} elseif ($existingEnv["LIVEKIT_ALLOW_ALL_USERS"] -in @("true", "false")) {
+    # Preserve an operator's explicit existing policy on upgrades. New installs
+    # fail closed unless -AllowAllUsers is deliberately supplied.
+    $allowAllUsersValue = $existingEnv["LIVEKIT_ALLOW_ALL_USERS"]
+}
 $existingValueMap = @{
     LiveKitUrl       = "LIVEKIT_URL"
     LiveKitApiKey    = "LIVEKIT_API_KEY"
@@ -279,7 +288,7 @@ try {
     Set-DotEnvValue $envPath "LIVEKIT_API_SECRET" $LiveKitApiSecret
     Set-DotEnvValue $envPath "LIVEKIT_ROOM" $Room
     Set-DotEnvValue $envPath "LIVEKIT_AGENT_NAME" $AgentName
-    Set-DotEnvValue $envPath "LIVEKIT_ALLOW_ALL_USERS" "true"
+    Set-DotEnvValue $envPath "LIVEKIT_ALLOW_ALL_USERS" $allowAllUsersValue
     Remove-DotEnvValues $envPath @(
         "HERMES_LIVEKIT_AUTO_VISION",
         "HERMES_LIVEKIT_VIDEO_SAMPLE_SECONDS",

@@ -1499,16 +1499,8 @@ class LiveKitAdapter(BasePlatformAdapter):
             text_content = raw_text
 
         is_text_message = bool(text_content) or msg_type == "text"
-
-        if not is_text_message:
-            logger.debug("[%s] %s: ignoring non-text message from %s", self.name, topic, participant_identity or "?")
-            return
-
-        if not msg_type:
-            msg_type = "text" if text_content else ""
-        if not msg_type:
-            logger.debug("[%s] %s: payload missing 'type'", self.name, self.DATA_CHANNEL_CONTROL_TOPIC)
-            return
+        if not msg_type and text_content:
+            msg_type = "text"
 
         # Dispatch table. Keep additions here so adding new client:* types
         # is a single line.
@@ -1521,7 +1513,16 @@ class LiveKitAdapter(BasePlatformAdapter):
             "client:tool-result": lambda: self._handle_tool_result(msg, participant_identity),
         }
 
-        # Handle direct text messages (browser chatbox input)
+        handler = handlers.get(msg_type)
+        if handler is not None:
+            try:
+                asyncio.create_task(handler())
+            except RuntimeError:
+                # No running loop (callback fired during teardown). Drop quietly.
+                pass
+            return
+
+        # Handle direct text messages (browser chatbox input).
         if is_text_message and msg_type == "text":
             if self._auto_vision and self._should_attach_video(text_content):
                 self._queue_latest_video_frame(participant_identity)
@@ -1545,16 +1546,14 @@ class LiveKitAdapter(BasePlatformAdapter):
                 media_types=media_types,
                 timestamp=datetime.now(tz=timezone.utc),
             )))
-        handler = handlers.get(msg_type)
-        if handler is None:
-            logger.debug("[%s] unknown control type %r from %s", self.name, msg_type, participant_identity or "?")
             return
 
-        try:
-            asyncio.create_task(handler())
-        except RuntimeError:
-            # No running loop (callback fired during teardown). Drop quietly.
-            pass
+        logger.debug(
+            "[%s] unknown control type %r from %s",
+            self.name,
+            msg_type,
+            participant_identity or "?",
+        )
 
     async def _capture_next_frame(self, identity: str) -> None:
         """Sample the very next video frame from ``identity`` and queue it.

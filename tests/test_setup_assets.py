@@ -36,6 +36,18 @@ class SetupAssetTests(unittest.TestCase):
         self.assertIn('$_.Name -like "control_bridge.py.retired-*"', setup)
         self.assertNotIn("Move-Item -LiteralPath $bridgePath", setup)
 
+    def test_setup_does_not_force_allow_all_users_on_new_installs(self):
+        setup = (PLUGIN_ROOT / "Setup-HermesLiveKit.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+
+        self.assertIn("[switch]$AllowAllUsers", setup)
+        self.assertIn('$allowAllUsersValue = "false"', setup)
+        self.assertNotIn(
+            'Set-DotEnvValue $envPath "LIVEKIT_ALLOW_ALL_USERS" "true"',
+            setup,
+        )
+
     def test_readme_leads_with_one_click_setup(self):
         readme = (PLUGIN_ROOT / "README.md").read_text(encoding="utf-8")
 

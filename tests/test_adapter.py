@@ -173,6 +173,30 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received["event"].text, "hello from phone")
         self.assertEqual(received["event"].source.user_id, "phone")
 
+    async def test_tool_registration_control_message_does_not_require_text(self):
+        registered = asyncio.Event()
+        received = {}
+
+        async def fake_register(message, identity):
+            received["message"] = message
+            received["identity"] = identity
+            registered.set()
+
+        packet = SimpleNamespace(
+            topic="hermes-control",
+            data=(
+                b'{"type":"client:tool-register","name":"find_local_recommendations",'
+                b'"description":"Grounded tourism retrieval","input_schema":{"type":"object"}}'
+            ),
+            participant=SimpleNamespace(identity="mira-worker"),
+        )
+        with patch.object(self.adapter, "_register_client_tool", fake_register):
+            self.adapter._on_data_received(packet)
+            await asyncio.wait_for(registered.wait(), timeout=1)
+
+        self.assertEqual(received["identity"], "mira-worker")
+        self.assertEqual(received["message"]["name"], "find_local_recommendations")
+
     async def test_image_byte_stream_is_queued_for_next_turn(self):
         published = AsyncMock()
 
