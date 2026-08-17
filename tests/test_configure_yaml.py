@@ -5,7 +5,7 @@ from pathlib import Path
 
 import yaml
 
-from configure_yaml import ACKNOWLEDGEMENT_PHRASES, update_config
+from configure_yaml import ACKNOWLEDGEMENT_PHRASES, INVOCATION_KEYTERMS, update_config
 
 
 class ConfigureYamlTests(unittest.TestCase):
@@ -35,6 +35,8 @@ class ConfigureYamlTests(unittest.TestCase):
             self.assertEqual(
                 extra["vision"]["image_stream_topics"], ["test", "hermes-image"]
             )
+            self.assertEqual(extra["invocation"]["keyterms"], INVOCATION_KEYTERMS)
+            self.assertEqual(extra["invocation"]["conversation_timeout_seconds"], 120)
         finally:
             path.unlink(missing_ok=True)
 

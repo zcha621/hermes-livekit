@@ -120,6 +120,11 @@ DEFAULT_ACK_PHRASES = (
     "Give me a sec.",
     "On it.",
 )
+DEFAULT_INVOCATION_KEYTERMS = ("Hermes", "MiRA")
+DEFAULT_CONVERSATION_TIMEOUT_SECONDS = 120.0
+AGENT_STATUS_SCHEMA = "mira-agent-status.v1"
+AGENT_STATES = frozenset({"initializing", "idle", "listening", "thinking", "speaking"})
+TOPIC_MAX_LENGTH = 180
 MAX_IMAGE_STREAM_BYTES = 12 * 1024 * 1024
 VISUAL_UTTERANCE_RE = re.compile(
     r"\b("
@@ -222,6 +227,11 @@ class LiveKitAdapter(BasePlatformAdapter):
             if isinstance(extra.get("acknowledgements"), dict)
             else {}
         )
+        invocation_config = (
+            extra.get("invocation")
+            if isinstance(extra.get("invocation"), dict)
+            else {}
+        )
         self._silence_threshold_seconds = self._positive_float(
             audio_config.get("silence_threshold_seconds"),
             DEFAULT_SILENCE_THRESHOLD_SECONDS,
@@ -258,6 +268,39 @@ class LiveKitAdapter(BasePlatformAdapter):
         if not self._ack_phrases:
             self._ack_enabled = False
 
+        keyterms = invocation_config.get("keyterms", DEFAULT_INVOCATION_KEYTERMS)
+        if isinstance(keyterms, str):
+            keyterms = keyterms.split(",")
+        self._keyterms = tuple(
+            dict.fromkeys(
+                str(keyterm).strip()
+                for keyterm in keyterms
+                if str(keyterm).strip()
+            )
+        ) if isinstance(keyterms, (list, tuple)) else DEFAULT_INVOCATION_KEYTERMS
+        self._invocation_enabled = self._config_bool(
+            invocation_config.get("enabled"), True
+        ) and bool(self._keyterms)
+        self._strip_keyterm = self._config_bool(
+            invocation_config.get("strip_keyterm"), True
+        )
+        self._conversation_timeout_seconds = self._positive_float(
+            invocation_config.get("conversation_timeout_seconds"),
+            DEFAULT_CONVERSATION_TIMEOUT_SECONDS,
+        )
+        self._keyterm_patterns = tuple(
+            (
+                keyterm,
+                re.compile(
+                    r"(?<!\w)"
+                    + r"\s+".join(re.escape(part) for part in keyterm.split())
+                    + r"(?!\w)",
+                    re.IGNORECASE,
+                ),
+            )
+            for keyterm in self._keyterms
+        )
+
         self._room: Optional["rtc.Room"] = None
         self._audio_source: Optional["rtc.AudioSource"] = None
         self._local_track: Optional["rtc.LocalAudioTrack"] = None
@@ -289,6 +332,20 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         # Per-participant speech state (for listening-start/stop events)
         self._speaking_participants: set[str] = set()
+
+        # A keyterm opens a room-wide conversation window. Hermes already
+        # supports shared group sessions; this state adds explicit invocation,
+        # current-speaker, and per-speaker topic tracking to that session.
+        self._conversation_active_until = 0.0
+        self._conversation_expiry_task: Optional[asyncio.Task] = None
+        self._participant_topics: Dict[str, str] = {}
+        self._active_speaker_identity = ""
+        self._active_speaker_name = ""
+        self._active_topic = ""
+        self._last_keyterm = ""
+        self._agent_state = "initializing"
+        self._agent_state_generation = 0
+        self._agent_state_lock = asyncio.Lock()
 
         # Video streams are continuously drained to avoid native queue
         # overflows. Only a throttled latest frame is JPEG-encoded in memory.
@@ -351,6 +408,195 @@ class LiveKitAdapter(BasePlatformAdapter):
             return parsed if parsed >= 0 else default
         except (TypeError, ValueError):
             return default
+
+    def _conversation_is_active(self) -> bool:
+        if not self._invocation_enabled:
+            return True
+        return time.monotonic() < self._conversation_active_until
+
+    def _participant_display_name(self, identity: str) -> str:
+        if self._room is not None:
+            participant = self._room.remote_participants.get(identity)
+            name = str(getattr(participant, "name", "") or "").strip()
+            if name:
+                return name
+        return identity or "Participant"
+
+    def _match_keyterm(self, transcript: str) -> tuple[str, str]:
+        """Return ``(matched keyterm, optionally stripped transcript)``."""
+        for keyterm, pattern in self._keyterm_patterns:
+            match = pattern.search(transcript)
+            if match is None:
+                continue
+            cleaned = transcript
+            if self._strip_keyterm:
+                cleaned = (transcript[:match.start()] + " " + transcript[match.end():])
+                cleaned = re.sub(r"^[\s,.:;!?\-–—]+|[\s,.:;!?\-–—]+$", "", cleaned)
+                cleaned = re.sub(r"^(?:hey|hi|okay|ok)\b[\s,.:;!?\-–—]*", "", cleaned, flags=re.IGNORECASE)
+                cleaned = re.sub(r"\s{2,}", " ", cleaned)
+            return keyterm, cleaned.strip()
+        return "", transcript.strip()
+
+    @staticmethod
+    def _topic_for_turn(text: str, previous: str = "") -> str:
+        compact = re.sub(r"\s+", " ", text).strip()
+        meaningful_words = re.findall(r"[\w'-]+", compact, flags=re.UNICODE)
+        if len(meaningful_words) < 4 and previous:
+            return previous
+        if len(compact) <= TOPIC_MAX_LENGTH:
+            return compact
+        return compact[: TOPIC_MAX_LENGTH - 1].rstrip() + "…"
+
+    def _activate_conversation(self, keyterm: str = "") -> None:
+        self._conversation_active_until = (
+            time.monotonic() + self._conversation_timeout_seconds
+        )
+        if keyterm:
+            self._last_keyterm = keyterm
+        if self._conversation_expiry_task is not None:
+            self._conversation_expiry_task.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._conversation_expiry_task = None
+        else:
+            self._conversation_expiry_task = loop.create_task(
+                self._expire_conversation_after_idle()
+            )
+
+    async def _expire_conversation_after_idle(self) -> None:
+        try:
+            while self._running:
+                remaining = self._conversation_active_until - time.monotonic()
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                    continue
+                if self._active_sessions or self._is_playing or self._speaking_participants:
+                    self._conversation_active_until = time.monotonic() + 5.0
+                    continue
+                self._active_speaker_identity = ""
+                self._active_speaker_name = ""
+                self._active_topic = ""
+                await self._set_agent_state("idle", force=True)
+                return
+        except asyncio.CancelledError:
+            return
+
+    async def _prepare_invoked_event(self, event: MessageEvent) -> bool:
+        """Apply room invocation policy and speaker/topic context to a turn."""
+        identity = str(getattr(event.source, "user_id", "") or "client")
+        display_name = self._participant_display_name(identity)
+        matched_keyterm, cleaned = self._match_keyterm(event.text or "")
+        was_active = self._conversation_is_active()
+
+        if matched_keyterm:
+            self._activate_conversation(matched_keyterm)
+        elif not was_active:
+            await self._publish_agent_event(
+                "agent:invocation-required",
+                {"identity": identity, "keyterms": list(self._keyterms)},
+            )
+            await self._set_agent_state("idle", force=True)
+            return False
+        else:
+            self._activate_conversation()
+
+        self._active_speaker_identity = identity
+        self._active_speaker_name = display_name
+        self._active_topic = self._participant_topics.get(identity, "")
+        if cleaned:
+            topic = self._topic_for_turn(
+                cleaned, self._participant_topics.get(identity, "")
+            )
+            if topic:
+                self._participant_topics[identity] = topic
+                self._active_topic = topic
+
+        # A standalone wake phrase opens the follow-up window without sending a
+        # content-free LLM turn. The UI still receives the invocation status.
+        if not cleaned:
+            await self._publish_agent_event(
+                "agent:invoked",
+                {"identity": identity, "name": display_name, "keyterm": matched_keyterm},
+            )
+            await self._set_agent_state("idle", force=True)
+            return False
+
+        event.text = cleaned
+        event.source.user_name = display_name
+        event.source.chat_type = "group"
+        ledger = "; ".join(
+            f"{self._participant_display_name(person)}: {topic}"
+            for person, topic in self._participant_topics.items()
+        )
+        meeting_context = (
+            "LiveKit meeting context: the current speaker is "
+            f"{display_name} (identity {identity}). "
+            "Address the correct speaker and distinguish participants. "
+            f"Latest participant topics/requests: {ledger}."
+        )
+        existing_prompt = str(getattr(event, "channel_prompt", "") or "").strip()
+        event.channel_prompt = (
+            f"{existing_prompt}\n\n{meeting_context}" if existing_prompt else meeting_context
+        )
+        setattr(event, "_livekit_invocation_checked", True)
+        return True
+
+    def _agent_status_payload(self) -> Dict[str, Any]:
+        invoked = self._conversation_is_active()
+        return {
+            "schema": AGENT_STATUS_SCHEMA,
+            "state": self._agent_state,
+            "invoked": invoked,
+            "can_interrupt": invoked,
+            "active_speaker": {
+                "identity": self._active_speaker_identity,
+                "name": self._active_speaker_name,
+            },
+            "topic": self._active_topic,
+            "keyterms": list(self._keyterms),
+            "last_keyterm": self._last_keyterm,
+            "updated_at": datetime.now(tz=timezone.utc).isoformat(),
+        }
+
+    async def _set_agent_state(self, state: str, *, force: bool = False) -> int:
+        """Synchronize LiveKit's standard state attribute and MiRA context."""
+        if state not in AGENT_STATES:
+            raise ValueError(f"Unsupported LiveKit agent state: {state}")
+        async with self._agent_state_lock:
+            if not force and state == self._agent_state:
+                return self._agent_state_generation
+            previous_state = self._agent_state
+            self._agent_state = state
+            self._agent_state_generation += 1
+            generation = self._agent_state_generation
+            payload = self._agent_status_payload()
+            if self._room is not None:
+                attributes = {
+                    "lk.agent.state": state,
+                    "lk.agent.inputs": '["audio","text"]',
+                    "lk.agent.outputs": '["audio","transcription"]',
+                    "mira.agent.status_schema": AGENT_STATUS_SCHEMA,
+                    "mira.agent.invoked": "true" if payload["invoked"] else "false",
+                    "mira.agent.active_speaker": self._active_speaker_identity,
+                    "mira.agent.active_speaker_name": self._active_speaker_name,
+                    "mira.agent.topic": self._active_topic,
+                    "mira.agent.keyterms": json.dumps(self._keyterms),
+                }
+                try:
+                    await self._room.local_participant.set_attributes(attributes)
+                except Exception as exc:
+                    logger.debug("[%s] agent attributes update failed: %s", self.name, exc)
+                await self._publish_agent_event("agent:status", payload)
+                if previous_state == "thinking" and state != "thinking":
+                    await self._publish_agent_event("agent:thinking-stop")
+                if state == "thinking" and previous_state != "thinking":
+                    await self._publish_agent_event("agent:thinking-start")
+            return generation
+
+    async def _finish_state_if_current(self, generation: int) -> None:
+        if generation == self._agent_state_generation:
+            await self._set_agent_state("idle")
 
     def _arm_tool_acknowledgement(self) -> None:
         """Arm one acknowledgement for the next real tool call in this turn."""
@@ -649,6 +895,7 @@ class LiveKitAdapter(BasePlatformAdapter):
 
             # Connect to room
             await self._room.connect(self._url, jwt_token)
+            await self._set_agent_state("initializing", force=True)
 
             # Set metadata (including avatar) after connecting — avoids JWT size limits
             metadata = {}
@@ -668,6 +915,7 @@ class LiveKitAdapter(BasePlatformAdapter):
 
             # Start silence detection loop
             self._silence_task = asyncio.create_task(self._check_silence_loop())
+            await self._set_agent_state("idle", force=True)
 
             self._mark_connected()
             logger.info("[%s] Connected to room '%s' at %s", self.name, self._room_name, self._url)
@@ -701,6 +949,14 @@ class LiveKitAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._silence_task = None
+
+        if self._conversation_expiry_task:
+            self._conversation_expiry_task.cancel()
+            try:
+                await self._conversation_expiry_task
+            except asyncio.CancelledError:
+                pass
+            self._conversation_expiry_task = None
 
         await self._close_all_audio_streams()
 
@@ -754,6 +1010,11 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._audio_buffers.clear()
         self._last_audio_time.clear()
         self._speaking_participants.clear()
+        self._participant_topics.clear()
+        self._conversation_active_until = 0.0
+        self._active_speaker_identity = ""
+        self._active_speaker_name = ""
+        self._active_topic = ""
 
         # Unlink any frame files that were captured but never dispatched
         # (no MessageEvent ever drained them). Dispatched-but-not-yet-read
@@ -786,7 +1047,10 @@ class LiveKitAdapter(BasePlatformAdapter):
             # This is a LiveKit DataPacket - voice input path
             packet = event
             participant = getattr(packet, "participant", None)
-            identity = getattr(participant, "identity", "") if participant else ""
+            identity = str(getattr(participant, "identity", "") or "").strip()
+            if not identity:
+                logger.warning("[%s] ignoring transcript packet without sender identity", self.name)
+                return
             
             try:
                 import json as _json
@@ -815,18 +1079,31 @@ class LiveKitAdapter(BasePlatformAdapter):
                 media_types=[],
                 timestamp=datetime.now(tz=timezone.utc),
             )
-            self._arm_tool_acknowledgement()
-            await super().handle_message(msg_event)
+            await self.handle_message(msg_event)
             return
 
         if not isinstance(event, MessageEvent):
             await super().handle_message(event)
             return
 
+        if not getattr(event, "_livekit_invocation_checked", False):
+            if not await self._prepare_invoked_event(event):
+                return
+
+        identity = str(getattr(event.source, "user_id", "") or "client")
+        await self._publish_agent_event(
+            "agent:user-transcript",
+            {
+                "transcript": event.text,
+                "final": True,
+                "identity": identity,
+                "name": getattr(event.source, "user_name", identity),
+                "topic": self._participant_topics.get(identity, ""),
+            },
+        )
+        await self._set_agent_state("thinking", force=True)
         self._arm_tool_acknowledgement()
         await super().handle_message(event)
-
-
 
     # -- LiveKit event handlers ---------------------------------------------
 
@@ -1119,6 +1396,10 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._audio_buffers.pop(identity, None)
         self._last_audio_time.pop(identity, None)
         self._speaking_participants.discard(identity)
+        try:
+            asyncio.create_task(self._finish_listening_state())
+        except RuntimeError:
+            pass
 
     async def _close_all_audio_streams(self) -> None:
         """Close all subscribed LiveKit audio streams."""
@@ -1273,7 +1554,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._latest_video_frames.pop(key, None)
 
     def _interrupt_playback(self, identity: str) -> None:
-        if not self._is_playing:
+        if not self._is_playing or not self._conversation_is_active():
             return
         logger.info("[%s] Barge-in detected from %s; stopping TTS", self.name, identity)
         self._playback_interrupt.set()
@@ -1282,6 +1563,19 @@ class LiveKitAdapter(BasePlatformAdapter):
                 self._audio_source.clear_queue()
             except Exception:
                 pass
+
+    async def _set_listening_state(self, identity: str) -> None:
+        self._active_speaker_identity = identity
+        self._active_speaker_name = self._participant_display_name(identity)
+        self._active_topic = self._participant_topics.get(identity, "")
+        await self._set_agent_state("listening", force=True)
+
+    async def _finish_listening_state(self) -> None:
+        if self._speaking_participants:
+            identity = next(iter(self._speaking_participants))
+            await self._set_listening_state(identity)
+        elif self._agent_state == "listening":
+            await self._set_agent_state("idle")
 
     async def _check_silence_loop(self):
         """Periodically check for completed utterances (silence after speech).
@@ -1332,6 +1626,7 @@ class LiveKitAdapter(BasePlatformAdapter):
                                     "agent:listening-start", {"identity": identity}
                                 )
                             )
+                            asyncio.create_task(self._set_listening_state(identity))
                         continue
 
                     # Silent — check if silence has lasted long enough
@@ -1363,6 +1658,7 @@ class LiveKitAdapter(BasePlatformAdapter):
                                     "agent:listening-stop", {"identity": identity}
                                 )
                             )
+                            asyncio.create_task(self._finish_listening_state())
                         continue
 
                     # Extract the utterance (speech portion only) and reset
@@ -1375,6 +1671,7 @@ class LiveKitAdapter(BasePlatformAdapter):
                             "agent:listening-stop", {"identity": identity}
                         )
                     )
+                    asyncio.create_task(self._finish_listening_state())
 
                     logger.info("[%s] Utterance from %s: %.1fs audio", self.name, identity, duration)
                     asyncio.create_task(self._process_voice_input(identity, pcm_data))
@@ -1415,12 +1712,6 @@ class LiveKitAdapter(BasePlatformAdapter):
 
             logger.info("[%s] Transcript from %s: %s", self.name, identity, transcript[:80])
 
-            # Publish the final user transcript so clients can update their UI.
-            await self._publish_agent_event(
-                "agent:user-transcript",
-                {"transcript": transcript, "final": True, "identity": identity},
-            )
-
             # Drain any captured frames into this message so the agent's
             # vision pipeline sees them alongside the transcript.
             if self._auto_vision and self._should_attach_video(transcript):
@@ -1446,8 +1737,6 @@ class LiveKitAdapter(BasePlatformAdapter):
                 timestamp=datetime.now(tz=timezone.utc),
             )
 
-            # Agent is about to invoke the LLM.
-            await self._publish_agent_event("agent:thinking-start")
             await self.handle_message(event)
         except Exception as e:
             logger.error("[%s] Error processing voice from %s: %s", self.name, identity, e)
@@ -1469,9 +1758,9 @@ class LiveKitAdapter(BasePlatformAdapter):
         topic = getattr(packet, "topic", None) or ""
         # Handle all topics - browser chatbox sends text on any topic
         participant = getattr(packet, "participant", None)
-        participant_identity = (
+        participant_identity = str(
             getattr(participant, "identity", "") if participant is not None else ""
-        )
+        ).strip()
 
         raw_payload = b""
         try:
@@ -1501,6 +1790,15 @@ class LiveKitAdapter(BasePlatformAdapter):
         is_text_message = bool(text_content) or msg_type == "text"
         if not msg_type and text_content:
             msg_type = "text"
+
+        # A sender-less packet can occur if a newly connected participant
+        # publishes before its participant update reaches this client. Never
+        # collapse such turns into a shared synthetic "client" identity: that
+        # would corrupt multi-speaker context and weaken authorization. The
+        # sender can retry once room synchronization completes.
+        if (msg_type or text_content) and not participant_identity:
+            logger.warning("[%s] dropping data packet without participant identity", self.name)
+            return
 
         # Dispatch table. Keep additions here so adding new client:* types
         # is a single line.
@@ -1678,11 +1976,6 @@ class LiveKitAdapter(BasePlatformAdapter):
             timestamp=datetime.now(tz=timezone.utc),
         )
 
-        await self._publish_agent_event(
-            "agent:user-transcript",
-            {"transcript": text, "final": True, "identity": identity, "source": "text"},
-        )
-        await self._publish_agent_event("agent:thinking-start")
         await self.handle_message(event)
 
     async def _handle_client_control(self, msg: Dict[str, Any], identity: str) -> None:
@@ -2058,6 +2351,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected to room")
 
         async with self._playback_lock:
+            speaking_generation = 0
             try:
                 self._playback_interrupt.clear()
                 self._is_playing = True
@@ -2076,6 +2370,7 @@ class LiveKitAdapter(BasePlatformAdapter):
 
                 samples_per_frame = SAMPLE_RATE // 50  # 20ms frames
                 bytes_per_frame = samples_per_frame * NUM_CHANNELS * 2
+                speaking_generation = await self._set_agent_state("speaking", force=True)
                 await self._publish_agent_event("agent:speaking-start")
 
                 offset = 0
@@ -2108,6 +2403,8 @@ class LiveKitAdapter(BasePlatformAdapter):
             finally:
                 self._is_playing = False
                 await self._publish_agent_event("agent:speaking-stop")
+                if speaking_generation:
+                    await self._finish_state_if_current(speaking_generation)
 
     @staticmethod
     def _decode_audio_to_pcm(audio_path: str) -> Optional[bytes]:
@@ -2176,8 +2473,13 @@ class LiveKitAdapter(BasePlatformAdapter):
         return text[:4000].strip()
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """No typing indicator for voice — no-op."""
-        pass
+        """Mirror Discord's working indicator through LiveKit agent state."""
+        await self._set_agent_state("thinking")
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """Clear the working state after Hermes completes the turn."""
+        if self._agent_state == "thinking" and not self._is_playing:
+            await self._set_agent_state("idle")
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return info about the LiveKit room."""

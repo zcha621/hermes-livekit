@@ -7,6 +7,60 @@ client-provided tools without modifying Hermes core.
 Hermes is configured on its host through `config.yaml`. There is no HTTP
 control bridge or web-portal control page.
 
+## Invocation keyterms and shared meeting context
+
+MiRA listens for speech activity but does not send ordinary room conversation
+to Hermes until someone says a configured invocation keyterm. The defaults are
+`Hermes` and `MiRA`. A phrase such as “MiRA, find an accessible Rotorua walk”
+opens a room-wide conversation window and strips the invocation phrase before
+the request reaches the LLM.
+
+While the window is open:
+
+- any participant can continue the conversation without repeating a keyterm;
+- LiveKit identity and display name are attached to every turn;
+- the latest substantive topic/request is retained separately for each speaker;
+- short follow-ups such as “yes please” retain that speaker's prior topic; and
+- speech from any participant interrupts TTS immediately and becomes the next
+  Hermes turn through the gateway's `busy_input_mode: interrupt` behavior.
+
+The window closes after 120 seconds without an accepted turn. Saying a keyterm
+again opens or refreshes it. A keyterm spoken on its own opens the window but
+does not create an empty LLM request.
+
+This is application-level invocation policy built on LiveKit participant audio
+and Hermes STT. LiveKit itself supplies per-participant identity, synchronized
+attributes, data packets, and interruption-capable media; it does not manage
+MiRA's wake phrases.
+
+## Agent status in meeting clients
+
+The adapter publishes LiveKit's standard `lk.agent.state` participant attribute
+and mirrors richer context in an `agent:status` data envelope using schema
+`mira-agent-status.v1`.
+
+| LiveKit state | Meeting UI | Meaning |
+| --- | --- | --- |
+| `initializing` | Agent is starting | The adapter is joining and publishing media. |
+| `idle` | Agent is ready | Say a keyterm, or continue while already invoked. |
+| `listening` | Listening to _name_ | A participant is currently talking. |
+| `thinking` | Working for _name_ | STT has completed and the Hermes backend is working. |
+| `speaking` | Agent is speaking | TTS is playing; any participant may interrupt. |
+
+The durable participant attributes also expose:
+
+- `mira.agent.invoked`
+- `mira.agent.active_speaker`
+- `mira.agent.active_speaker_name`
+- `mira.agent.topic`
+- `mira.agent.keyterms`
+- `mira.agent.status_schema`
+
+The web meeting at `/meet`, the Android Compose meeting, and the classic
+Android meeting all render the same status contract. Participant attributes
+let late joiners receive current state; reliable status data packets provide
+the matching realtime event stream.
+
 ## Natural voice acknowledgements
 
 LiveKit follows Hermes Discord voice behavior:
@@ -116,6 +170,13 @@ platforms:
           - Checking on that now.
           - Give me a sec.
           - On it.
+      invocation:
+        enabled: true
+        keyterms:
+          - Hermes
+          - MiRA
+        conversation_timeout_seconds: 120
+        strip_keyterm: true
 
 voice:
   auto_tts: true
@@ -164,6 +225,13 @@ A useful call check is:
    the first tool starts, then deliver the answer.
 3. Ask a multi-tool question. The cue should still occur only once.
 4. Speak during playback. MiRA should stop and listen.
+5. Before invocation, speak without a keyterm. The agent should return to ready
+   without sending the transcript to Hermes.
+6. Say “MiRA” plus a request as one participant, then continue as a second
+   participant without repeating it. The status should show the correct names
+   and latest topics.
+7. Wait for the invocation timeout and confirm the UI returns to “say MiRA to
+   begin”.
 
 ## Runtime files
 

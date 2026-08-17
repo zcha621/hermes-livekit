@@ -51,11 +51,34 @@ class AdapterTests(unittest.TestCase):
         source.clear_queue = lambda: setattr(source, "cleared", True)
         self.adapter._audio_source = source
         self.adapter._is_playing = True
+        self.adapter._activate_conversation("Hermes")
 
         self.adapter._interrupt_playback("phone")
 
         self.assertTrue(self.adapter._playback_interrupt.is_set())
         self.assertTrue(source.cleared)
+
+    def test_barge_in_before_invocation_does_not_stop_playback(self):
+        source = SimpleNamespace(clear_queue=lambda: self.fail("queue should stay live"))
+        self.adapter._audio_source = source
+        self.adapter._is_playing = True
+
+        self.adapter._interrupt_playback("phone")
+
+        self.assertFalse(self.adapter._playback_interrupt.is_set())
+
+    def test_keyterm_match_is_case_insensitive_and_strips_wake_phrase(self):
+        keyterm, cleaned = self.adapter._match_keyterm(
+            "Hey MiRA, find walks near Rotorua"
+        )
+
+        self.assertEqual(keyterm, "MiRA")
+        self.assertEqual(cleaned, "find walks near Rotorua")
+
+    def test_short_followup_keeps_participant_topic(self):
+        topic = self.adapter._topic_for_turn("yes please", "Rotorua family walks")
+
+        self.assertEqual(topic, "Rotorua family walks")
 
     def test_latest_video_frame_prefers_sender_and_writes_unique_snapshot(self):
         now = time.monotonic()
@@ -163,15 +186,124 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         packet = SimpleNamespace(
             topic="chat",
-            data=b"hello from phone",
+            data=b"Hermes, hello from phone",
             participant=SimpleNamespace(identity="phone"),
         )
         with patch.object(self.adapter, "handle_message", fake_handle):
             self.adapter._on_data_received(packet)
             await asyncio.wait_for(dispatched.wait(), timeout=1)
 
-        self.assertEqual(received["event"].text, "hello from phone")
+        self.assertEqual(received["event"].text, "Hermes, hello from phone")
         self.assertEqual(received["event"].source.user_id, "phone")
+
+    async def test_message_without_keyterm_is_ignored_until_invoked(self):
+        dispatched = AsyncMock()
+        self.adapter._room = SimpleNamespace(
+            remote_participants={},
+            local_participant=SimpleNamespace(set_attributes=AsyncMock()),
+        )
+        event = livekit_adapter.MessageEvent(
+            text="What is the weather?",
+            message_type=livekit_adapter.MessageType.VOICE,
+            source=self.adapter.build_source(
+                chat_id="test-room",
+                chat_type="group",
+                user_id="alice",
+                user_name="Alice",
+            ),
+        )
+
+        with (
+            patch.object(self.adapter, "_publish_agent_event", AsyncMock()),
+            patch.object(livekit_adapter.BasePlatformAdapter, "handle_message", dispatched),
+        ):
+            await self.adapter.handle_message(event)
+
+        dispatched.assert_not_awaited()
+
+    async def test_keyterm_opens_room_for_another_speaker_and_adds_context(self):
+        self.adapter._room = SimpleNamespace(
+            remote_participants={
+                "alice": SimpleNamespace(name="Alice"),
+                "bob": SimpleNamespace(name="Bob"),
+            },
+            local_participant=SimpleNamespace(set_attributes=AsyncMock()),
+        )
+        published = AsyncMock()
+        with patch.object(self.adapter, "_publish_agent_event", published):
+            first = livekit_adapter.MessageEvent(
+                text="Hermes, plan a Rotorua walk for us",
+                message_type=livekit_adapter.MessageType.VOICE,
+                source=self.adapter.build_source(
+                    chat_id="test-room", chat_type="group", user_id="alice"
+                ),
+            )
+            second = livekit_adapter.MessageEvent(
+                text="Make it accessible too",
+                message_type=livekit_adapter.MessageType.VOICE,
+                source=self.adapter.build_source(
+                    chat_id="test-room", chat_type="group", user_id="bob"
+                ),
+            )
+
+            self.assertTrue(await self.adapter._prepare_invoked_event(first))
+            self.assertTrue(await self.adapter._prepare_invoked_event(second))
+
+        self.assertEqual(first.source.user_name, "Alice")
+        self.assertEqual(second.source.user_name, "Bob")
+        self.assertIn("Alice: plan a Rotorua walk for us", second.channel_prompt)
+        self.assertIn("Bob: Make it accessible too", second.channel_prompt)
+
+    async def test_standalone_keyterm_invokes_without_empty_llm_turn(self):
+        self.adapter._room = SimpleNamespace(
+            remote_participants={"alice": SimpleNamespace(name="Alice")},
+            local_participant=SimpleNamespace(set_attributes=AsyncMock()),
+        )
+        event = livekit_adapter.MessageEvent(
+            text="MiRA",
+            message_type=livekit_adapter.MessageType.VOICE,
+            source=self.adapter.build_source(
+                chat_id="test-room", chat_type="group", user_id="alice"
+            ),
+        )
+
+        with patch.object(self.adapter, "_publish_agent_event", AsyncMock()) as published:
+            accepted = await self.adapter._prepare_invoked_event(event)
+
+        self.assertFalse(accepted)
+        self.assertTrue(self.adapter._conversation_is_active())
+        published.assert_any_await(
+            "agent:invoked",
+            {"identity": "alice", "name": "Alice", "keyterm": "MiRA"},
+        )
+
+    async def test_thinking_state_publishes_standard_and_rich_status(self):
+        set_attributes = AsyncMock()
+        self.adapter._room = SimpleNamespace(
+            remote_participants={},
+            local_participant=SimpleNamespace(set_attributes=set_attributes),
+        )
+        self.adapter._activate_conversation("Hermes")
+        self.adapter._active_speaker_identity = "alice"
+        self.adapter._active_speaker_name = "Alice"
+        self.adapter._active_topic = "accessible Rotorua walks"
+
+        with patch.object(self.adapter, "_publish_agent_event", AsyncMock()) as published:
+            await self.adapter._set_agent_state("thinking", force=True)
+
+        attributes = set_attributes.await_args.args[0]
+        self.assertEqual(attributes["lk.agent.state"], "thinking")
+        self.assertEqual(attributes["mira.agent.invoked"], "true")
+        self.assertEqual(attributes["mira.agent.active_speaker_name"], "Alice")
+        status_payload = next(
+            call.args[1]
+            for call in published.await_args_list
+            if call.args[0] == "agent:status"
+        )
+        self.assertEqual(status_payload["schema"], "mira-agent-status.v1")
+        self.assertEqual(status_payload["state"], "thinking")
+        self.assertTrue(status_payload["can_interrupt"])
+        published.assert_any_await("agent:thinking-start")
 
     async def test_tool_registration_control_message_does_not_require_text(self):
         registered = asyncio.Event()
@@ -196,6 +328,19 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(received["identity"], "mira-worker")
         self.assertEqual(received["message"]["name"], "find_local_recommendations")
+
+    async def test_senderless_text_packet_is_not_collapsed_into_client_identity(self):
+        packet = SimpleNamespace(
+            topic="hermes-control",
+            data=b"Hermes, process this",
+            participant=None,
+        )
+
+        with patch.object(self.adapter, "handle_message", AsyncMock()) as dispatched:
+            self.adapter._on_data_received(packet)
+            await asyncio.sleep(0)
+
+        dispatched.assert_not_awaited()
 
     async def test_image_byte_stream_is_queued_for_next_turn(self):
         published = AsyncMock()

@@ -17,6 +17,7 @@ ACKNOWLEDGEMENT_PHRASES = [
     "Give me a sec.",
     "On it.",
 ]
+INVOCATION_KEYTERMS = ["Hermes", "MiRA"]
 
 
 def update_config(config_path: Path) -> None:
@@ -45,6 +46,12 @@ def update_config(config_path: Path) -> None:
     extra["acknowledgements"] = {
         "enabled": True,
         "phrases": list(ACKNOWLEDGEMENT_PHRASES),
+    }
+    extra["invocation"] = {
+        "enabled": True,
+        "keyterms": list(INVOCATION_KEYTERMS),
+        "conversation_timeout_seconds": 120,
+        "strip_keyterm": True,
     }
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
