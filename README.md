@@ -20,7 +20,22 @@ LiveKit follows Hermes Discord voice behavior:
 The default end-of-utterance silence threshold is also aligned with Discord at
 1.5 seconds. Barge-in still interrupts playback immediately.
 
-## Install or update on Windows
+## One-click setup on Windows
+
+After Hermes is installed, open the MiRA repository and double-click:
+
+```text
+agents\hermes-livekit\Setup-HermesLiveKit.cmd
+```
+
+The launcher installs missing FFmpeg and Python dependencies, enables gateway
+auto-start, applies the LiveKit configuration, validates it, and restarts the
+gateway. It reuses credentials from the existing Hermes `.env` or from
+`infrastructure\livekitserver-docker\.env`; if neither contains a complete
+LiveKit configuration, it prompts for the three required values. The window
+stays open at the end so success or an actionable error is visible.
+
+## Scripted install or update
 
 Run PowerShell from the MiRA repository root:
 
@@ -30,12 +45,17 @@ Run PowerShell from the MiRA repository root:
   -RestartGateway
 ```
 
-The script:
+The PowerShell script:
 
-- backs up the existing Hermes `.env`, `config.yaml`, and installed plugin;
+- keeps one rolling backup each of the existing Hermes `.env` and
+  `config.yaml`;
 - installs the plugin and pinned LiveKit dependencies;
 - keeps transport credentials in `.env`;
 - writes behavioral settings to Hermes `config.yaml`;
+- keeps its temporary plugin rollback outside the discoverable plugin folder
+  and removes it after validation;
+- removes old `hermes-livekit.backup-*` directories that could override the
+  active plugin during Hermes discovery;
 - removes legacy control-bridge environment values, scheduled task, process,
   and installed bridge script; and
 - optionally restarts or installs auto-start for the Hermes gateway.
@@ -128,5 +148,6 @@ A useful call check is:
 - `__init__.py` — Hermes plugin registration and lifecycle hooks.
 - `configure_yaml.py` — atomic non-secret behavior configuration.
 - `plugin.yaml` — plugin metadata.
+- `Setup-HermesLiveKit.cmd` — double-click setup for a Hermes Windows host.
 - `Setup-HermesLiveKit.ps1` — repeatable Windows install/update and migration.
 - `tests/test_adapter.py` — adapter behavior tests.
