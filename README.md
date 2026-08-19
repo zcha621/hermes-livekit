@@ -7,6 +7,13 @@ client-provided tools without modifying Hermes core.
 Hermes is configured on its host through `config.yaml`. There is no HTTP
 control bridge or web-portal control page.
 
+MiRA's conversational setup has three deliberate layers: `assets/SOUL.md`
+defines identity and voice, the bundled `mira-new-zealand-tourism` skill defines
+tourism procedure and grounding, and the trusted Python worker supplies the one
+implemented domain tool. LiveKit receives no Hermes core tools and explicitly
+opts out of global MCP servers. The complete operator guide is
+[`docs/deployment/HERMES-SETUP.md`](../../docs/deployment/HERMES-SETUP.md).
+
 ## Invocation keyterms and shared meeting context
 
 MiRA listens for speech activity but does not send ordinary room conversation
@@ -83,6 +90,10 @@ the tool to its registry, targets `agent:tool-call` envelopes back to the owner,
 and waits for a matching `client:tool-result`. Registrations and results are
 control messages and do not need a fake text/content field.
 
+Registration is fail-closed: the participant identity must begin with
+`agent-mira-knowledge-worker-`, and the tool name must be exactly
+`find_local_recommendations`. All other identities and names are rejected.
+
 The MiRA worker currently includes a harmless `content` compatibility marker in
 these envelopes so an installed pre-fix adapter can also route them. Updated
 adapters dispatch on `type` and ignore that marker.
@@ -121,7 +132,10 @@ The PowerShell script:
 
 - keeps one rolling backup each of the existing Hermes `.env` and
   `config.yaml`;
-- installs the plugin and pinned LiveKit dependencies;
+- migrates Hermes configuration before applying current settings;
+- installs the plugin, MiRA tourism skill, and pinned LiveKit dependencies;
+- installs the canonical MiRA SOUL when the file is missing or still the
+  generic Hermes starter, while preserving customized SOUL files;
 - keeps transport credentials in `.env`;
 - writes behavioral settings to Hermes `config.yaml`;
 - keeps its temporary plugin rollback outside the discoverable plugin folder
@@ -134,13 +148,20 @@ The PowerShell script:
 
 Use `-InstallHermes` for a new host, `-InstallFfmpeg` if FFmpeg is missing, and
 `-InstallAutoStart` to install Hermes gateway auto-start. Re-running setup reuses
-existing `LIVEKIT_*` values unless replacements are supplied.
+existing `LIVEKIT_*` values unless replacements are supplied. Use
+`-ReplaceSoul` only after reviewing a customized SOUL; setup saves the previous
+file as `SOUL.md.mira.bak`.
 
 ## Hermes YAML
 
 The relevant section of `%LOCALAPPDATA%\hermes\config.yaml` is:
 
 ```yaml
+platform_toolsets:
+  livekit:
+    - hermes-livekit
+    - no_mcp
+
 platforms:
   livekit:
     enabled: true
@@ -177,6 +198,16 @@ platforms:
           - MiRA
         conversation_timeout_seconds: 120
         strip_keyterm: true
+      remote_tools:
+        allowed_names:
+          - find_local_recommendations
+        allowed_owner_prefixes:
+          - agent-mira-knowledge-worker-
+
+tts:
+  provider: edge
+  edge:
+    voice: en-NZ-MollyNeural
 
 voice:
   auto_tts: true
@@ -208,6 +239,8 @@ existing explicit `true` or `false` value.
 
 Set `acknowledgements.enabled: false` to disable tool acknowledgements, or edit
 the phrase list to match MiRA's voice. Restart the gateway after changing YAML.
+The setup changes the stock US Edge voice to the New Zealand English Molly
+voice, but preserves any custom voice or provider. It does not alter STT.
 
 ## Validate
 
@@ -238,6 +271,8 @@ A useful call check is:
 - `adapter.py` — LiveKit transport, media, voice activity, hooks, and tools.
 - `__init__.py` — Hermes plugin registration and lifecycle hooks.
 - `configure_yaml.py` — atomic non-secret behavior configuration.
+- `assets/SOUL.md` — canonical MiRA conversational identity.
+- `skills/mira-new-zealand-tourism/SKILL.md` — grounded Aotearoa tourism procedure.
 - `plugin.yaml` — plugin metadata.
 - `Setup-HermesLiveKit.cmd` — double-click setup for a Hermes Windows host.
 - `Setup-HermesLiveKit.ps1` — repeatable Windows install/update and migration.

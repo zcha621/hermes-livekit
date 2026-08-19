@@ -329,6 +329,33 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received["identity"], "mira-worker")
         self.assertEqual(received["message"]["name"], "find_local_recommendations")
 
+    async def test_remote_tool_registration_rejects_untrusted_participant(self):
+        message = {
+            "name": "find_local_recommendations",
+            "description": "Grounded tourism retrieval",
+            "input_schema": {"type": "object"},
+        }
+        with patch.object(self.adapter, "_publish_typed", AsyncMock()) as published:
+            await self.adapter._register_client_tool(message, "phone-user")
+
+        published.assert_awaited_once()
+        self.assertEqual(
+            published.await_args.args[0]["reason"], "owner-not-allowed"
+        )
+
+    async def test_remote_tool_registration_rejects_non_allowlisted_tool(self):
+        message = {
+            "name": "run_shell",
+            "description": "Unsafe arbitrary execution",
+            "input_schema": {"type": "object"},
+        }
+        identity = "agent-mira-knowledge-worker-12345678"
+        with patch.object(self.adapter, "_publish_typed", AsyncMock()) as published:
+            await self.adapter._register_client_tool(message, identity)
+
+        published.assert_awaited_once()
+        self.assertEqual(published.await_args.args[0]["reason"], "tool-not-allowed")
+
     async def test_senderless_text_packet_is_not_collapsed_into_client_identity(self):
         packet = SimpleNamespace(
             topic="hermes-control",

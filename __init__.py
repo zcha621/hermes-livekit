@@ -15,11 +15,33 @@ _PLUGIN_DIR = str(Path(__file__).resolve().parent)
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
-from adapter import LIVE_ADAPTERS, LiveKitAdapter, check_livekit_requirements
+from adapter import (
+    LIVE_ADAPTERS,
+    TOOLSET_NAME,
+    LiveKitAdapter,
+    check_livekit_requirements,
+)
 
 logger = logging.getLogger("gateway.platforms.livekit")
 
 __all__ = ["register", "LiveKitAdapter", "check_livekit_requirements"]
+
+_PLUGIN_ROOT = Path(__file__).resolve().parent
+_TOURISM_SKILL_PATH = (
+    _PLUGIN_ROOT / "skills" / "mira-new-zealand-tourism" / "SKILL.md"
+)
+
+
+def _skill_body(path: Path) -> str:
+    """Load a bundled skill body without its YAML frontmatter."""
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if not content.startswith("---"):
+        return content
+    parts = content.split("---", 2)
+    return parts[2].strip() if len(parts) == 3 else content
 
 
 def _on_session_finalize_hook(**kwargs) -> None:
@@ -74,7 +96,7 @@ def _on_pre_tool_call_hook(
             tool_call_id=tool_call_id,
         )
 
-_LIVEKIT_PLATFORM_HINT = """You are Hermes LiveKit, a travel assistant for people on live video calls with remote family or friends.
+_LIVEKIT_PLATFORM_HINT = """You are MiRA on LiveKit, a travel companion for people on live video calls with remote family or friends.
 
 Primary goal: help the user stay natural, helpful, and present during the call. Give practical travel guidance, conversational support, local suggestions, itinerary ideas, and help with what to say or do next.
 
@@ -96,6 +118,13 @@ Style:
 - Do not over-explain unless asked.
 - Keep voice replies short enough to feel natural in a live conversation.
 - You can send text messages alongside voice replies when that helps clarity."""
+
+_TOURISM_GUIDANCE = _skill_body(_TOURISM_SKILL_PATH)
+if _TOURISM_GUIDANCE:
+    # Platform hints are a stable prompt layer. Including the read-only bundled
+    # skill here gives every LiveKit session the same tourism operating guidance
+    # without exposing Hermes's general skill discovery or skill-write tools.
+    _LIVEKIT_PLATFORM_HINT += "\n\n" + _TOURISM_GUIDANCE
 
 
 def _env_enablement() -> Optional[dict]:
@@ -221,22 +250,27 @@ def register(ctx) -> None:
         platform_hint=_LIVEKIT_PLATFORM_HINT,
     )
 
-    # Provide a hermes-livekit toolset alias so cli/gateway tooling defaults
-    # match the kortexa branch behaviour.  ``get_all_platforms()`` already
-    # synthesises the ``hermes-{name}`` mapping in PlatformInfo, but the
-    # toolset itself has to exist in the TOOLSETS dict for tool resolution.
+    # Keep the guidance available as a namespaced read-only plugin skill for
+    # CLI inspection. LiveKit receives the same content in its platform hint,
+    # so the voice surface does not need skill discovery or write tools.
     try:
-        from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
-        if "hermes-livekit" not in TOOLSETS:
-            TOOLSETS["hermes-livekit"] = {
-                "description": "LiveKit voice toolset — interact with Hermes via WebRTC voice",
-                "tools": _HERMES_CORE_TOOLS,
-                "includes": [],
-            }
+        ctx.register_skill("mira-new-zealand-tourism", _TOURISM_SKILL_PATH)
+    except Exception as exc:
+        logger.debug("tourism skill registration failed: %s", exc)
+
+    # The LiveKit platform default must be narrow. Client-offered tools are
+    # registered into TOOLSET_NAME after a trusted worker joins the room. Do
+    # not inherit Hermes core tools here: that would expose terminal, files,
+    # browser, code execution, delegation, and global MCP servers to voice.
+    try:
+        from toolsets import TOOLSETS
+        TOOLSETS["hermes-livekit"] = {
+            "description": "MiRA LiveKit tools supplied by the trusted room worker",
+            "tools": [],
+            "includes": [TOOLSET_NAME],
+        }
     except Exception:
-        # Toolset registration is best-effort; the adapter still works
-        # without it (resolves through the gateway umbrella toolset).
-        pass
+        logger.exception("could not register the restricted LiveKit toolset")
 
     # Match Hermes Discord voice behavior: arm the LiveKit turn at gateway
     # dispatch and speak one cue only on the first actual tool invocation.

@@ -18,6 +18,16 @@ ACKNOWLEDGEMENT_PHRASES = [
     "On it.",
 ]
 INVOCATION_KEYTERMS = ["Hermes", "MiRA"]
+LIVEKIT_TOOLSETS = ["hermes-livekit", "no_mcp"]
+REMOTE_TOOL_NAMES = ["find_local_recommendations"]
+REMOTE_TOOL_OWNER_PREFIXES = ["agent-mira-knowledge-worker-"]
+DEFAULT_NEW_ZEALAND_VOICE = "en-NZ-MollyNeural"
+STOCK_EDGE_VOICES = {"", "en-US-JennyNeural"}
+LEGACY_MIRA_SYSTEM_PROMPT = (
+    "You are MiRA, a warm and concise tourism companion. Respond directly and "
+    "naturally. Do not announce routine internal work. Ask a brief clarifying "
+    "question only when needed."
+)
 
 
 def update_config(config_path: Path) -> None:
@@ -30,8 +40,14 @@ def update_config(config_path: Path) -> None:
         raise ValueError("Hermes config root must be a YAML mapping")
 
     platforms = config.setdefault("platforms", {})
+    if not isinstance(platforms, dict):
+        raise ValueError("Hermes platforms config must be a YAML mapping")
     livekit = platforms.setdefault("livekit", {})
+    if not isinstance(livekit, dict):
+        raise ValueError("Hermes LiveKit config must be a YAML mapping")
     extra = livekit.setdefault("extra", {})
+    if not isinstance(extra, dict):
+        raise ValueError("Hermes LiveKit extra config must be a YAML mapping")
     extra["audio"] = {
         "silence_threshold_seconds": 1.5,
         "min_speech_duration_seconds": 0.5,
@@ -53,6 +69,39 @@ def update_config(config_path: Path) -> None:
         "conversation_timeout_seconds": 120,
         "strip_keyterm": True,
     }
+    extra["remote_tools"] = {
+        "allowed_names": list(REMOTE_TOOL_NAMES),
+        "allowed_owner_prefixes": list(REMOTE_TOOL_OWNER_PREFIXES),
+    }
+
+    # Hermes otherwise gives an unknown plugin platform its broad core tool
+    # bundle and automatically adds every enabled MCP server. MiRA's voice
+    # surface gets only trusted LiveKit worker tools and explicitly opts out of
+    # global MCP inheritance.
+    platform_toolsets = config.setdefault("platform_toolsets", {})
+    if not isinstance(platform_toolsets, dict):
+        raise ValueError("Hermes platform_toolsets config must be a YAML mapping")
+    platform_toolsets["livekit"] = list(LIVEKIT_TOOLSETS)
+
+    # SOUL.md is the primary identity. Remove only the previous MiRA setup's
+    # known overlay; preserve any operator-authored system prompt.
+    agent = config.get("agent")
+    if isinstance(agent, dict) and agent.get("system_prompt") == LEGACY_MIRA_SYSTEM_PROMPT:
+        agent["system_prompt"] = ""
+
+    # Prefer a New Zealand English voice when the host is new or still uses
+    # Hermes's stock US Edge voice. Never replace a custom provider or voice.
+    tts = config.setdefault("tts", {})
+    if not isinstance(tts, dict):
+        raise ValueError("Hermes TTS config must be a YAML mapping")
+    provider = str(tts.get("provider") or "edge")
+    tts.setdefault("provider", provider)
+    if provider == "edge":
+        edge = tts.setdefault("edge", {})
+        if not isinstance(edge, dict):
+            raise ValueError("Hermes Edge TTS config must be a YAML mapping")
+        if str(edge.get("voice") or "") in STOCK_EDGE_VOICES:
+            edge["voice"] = DEFAULT_NEW_ZEALAND_VOICE
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(

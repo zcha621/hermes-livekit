@@ -161,6 +161,8 @@ PRESENCE_POLL_INTERVAL_LOCAL = 5.0
 TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 TOOL_CALL_TIMEOUT_DEFAULT = 30.0
 TOOLSET_NAME = "hermes-livekit-tools"
+DEFAULT_REMOTE_TOOL_NAMES = ("find_local_recommendations",)
+DEFAULT_REMOTE_TOOL_OWNER_PREFIXES = ("agent-mira-knowledge-worker-",)
 
 # Live adapter instances — used by the plugin's session-finalize hook to find
 # the adapter(s) whose pending remote-tool calls need cancellation when the
@@ -232,6 +234,11 @@ class LiveKitAdapter(BasePlatformAdapter):
             if isinstance(extra.get("invocation"), dict)
             else {}
         )
+        remote_tools_config = (
+            extra.get("remote_tools")
+            if isinstance(extra.get("remote_tools"), dict)
+            else {}
+        )
         self._silence_threshold_seconds = self._positive_float(
             audio_config.get("silence_threshold_seconds"),
             DEFAULT_SILENCE_THRESHOLD_SECONDS,
@@ -299,6 +306,30 @@ class LiveKitAdapter(BasePlatformAdapter):
                 ),
             )
             for keyterm in self._keyterms
+        )
+        allowed_tool_names = remote_tools_config.get(
+            "allowed_names", DEFAULT_REMOTE_TOOL_NAMES
+        )
+        if isinstance(allowed_tool_names, str):
+            allowed_tool_names = allowed_tool_names.split(",")
+        self._allowed_remote_tool_names = frozenset(
+            str(name).strip()
+            for name in allowed_tool_names
+            if str(name).strip()
+        ) if isinstance(allowed_tool_names, (list, tuple)) else frozenset(
+            DEFAULT_REMOTE_TOOL_NAMES
+        )
+        owner_prefixes = remote_tools_config.get(
+            "allowed_owner_prefixes", DEFAULT_REMOTE_TOOL_OWNER_PREFIXES
+        )
+        if isinstance(owner_prefixes, str):
+            owner_prefixes = owner_prefixes.split(",")
+        self._allowed_remote_tool_owner_prefixes = tuple(
+            str(prefix).strip()
+            for prefix in owner_prefixes
+            if str(prefix).strip()
+        ) if isinstance(owner_prefixes, (list, tuple)) else (
+            DEFAULT_REMOTE_TOOL_OWNER_PREFIXES
         )
 
         self._room: Optional["rtc.Room"] = None
@@ -2029,6 +2060,45 @@ class LiveKitAdapter(BasePlatformAdapter):
         input_schema = msg.get("input_schema")
 
         if not identity:
+            return
+
+        if not any(
+            identity.startswith(prefix)
+            for prefix in self._allowed_remote_tool_owner_prefixes
+        ):
+            logger.warning(
+                "[%s] rejected tool registration %r from untrusted participant %r",
+                self.name,
+                name,
+                identity,
+            )
+            await self._publish_typed(
+                {
+                    "type": "agent:tool-registered",
+                    "name": name,
+                    "success": False,
+                    "reason": "owner-not-allowed",
+                },
+                identity=identity,
+            )
+            return
+
+        if name not in self._allowed_remote_tool_names:
+            logger.warning(
+                "[%s] rejected non-allowlisted remote tool %r from %r",
+                self.name,
+                name,
+                identity,
+            )
+            await self._publish_typed(
+                {
+                    "type": "agent:tool-registered",
+                    "name": name,
+                    "success": False,
+                    "reason": "tool-not-allowed",
+                },
+                identity=identity,
+            )
             return
 
         if not TOOL_NAME_RE.match(name):

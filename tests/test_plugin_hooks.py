@@ -71,6 +71,20 @@ class PluginHookTests(unittest.TestCase):
             tool_call_id="tool-1",
         )
 
+    def test_tourism_guidance_is_always_in_livekit_platform_hint(self):
+        self.assertIn("Aotearoa New Zealand", plugin._LIVEKIT_PLATFORM_HINT)
+        self.assertIn("find_local_recommendations", plugin._LIVEKIT_PLATFORM_HINT)
+
+    def test_register_exposes_bundled_skill_read_only(self):
+        context = Mock()
+
+        plugin.register(context)
+
+        context.register_skill.assert_called_once_with(
+            "mira-new-zealand-tourism", plugin._TOURISM_SKILL_PATH
+        )
+        context.register_platform.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

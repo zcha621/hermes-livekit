@@ -2,8 +2,8 @@
 name: hermes-livekit
 label: LiveKit WebRTC
 kind: platform
-version: 1.3.0
-description: LiveKit WebRTC voice gateway plugin for Hermes
+version: 1.4.0
+description: Restricted MiRA voice and tourism gateway for Hermes over LiveKit
 author: kortexa-ai
 
 requires_env:

@@ -8,6 +8,7 @@ param(
     [string]$Room = "hermes",
     [string]$AgentName = "Hermes",
     [switch]$AllowAllUsers,
+    [switch]$ReplaceSoul,
     [switch]$InstallHermes,
     [switch]$InstallFfmpeg,
     [switch]$RestartGateway,
@@ -151,6 +152,43 @@ function Remove-StaleLiveKitBackups {
     }
 }
 
+function Install-MiraSoul {
+    param(
+        [string]$SourcePath,
+        [string]$TargetPath,
+        [switch]$Force
+    )
+
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+        throw "MiRA SOUL template is missing: $SourcePath"
+    }
+    if (-not (Test-Path -LiteralPath $TargetPath -PathType Leaf)) {
+        Copy-Item -LiteralPath $SourcePath -Destination $TargetPath -Force
+        Write-Host "Installed the MiRA conversational identity in SOUL.md."
+        return $true
+    }
+
+    $existing = (Get-Content -LiteralPath $TargetPath -Raw).Trim()
+    $isStarterSoul = (
+        $existing.StartsWith(
+            "You are Hermes Agent, an intelligent AI assistant created by Nous Research.",
+            [System.StringComparison]::Ordinal
+        ) -and $existing.Length -lt 2000
+    )
+    if (-not $Force -and -not $isStarterSoul) {
+        Write-Warning (
+            "Preserving the customized Hermes SOUL.md. Compare it with " +
+            "'$SourcePath', or rerun with -ReplaceSoul to install MiRA's identity."
+        )
+        return $false
+    }
+
+    Copy-Item -LiteralPath $TargetPath -Destination "$TargetPath.mira.bak" -Force
+    Copy-Item -LiteralPath $SourcePath -Destination $TargetPath -Force
+    Write-Host "Installed the MiRA conversational identity in SOUL.md."
+    return $true
+}
+
 if (-not (Test-Path -LiteralPath $HermesHome) -and $InstallHermes) {
     Write-Host "Installing Hermes from the official Nous Research Windows installer..."
     $installerSource = Invoke-RestMethod -Uri "https://hermes-agent.nousresearch.com/install.ps1"
@@ -165,6 +203,8 @@ $pluginsDir = Join-Path $HermesHome "plugins"
 $targetPlugin = Join-Path $pluginsDir "hermes-livekit"
 $envPath = Join-Path $HermesHome ".env"
 $configPath = Join-Path $HermesHome "config.yaml"
+$soulPath = Join-Path $HermesHome "SOUL.md"
+$soulSource = Join-Path $sourcePlugin "assets\SOUL.md"
 $pythonExe = Join-Path $HermesHome "hermes-agent\venv\Scripts\python.exe"
 $hermesExe = Join-Path $HermesHome "hermes-agent\venv\Scripts\hermes.exe"
 if (-not (Test-Path -LiteralPath $pythonExe) -or -not (Test-Path -LiteralPath $hermesExe)) {
@@ -235,6 +275,8 @@ if (-not $LiveKitUrl -or -not $LiveKitApiKey -or -not $LiveKitApiSecret) {
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $hadConfig = Test-Path -LiteralPath $configPath -PathType Leaf
 $hadEnv = Test-Path -LiteralPath $envPath -PathType Leaf
+$hadSoul = Test-Path -LiteralPath $soulPath -PathType Leaf
+$soulChanged = $false
 if (Test-Path -LiteralPath $configPath) {
     Copy-Item -LiteralPath $configPath -Destination "$configPath.livekit.bak" -Force
 }
@@ -252,6 +294,10 @@ try {
                 throw "Required plugin runtime file is missing: $runtimeSource"
             }
         }
+        $skillSource = Join-Path $sourcePlugin "skills\mira-new-zealand-tourism\SKILL.md"
+        if (-not (Test-Path -LiteralPath $skillSource -PathType Leaf)) {
+            throw "Required MiRA tourism skill is missing: $skillSource"
+        }
         if (Test-Path -LiteralPath $targetPlugin) {
             $pluginRollback = Join-Path ([System.IO.Path]::GetTempPath()) "hermes-livekit-rollback-$timestamp"
             if (Test-Path -LiteralPath $pluginRollback) {
@@ -266,7 +312,10 @@ try {
             $runtimeSource = Join-Path $sourcePlugin $runtimeFile
             Copy-Item -LiteralPath $runtimeSource -Destination (Join-Path $targetPlugin $runtimeFile) -Force
         }
+        Copy-Item -LiteralPath (Join-Path $sourcePlugin "skills") -Destination $targetPlugin -Recurse -Force
     }
+
+    $soulChanged = Install-MiraSoul -SourcePath $soulSource -TargetPath $soulPath -Force:$ReplaceSoul
 
     Write-Host "Installing LiveKit and vision dependencies in the Hermes environment..."
     & $pythonExe -m pip install "livekit==1.1.10" "livekit-api==1.1.0" "pillow>=10" "pyyaml>=6"
@@ -307,7 +356,10 @@ try {
     $previousHermesHome = $env:HERMES_HOME
     $env:HERMES_HOME = $HermesHome
     try {
-        & $hermesExe plugins enable hermes-livekit
+        & $hermesExe config migrate
+        if ($LASTEXITCODE -ne 0) { throw "Hermes configuration migration failed." }
+        & $hermesExe plugins enable hermes-livekit --no-allow-tool-override
+        if ($LASTEXITCODE -ne 0) { throw "Hermes LiveKit plugin enablement failed." }
         & $hermesExe config set platforms.livekit.enabled true
         & $hermesExe config set platforms.livekit.group_sessions_per_user false
         & $hermesExe config set platforms.livekit.extra.url '${LIVEKIT_URL}'
@@ -355,6 +407,13 @@ try {
     }
     if ($hadEnv -and (Test-Path -LiteralPath "$envPath.livekit.bak")) {
         Copy-Item -LiteralPath "$envPath.livekit.bak" -Destination $envPath -Force
+    }
+    if ($soulChanged) {
+        if ($hadSoul -and (Test-Path -LiteralPath "$soulPath.mira.bak")) {
+            Copy-Item -LiteralPath "$soulPath.mira.bak" -Destination $soulPath -Force
+        } elseif (-not $hadSoul -and (Test-Path -LiteralPath $soulPath)) {
+            Remove-Item -LiteralPath $soulPath -Force
+        }
     }
     if ($pluginRollback -and (Test-Path -LiteralPath $pluginRollback)) {
         if (Test-Path -LiteralPath $targetPlugin) {

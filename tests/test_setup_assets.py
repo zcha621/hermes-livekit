@@ -54,6 +54,26 @@ class SetupAssetTests(unittest.TestCase):
         self.assertIn("## One-click setup on Windows", readme)
         self.assertIn("Setup-HermesLiveKit.cmd", readme)
 
+    def test_setup_installs_identity_skill_and_restricted_tool_surface(self):
+        setup = (PLUGIN_ROOT / "Setup-HermesLiveKit.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+        soul = PLUGIN_ROOT / "assets" / "SOUL.md"
+        skill = PLUGIN_ROOT / "skills" / "mira-new-zealand-tourism" / "SKILL.md"
+
+        self.assertTrue(soul.is_file())
+        self.assertTrue(skill.is_file())
+        self.assertIn("[switch]$ReplaceSoul", setup)
+        self.assertIn("Install-MiraSoul", setup)
+        self.assertIn('Join-Path $sourcePlugin "skills"', setup)
+
+        configure = (PLUGIN_ROOT / "configure_yaml.py").read_text(encoding="utf-8")
+        self.assertIn('LIVEKIT_TOOLSETS = ["hermes-livekit", "no_mcp"]', configure)
+        self.assertIn('REMOTE_TOOL_NAMES = ["find_local_recommendations"]', configure)
+        self.assertIn(
+            "plugins enable hermes-livekit --no-allow-tool-override", setup
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
