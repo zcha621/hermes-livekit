@@ -6,6 +6,7 @@ point uses an existing ``register_platform()`` hook.
 """
 
 import logging
+import json
 import os
 import sys
 from pathlib import Path
@@ -15,7 +16,7 @@ _PLUGIN_DIR = str(Path(__file__).resolve().parent)
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
-from adapter import (
+from adapter import (  # noqa: E402
     LIVE_ADAPTERS,
     TOOLSET_NAME,
     LiveKitAdapter,
@@ -96,6 +97,78 @@ def _on_pre_tool_call_hook(
             tool_call_id=tool_call_id,
         )
 
+
+def _dispatch_account_workspace(arguments: dict, *, session_id: str = "") -> dict | None:
+    """Call the trusted worker tool without exposing account identifiers to the model."""
+    try:
+        from tools.registry import registry
+
+        result = registry.dispatch(
+            "manage_trip_itinerary",
+            arguments,
+            session_id=session_id,
+        )
+        if isinstance(result, str):
+            parsed = json.loads(result)
+            return (
+                parsed
+                if isinstance(parsed, dict) and not isinstance(parsed.get("error"), str)
+                else None
+            )
+    except Exception as exc:
+        logger.debug("account workspace bridge unavailable: %s", exc)
+    return None
+
+
+def _on_pre_llm_account_context(
+    session_id="", user_message="", **_kwargs
+) -> dict | None:
+    workspace = _dispatch_account_workspace({"action": "load"}, session_id=session_id)
+    if not workspace:
+        return None
+    if workspace.get("linked") is not True:
+        planning_terms = ("itinerary", "trip", "travel", "plan", "link code")
+        if not any(term in str(user_message).lower() for term in planning_terms):
+            return None
+        return {
+            "context": (
+                "This Hermes channel is not linked to a registered MiRA account. "
+                "For account-wide itinerary continuity, ask the traveller to create a "
+                "one-time channel code on the MiRA itinerary page and paste it here; then "
+                "call manage_trip_itinerary with action=link and that exact code."
+            )
+        }
+    compact = json.dumps(workspace, ensure_ascii=False, separators=(",", ":"))
+    return {
+        "context": (
+            "MiRA registered-account planning context (shared across Hermes sessions and "
+            "channels). A `draft` is editable and NOT saved/confirmed. An `itinerary` is the "
+            "last explicitly confirmed plan. Recent cross-channel conversation is included. "
+            "Use manage_trip_itinerary to revise a full structured draft, and only confirm the "
+            "exact current draft revision after an explicit user approval.\n" + compact
+        )
+    }
+
+
+def _on_post_llm_account_turn(
+    session_id="",
+    turn_id="",
+    user_message="",
+    assistant_response="",
+    **_kwargs,
+) -> None:
+    if not all((session_id, turn_id, user_message, assistant_response)):
+        return
+    _dispatch_account_workspace(
+        {
+            "action": "record_turn",
+            "turn_id": str(turn_id),
+            "user_message": str(user_message),
+            "assistant_message": str(assistant_response),
+        },
+        session_id=str(session_id),
+    )
+
 _LIVEKIT_PLATFORM_HINT = """You are MiRA on LiveKit, a travel companion for people on live video calls with remote family or friends.
 
 Primary goal: help the user stay natural, helpful, and present during the call. Give practical travel guidance, conversational support, local suggestions, itinerary ideas, and help with what to say or do next.
@@ -113,6 +186,8 @@ Interaction rules:
 Context-aware behavior:
 - Call `get_current_trip_context` before guidance that depends on the current time, phone location, participant conversation, or a saved itinerary. Refresh it when circumstances may have changed.
 - A saved itinerary is optional session context, never a prerequisite. If it is absent, converse from the current time, available location/device/social context, participant conversation, and relevant media instead.
+- Itinerary creation is conversational. Use `manage_trip_itinerary` action=revise to keep a complete structured draft as requirements change. Never claim a draft is saved and never call action=confirm until the traveller explicitly approves the current draft; pass its exact revision when confirming.
+- The registered-account planning context and conversation can follow a linked traveller across LiveKit, Discord, and other Hermes gateway sessions. If a channel is unlinked, help the traveller use the one-time code from the MiRA itinerary page.
 - A recent camera or shared-screen frame may be attached to a user turn. Use it when relevant, distinguish observation from inference, and do not claim to see anything when no image is attached.
 - When phone usage or call state is relevant later, favor actions that fit a live call setting: short replies, quick guidance, and minimal interruption.
 
@@ -280,6 +355,8 @@ def register(ctx) -> None:
     try:
         ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch_hook)
         ctx.register_hook("pre_tool_call", _on_pre_tool_call_hook)
+        ctx.register_hook("pre_llm_call", _on_pre_llm_account_context)
+        ctx.register_hook("post_llm_call", _on_post_llm_account_turn)
     except Exception as exc:
         logger.debug("acknowledgement hook registration failed: %s", exc)
 

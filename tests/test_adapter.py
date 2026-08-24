@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 import time
@@ -540,6 +541,54 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
             published.await_args.args[0]["reason"], "owner-not-allowed"
         )
 
+    async def test_remote_tool_handler_adds_trusted_session_source_and_returns_json(self):
+        owner = "agent-mira-knowledge-worker-12345678"
+        self.adapter._room = SimpleNamespace(remote_participants={owner: object()})
+        handler = self.adapter._build_tool_handler(owner, "manage_trip_itinerary")
+
+        async def publish(message, **_kwargs):
+            await self.adapter._handle_tool_result(
+                {
+                    "call_id": message["call_id"],
+                    "result": {"linked": True, "draft": {"revision": 4}},
+                },
+                owner,
+            )
+
+        session_values = {
+            "HERMES_SESSION_PLATFORM": "discord",
+            "HERMES_SESSION_USER_ID": "discord-user-42",
+            "HERMES_SESSION_USER_NAME": "Traveller",
+            "HERMES_SESSION_CHAT_ID": "channel-1",
+            "HERMES_SESSION_ID": "fallback-session",
+        }
+        with (
+            patch.object(self.adapter, "_publish_typed", side_effect=publish) as sent,
+            patch(
+                "gateway.session_context.get_session_env",
+                side_effect=lambda name, default="": session_values.get(name, default),
+            ),
+        ):
+            result = await handler(
+                {"action": "load", "_mira_source": {"user_id": "forged"}},
+                session_id="canonical-session",
+            )
+
+        arguments = sent.await_args.args[0]["arguments"]
+        self.assertEqual(
+            arguments["_mira_source"],
+            {
+                "platform": "discord",
+                "user_id": "discord-user-42",
+                "user_name": "Traveller",
+                "chat_id": "channel-1",
+                "hermes_session_id": "canonical-session",
+            },
+        )
+        self.assertEqual(
+            json.loads(result), {"linked": True, "draft": {"revision": 4}}
+        )
+
     async def test_remote_tool_registration_rejects_non_allowlisted_tool(self):
         message = {
             "name": "run_shell",
@@ -575,6 +624,14 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         register.assert_called_once()
         self.assertTrue(published.await_args.args[0]["success"])
+
+    async def test_simulated_worker_accepts_livekit_numeric_agent_kind(self):
+        identity = "simulated-agent-numeric"
+        self.adapter._room = SimpleNamespace(
+            remote_participants={identity: SimpleNamespace(kind=4)}
+        )
+
+        self.assertTrue(self.adapter._remote_participant_is_agent(identity))
 
     async def test_simulated_phone_cannot_register_remote_tool(self):
         identity = "simulated-agent-phone"

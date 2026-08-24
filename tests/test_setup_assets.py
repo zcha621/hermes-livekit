@@ -74,7 +74,7 @@ class SetupAssetTests(unittest.TestCase):
         self.assertIn('"web",', configure)
         self.assertIn('"no_mcp",', configure)
         self.assertIn(
-            'REMOTE_TOOL_NAMES = ["find_local_recommendations", "get_current_trip_context"]',
+            '"manage_trip_itinerary",',
             configure,
         )
         self.assertIn(

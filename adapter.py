@@ -165,6 +165,7 @@ TOOLSET_NAME = "hermes-livekit-tools"
 DEFAULT_REMOTE_TOOL_NAMES = (
     "find_local_recommendations",
     "get_current_trip_context",
+    "manage_trip_itinerary",
 )
 DEFAULT_REMOTE_TOOL_OWNER_PREFIXES = (
     "agent-mira-knowledge-worker-",
@@ -1968,7 +1969,6 @@ class LiveKitAdapter(BasePlatformAdapter):
         anything else is ignored (silently — keeps the protocol open for
         unrelated apps sharing the same data channel without spamming logs).
         """
-        topic = getattr(packet, "topic", None) or ""
         # Handle all topics - browser chatbox sends text on any topic
         participant = getattr(packet, "participant", None)
         participant_identity = str(
@@ -2440,7 +2440,17 @@ class LiveKitAdapter(BasePlatformAdapter):
             return False
         kind = getattr(participant, "kind", None)
         kind_name = str(getattr(kind, "name", kind) or "").lower()
-        return kind_name == "agent" or kind_name.endswith("_agent")
+        if kind_name == "agent" or kind_name.endswith("_agent"):
+            return True
+        # livekit-rtc 1.1.x exposes ParticipantKind as protobuf integers,
+        # while newer/test objects may expose enum names. Resolve the numeric
+        # server-classified AGENT value through the SDK rather than accepting
+        # participant-controlled identity or metadata alone.
+        try:
+            agent_kind = rtc.ParticipantKind.Value("PARTICIPANT_KIND_AGENT")
+            return int(kind) == int(agent_kind)
+        except (AttributeError, TypeError, ValueError):
+            return False
 
     async def _unregister_client_tool(self, msg: Dict[str, Any], identity: str) -> None:
         name = (msg.get("name") or "").strip()
@@ -2480,8 +2490,26 @@ class LiveKitAdapter(BasePlatformAdapter):
         arguments object, kwargs are framework extras we pass through.
         """
 
-        async def proxy(args: Optional[Dict[str, Any]] = None, **_kwargs: Any) -> Any:
+        async def proxy(args: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Any:
             arguments: Dict[str, Any] = dict(args or {})
+            try:
+                from gateway.session_context import get_session_env
+
+                platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+                user_id = get_session_env("HERMES_SESSION_USER_ID", "")
+                if platform and user_id:
+                    arguments["_mira_source"] = {
+                        "platform": platform,
+                        "user_id": user_id,
+                        "user_name": get_session_env("HERMES_SESSION_USER_NAME", ""),
+                        "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", ""),
+                        "hermes_session_id": (
+                            str(kwargs.get("session_id") or "")
+                            or get_session_env("HERMES_SESSION_ID", "")
+                        ),
+                    }
+            except Exception:
+                logger.debug("[%s] could not attach account source context", self.name)
             if not self._room or owner_identity not in self._room.remote_participants:
                 raise RuntimeError(
                     f"client {owner_identity!r} who registered {registered_name!r} is not connected"
@@ -2501,7 +2529,10 @@ class LiveKitAdapter(BasePlatformAdapter):
                     },
                     identity=owner_identity,
                 )
-                return await asyncio.wait_for(future, timeout=self._tool_call_timeout)
+                result = await asyncio.wait_for(future, timeout=self._tool_call_timeout)
+                if isinstance(result, str):
+                    return result
+                return json.dumps(result, ensure_ascii=False, default=str)
             except asyncio.TimeoutError:
                 await self._publish_typed(
                     {"type": "agent:tool-call-timeout", "call_id": call_id, "name": registered_name},

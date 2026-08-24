@@ -44,7 +44,11 @@ LIVEKIT_TOOLSETS = [
     "no_mcp",
 ]
 DEFAULT_WEB_SEARCH_BACKEND = "ddgs"
-REMOTE_TOOL_NAMES = ["find_local_recommendations", "get_current_trip_context"]
+REMOTE_TOOL_NAMES = [
+    "find_local_recommendations",
+    "get_current_trip_context",
+    "manage_trip_itinerary",
+]
 REMOTE_TOOL_OWNER_PREFIXES = [
     "agent-mira-knowledge-worker-",
     # LiveKit Agents 1.2.x uses this identity in ``connect --room`` mode,
@@ -117,6 +121,15 @@ def update_config(config_path: Path) -> None:
     if not isinstance(platform_toolsets, dict):
         raise ValueError("Hermes platform_toolsets config must be a YAML mapping")
     platform_toolsets["livekit"] = list(LIVEKIT_TOOLSETS)
+    # The trusted room worker registers account-aware planning tools in
+    # Hermes's process-wide registry. Keep that plugin toolset visible on every
+    # explicitly configured gateway surface so a linked traveller can continue
+    # the same plan from Discord, Telegram, Slack, or another supported channel.
+    for platform_name, configured_toolsets in platform_toolsets.items():
+        if not isinstance(configured_toolsets, list):
+            continue
+        if "hermes-livekit" not in configured_toolsets:
+            configured_toolsets.append("hermes-livekit")
 
     # The LiveKit fallback is read-only web search. Prefer the bundled,
     # keyless DDGS provider when no explicit search backend was selected; an

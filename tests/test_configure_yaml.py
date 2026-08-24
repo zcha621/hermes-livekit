@@ -113,6 +113,42 @@ class ConfigureYamlTests(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
+    def test_update_exposes_account_planning_toolset_on_configured_gateways(self):
+        workspace_temp = Path(__file__).resolve().parents[3] / ".tmp"
+        workspace_temp.mkdir(exist_ok=True)
+        path = workspace_temp / "hermes-livekit-channel-toolsets.yaml"
+        try:
+            path.write_text(
+                yaml.safe_dump(
+                    {
+                        "platform_toolsets": {
+                            "discord": ["browser", "no_mcp"],
+                            "telegram": ["web"],
+                        }
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+
+            update_config(path)
+
+            config = yaml.safe_load(path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                config["platform_toolsets"]["discord"],
+                ["browser", "no_mcp", "hermes-livekit"],
+            )
+            self.assertEqual(
+                config["platform_toolsets"]["telegram"],
+                ["web", "hermes-livekit"],
+            )
+            self.assertEqual(
+                config["platform_toolsets"]["livekit"].count("hermes-livekit"),
+                1,
+            )
+        finally:
+            path.unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     unittest.main()

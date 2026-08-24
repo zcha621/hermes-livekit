@@ -3,7 +3,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT))
@@ -75,6 +75,8 @@ class PluginHookTests(unittest.TestCase):
         self.assertIn("Aotearoa New Zealand", plugin._LIVEKIT_PLATFORM_HINT)
         self.assertIn("find_local_recommendations", plugin._LIVEKIT_PLATFORM_HINT)
         self.assertIn("get_current_trip_context", plugin._LIVEKIT_PLATFORM_HINT)
+        self.assertIn("manage_trip_itinerary", plugin._LIVEKIT_PLATFORM_HINT)
+        self.assertIn("explicitly approves", plugin._LIVEKIT_PLATFORM_HINT)
         self.assertIn(
             "Never end a turn with a holding sentence", plugin._LIVEKIT_PLATFORM_HINT
         )
@@ -89,6 +91,46 @@ class PluginHookTests(unittest.TestCase):
             "mira-new-zealand-tourism", plugin._TOURISM_SKILL_PATH
         )
         context.register_platform.assert_called_once()
+        hook_names = [call.args[0] for call in context.register_hook.call_args_list]
+        self.assertIn("pre_llm_call", hook_names)
+        self.assertIn("post_llm_call", hook_names)
+
+    def test_pre_llm_hook_injects_linked_cross_channel_workspace(self):
+        workspace = {
+            "linked": True,
+            "draft": {"revision": 2, "title": "Auckland"},
+            "itinerary": None,
+            "conversation": [{"role": "user", "content": "Keep it relaxed"}],
+        }
+        with patch.object(
+            plugin, "_dispatch_account_workspace", return_value=workspace
+        ) as dispatch:
+            result = plugin._on_pre_llm_account_context(
+                session_id="discord-session", user_message="Can we continue my plan?"
+            )
+
+        dispatch.assert_called_once_with({"action": "load"}, session_id="discord-session")
+        self.assertIn('"revision":2', result["context"])
+        self.assertIn("NOT saved/confirmed", result["context"])
+
+    def test_post_llm_hook_records_full_turn_for_linked_account(self):
+        with patch.object(plugin, "_dispatch_account_workspace") as dispatch:
+            plugin._on_post_llm_account_turn(
+                session_id="livekit-session",
+                turn_id="turn-7",
+                user_message="Move lunch later",
+                assistant_response="I moved lunch to 1 pm.",
+            )
+
+        dispatch.assert_called_once_with(
+            {
+                "action": "record_turn",
+                "turn_id": "turn-7",
+                "user_message": "Move lunch later",
+                "assistant_message": "I moved lunch to 1 pm.",
+            },
+            session_id="livekit-session",
+        )
 
 
 if __name__ == "__main__":

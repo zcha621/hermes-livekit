@@ -115,8 +115,8 @@ Registration is fail-closed: the production participant identity must begin
 with `agent-mira-knowledge-worker-`. LiveKit Agents 1.2.x local
 `connect --room` workers use `simulated-agent-`; that compatibility identity is
 accepted only when LiveKit marks the participant kind as `AGENT`. The tool name
-must be either `find_local_recommendations` or `get_current_trip_context`. All
-other identities and names are rejected.
+must be `find_local_recommendations`, `get_current_trip_context`, or
+`manage_trip_itinerary`. All other identities and names are rejected.
 
 The MiRA worker currently includes a harmless `content` compatibility marker in
 these envelopes so an installed pre-fix adapter can also route them. Updated
@@ -128,6 +128,16 @@ itinerary, latest consented Android context, and recent participant-labelled
 transcripts. The worker, not the LLM, injects the Tourism AI session ID and
 holds the short-lived backend credential. Do not expose arbitrary HTTP, SQL,
 Cypher, shell, or filesystem tools through this protocol.
+
+`manage_trip_itinerary` is the account-planning route. Hermes receives trusted
+gateway platform/user/session context from the adapter, never an account ID
+from the model. `revise` stores an editable draft; `confirm` requires the exact
+current revision and explicit traveller approval before the backend promotes it
+to the confirmed itinerary. The plugin loads the linked workspace before each
+turn and records the completed user/assistant turn afterward, allowing the
+draft, confirmed plan, and recent conversation to continue across Hermes
+sessions and explicitly configured gateway channels. An unlinked channel can
+be attached with the portal's 15-minute one-time code.
 
 ## One-click setup on Windows
 
@@ -187,11 +197,17 @@ LiveKit sessions expose three preferred tourism evidence routes:
 
 - `find_local_recommendations` — the authenticated MiRA graph/RAG route for
   curated, session-scoped tourism evidence;
+- `manage_trip_itinerary` - account linking plus conversational draft revision
+  and explicit confirmation. A draft is not a saved itinerary;
 - `web_search` — Hermes's read-only online-search fallback for fresh facts or
   locations not covered by the pilot graph.
 
 LiveKit also receives the same normal Hermes task and skill toolsets as Discord,
 so a spoken request can be completed rather than acknowledged and abandoned.
+Setup also adds the narrow `hermes-livekit` toolset to every explicitly
+configured Hermes gateway surface, allowing linked Discord, Telegram, or other
+channels to continue account planning while the trusted LiveKit worker remains
+connected.
 `no_mcp` remains explicit, preventing globally enabled MCP servers from
 silently entering a room. The tourism skill tells Hermes when to prefer the
 graph and when to fall back to online search, and requires source URLs for
@@ -265,6 +281,7 @@ platforms:
         allowed_names:
           - find_local_recommendations
           - get_current_trip_context
+          - manage_trip_itinerary
         allowed_owner_prefixes:
           - agent-mira-knowledge-worker-
 
