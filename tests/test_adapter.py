@@ -528,8 +528,8 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_remote_tool_registration_rejects_untrusted_participant(self):
         message = {
-            "name": "find_local_recommendations",
-            "description": "Grounded tourism retrieval",
+            "name": "get_current_trip_context",
+            "description": "Current consented trip context",
             "input_schema": {"type": "object"},
         }
         with patch.object(self.adapter, "_publish_typed", AsyncMock()) as published:
@@ -561,8 +561,8 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         message = {
-            "name": "find_local_recommendations",
-            "description": "Grounded tourism retrieval",
+            "name": "get_current_trip_context",
+            "description": "Current consented trip context",
             "input_schema": {"type": "object"},
         }
 

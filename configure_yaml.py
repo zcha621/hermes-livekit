@@ -44,7 +44,7 @@ LIVEKIT_TOOLSETS = [
     "no_mcp",
 ]
 DEFAULT_WEB_SEARCH_BACKEND = "ddgs"
-REMOTE_TOOL_NAMES = ["find_local_recommendations"]
+REMOTE_TOOL_NAMES = ["find_local_recommendations", "get_current_trip_context"]
 REMOTE_TOOL_OWNER_PREFIXES = [
     "agent-mira-knowledge-worker-",
     # LiveKit Agents 1.2.x uses this identity in ``connect --room`` mode,

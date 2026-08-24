@@ -73,7 +73,10 @@ class SetupAssetTests(unittest.TestCase):
         self.assertIn('"terminal",', configure)
         self.assertIn('"web",', configure)
         self.assertIn('"no_mcp",', configure)
-        self.assertIn('REMOTE_TOOL_NAMES = ["find_local_recommendations"]', configure)
+        self.assertIn(
+            'REMOTE_TOOL_NAMES = ["find_local_recommendations", "get_current_trip_context"]',
+            configure,
+        )
         self.assertIn(
             "plugins enable hermes-livekit --no-allow-tool-override", setup
         )

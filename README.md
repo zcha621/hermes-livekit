@@ -115,17 +115,19 @@ Registration is fail-closed: the production participant identity must begin
 with `agent-mira-knowledge-worker-`. LiveKit Agents 1.2.x local
 `connect --room` workers use `simulated-agent-`; that compatibility identity is
 accepted only when LiveKit marks the participant kind as `AGENT`. The tool name
-must be exactly `find_local_recommendations`. All other identities and names
-are rejected.
+must be either `find_local_recommendations` or `get_current_trip_context`. All
+other identities and names are rejected.
 
 The MiRA worker currently includes a harmless `content` compatibility marker in
 these envelopes so an installed pre-fix adapter can also route them. Updated
 adapters dispatch on `type` and ignore that marker.
 
-MiRA currently uses this protocol for `find_local_recommendations`. The worker,
-not the LLM, injects the Tourism AI session ID and holds the short-lived backend
-credential. Do not expose arbitrary HTTP, SQL, Cypher, shell, or filesystem
-tools through this protocol.
+MiRA uses this protocol for grounded recommendation retrieval and for a bounded
+current-context read. The latter returns current server time, an optional saved
+itinerary, latest consented Android context, and recent participant-labelled
+transcripts. The worker, not the LLM, injects the Tourism AI session ID and
+holds the short-lived backend credential. Do not expose arbitrary HTTP, SQL,
+Cypher, shell, or filesystem tools through this protocol.
 
 ## One-click setup on Windows
 
@@ -178,7 +180,10 @@ file as `SOUL.md.mira.bak`.
 
 ## Evidence routes
 
-LiveKit sessions expose two preferred tourism evidence routes:
+LiveKit sessions expose three preferred tourism evidence routes:
+
+- `get_current_trip_context` - current time, optional itinerary, consented
+  location/device/social context, and recent room conversation;
 
 - `find_local_recommendations` — the authenticated MiRA graph/RAG route for
   curated, session-scoped tourism evidence;
@@ -259,6 +264,7 @@ platforms:
       remote_tools:
         allowed_names:
           - find_local_recommendations
+          - get_current_trip_context
         allowed_owner_prefixes:
           - agent-mira-knowledge-worker-
 

@@ -162,7 +162,10 @@ PRESENCE_POLL_INTERVAL_LOCAL = 5.0
 TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 TOOL_CALL_TIMEOUT_DEFAULT = 30.0
 TOOLSET_NAME = "hermes-livekit-tools"
-DEFAULT_REMOTE_TOOL_NAMES = ("find_local_recommendations",)
+DEFAULT_REMOTE_TOOL_NAMES = (
+    "find_local_recommendations",
+    "get_current_trip_context",
+)
 DEFAULT_REMOTE_TOOL_OWNER_PREFIXES = (
     "agent-mira-knowledge-worker-",
     "simulated-agent-",
