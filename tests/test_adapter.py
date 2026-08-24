@@ -67,6 +67,67 @@ class AdapterTests(unittest.TestCase):
 
         self.assertFalse(self.adapter._playback_interrupt.is_set())
 
+    def test_explicit_interrupt_flushes_audio_and_dispatches_priority_stop(self):
+        source = SimpleNamespace()
+        source.cleared = False
+        source.clear_queue = lambda: setattr(source, "cleared", True)
+        self.adapter._audio_source = source
+        self.adapter._is_playing = True
+        self.adapter._activate_invoked_turn("Hermes")
+
+        with (
+            patch.object(self.adapter, "_publish_agent_event", AsyncMock()) as published,
+            patch.object(self.adapter, "handle_message", AsyncMock()) as dispatched,
+        ):
+            asyncio.run(
+                self.adapter._handle_client_control(
+                    {
+                        "action": "interrupt",
+                        "reason": "user-request",
+                        "request_id": "request-123",
+                    },
+                    "phone",
+                )
+            )
+
+        self.assertTrue(source.cleared)
+        self.assertTrue(self.adapter._playback_interrupt.is_set())
+        dispatched.assert_awaited_once()
+        event = dispatched.await_args.args[0]
+        self.assertEqual(event.message_id, "request-123")
+        self.assertEqual(event.text, "/stop")
+        self.assertEqual(event.source.user_id, "phone")
+        self.assertTrue(getattr(event, "_livekit_invocation_checked"))
+        published.assert_awaited_once_with(
+            "agent:interrupted",
+            {
+                "identity": "phone",
+                "request_id": "request-123",
+                "reason": "user-request",
+            },
+        )
+
+    def test_explicit_interrupt_is_ignored_without_active_response(self):
+        with (
+            patch.object(self.adapter, "_publish_agent_event", AsyncMock()) as published,
+            patch.object(self.adapter, "handle_message", AsyncMock()) as dispatched,
+        ):
+            asyncio.run(
+                self.adapter._handle_client_control(
+                    {"action": "interrupt", "request_id": "request-123"}, "phone"
+                )
+            )
+
+        dispatched.assert_not_awaited()
+        published.assert_awaited_once_with(
+            "agent:interrupt-ignored",
+            {
+                "identity": "phone",
+                "request_id": "request-123",
+                "reason": "no-active-response",
+            },
+        )
+
     def test_keyterm_match_is_case_insensitive_and_strips_wake_phrase(self):
         keyterm, cleaned = self.adapter._match_keyterm(
             "Hey MiRA, find walks near Rotorua"
@@ -439,6 +500,31 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(received["identity"], "mira-worker")
         self.assertEqual(received["message"]["name"], "find_local_recommendations")
+
+    async def test_client_interrupt_packet_routes_from_shared_control_topic(self):
+        routed = asyncio.Event()
+        received = {}
+
+        async def fake_control(message, identity):
+            received["message"] = message
+            received["identity"] = identity
+            routed.set()
+
+        packet = SimpleNamespace(
+            topic="hermes-control",
+            data=(
+                b'{"type":"client:control","action":"interrupt",'
+                b'"reason":"user-request","request_id":"request-123"}'
+            ),
+            participant=SimpleNamespace(identity="phone"),
+        )
+        with patch.object(self.adapter, "_handle_client_control", fake_control):
+            self.adapter._on_data_received(packet)
+            await asyncio.wait_for(routed.wait(), timeout=1)
+
+        self.assertEqual(received["identity"], "phone")
+        self.assertEqual(received["message"]["action"], "interrupt")
+        self.assertEqual(received["message"]["request_id"], "request-123")
 
     async def test_remote_tool_registration_rejects_untrusted_participant(self):
         message = {

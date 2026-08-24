@@ -64,6 +64,31 @@ Android meeting all render the same status contract. Participant attributes
 let late joiners receive current state; reliable status data packets provide
 the matching realtime event stream.
 
+## Interruption and audio processing
+
+Meeting microphones remain published during Hermes playback. Web and Android
+enable WebRTC echo cancellation, noise suppression, and automatic gain control;
+the Android client additionally enables its high-pass and typing-noise filters.
+The adapter detects inbound speech independently of its outbound track and
+flushes queued TTS audio on voice barge-in.
+
+The meeting clients also expose **Stop agent** while the state is `thinking` or
+`speaking`. The control is independent of microphone mute and uses a reliable
+packet on the `hermes-control` topic:
+
+```json
+{
+  "type": "client:control",
+  "action": "interrupt",
+  "reason": "user-request",
+  "request_id": "client-generated-id"
+}
+```
+
+Hermes immediately clears queued audio, publishes `agent:interrupted`, and
+dispatches its canonical `/stop` command. The gateway cancels in-flight model,
+tool, and child-agent work regardless of the configured busy-input mode.
+
 ## Natural voice acknowledgements
 
 LiveKit follows Hermes Discord voice behavior:
@@ -291,11 +316,13 @@ A useful call check is:
    the first tool starts, then deliver the answer.
 3. Ask a multi-tool question. The cue should still occur only once.
 4. Speak during playback. MiRA should stop and listen.
-5. Speak without a keyterm. The utterance should appear in the labeled room
+5. While MiRA is working or speaking, use **Stop agent** and confirm playback
+   stops immediately. Repeat with the microphone muted.
+6. Speak without a keyterm. The utterance should appear in the labeled room
    transcript, but no Hermes response turn should be created.
-6. Say “MiRA” plus a request. MiRA should answer using relevant context from the
+7. Say “MiRA” plus a request. MiRA should answer using relevant context from the
    preceding ambient transcript.
-7. Speak again without a keyterm. MiRA should remain quiet; repeat with a
+8. Speak again without a keyterm. MiRA should remain quiet; repeat with a
    keyterm and confirm the correct participant name appears in context.
 
 ## Runtime files

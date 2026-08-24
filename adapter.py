@@ -384,6 +384,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         # Hermes still hears and records the whole room transcript, but an
         # ambient turn never reaches the response-generating agent loop.
         self._invoked_turn_active = False
+        self._invoked_turn_generation = 0
         self._participant_topics: Dict[str, str] = {}
         self._conversation_transcript: list[Dict[str, Any]] = []
         self._transcript_sequence = 0
@@ -506,12 +507,16 @@ class LiveKitAdapter(BasePlatformAdapter):
             return compact
         return compact[: TOPIC_MAX_LENGTH - 1].rstrip() + "…"
 
-    def _activate_invoked_turn(self, keyterm: str = "") -> None:
+    def _activate_invoked_turn(self, keyterm: str = "") -> int:
+        self._invoked_turn_generation += 1
         self._invoked_turn_active = True
         if keyterm:
             self._last_keyterm = keyterm
+        return self._invoked_turn_generation
 
-    def _finish_invoked_turn(self) -> None:
+    def _finish_invoked_turn(self, generation: Optional[int] = None) -> None:
+        if generation is not None and generation != self._invoked_turn_generation:
+            return
         self._invoked_turn_active = False
 
     def _reset_room_context(self) -> None:
@@ -520,6 +525,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._conversation_transcript.clear()
         self._transcript_sequence = 0
         self._invoked_turn_active = False
+        self._invoked_turn_generation += 1
         self._active_speaker_identity = ""
         self._active_speaker_name = ""
         self._active_topic = ""
@@ -760,7 +766,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             "schema": AGENT_STATUS_SCHEMA,
             "state": self._agent_state,
             "invoked": invoked,
-            "can_interrupt": invoked,
+            "can_interrupt": invoked and self._agent_state in {"thinking", "speaking"},
             "active_speaker": {
                 "identity": self._active_speaker_identity,
                 "name": self._active_speaker_name,
@@ -1756,9 +1762,9 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._video_track_meta.pop(key, None)
             self._latest_video_frames.pop(key, None)
 
-    def _interrupt_playback(self, identity: str) -> None:
+    def _interrupt_playback(self, identity: str) -> bool:
         if not self._is_playing or not self._conversation_is_active():
-            return
+            return False
         logger.info("[%s] Barge-in detected from %s; stopping TTS", self.name, identity)
         self._playback_interrupt.set()
         if self._audio_source is not None:
@@ -1766,6 +1772,7 @@ class LiveKitAdapter(BasePlatformAdapter):
                 self._audio_source.clear_queue()
             except Exception:
                 pass
+        return True
 
     async def _set_listening_state(self, identity: str) -> None:
         self._active_speaker_identity = identity
@@ -2182,13 +2189,15 @@ class LiveKitAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     async def _handle_client_control(self, msg: Dict[str, Any], identity: str) -> None:
-        """Runtime control hooks from the client. Placeholder for now.
+        """Handle reliable runtime controls from a connected client.
 
         Currently recognized actions:
           - ``pause``  — stop sampling inbound audio (already used internally
             during TTS playback); kept here as an explicit client-facing hook
             for future "mute me" UX.
           - ``resume`` — re-enable audio sampling.
+          - ``interrupt`` — flush speech immediately and dispatch Hermes's
+            priority ``/stop`` command.
         """
         action = (msg.get("action") or "").strip().lower()
         if action == "pause":
@@ -2197,8 +2206,59 @@ class LiveKitAdapter(BasePlatformAdapter):
         elif action == "resume":
             self._paused = False
             logger.info("[%s] resumed by client %s", self.name, identity)
+        elif action == "interrupt":
+            await self._handle_client_interrupt(msg, identity)
         else:
             logger.debug("[%s] unknown client:control action %r", self.name, action)
+
+    async def _handle_client_interrupt(
+        self, msg: Dict[str, Any], identity: str
+    ) -> None:
+        """Stop current audio and make Hermes cancel its in-flight response."""
+        if not self._conversation_is_active():
+            await self._publish_agent_event(
+                "agent:interrupt-ignored",
+                {
+                    "identity": identity,
+                    "request_id": str(msg.get("request_id") or ""),
+                    "reason": "no-active-response",
+                },
+            )
+            return
+
+        self._interrupt_playback(identity)
+        self._finish_tool_acknowledgement_turn()
+
+        # Dispatch the canonical gateway command rather than conversational
+        # text. /stop always cancels generation, tools, and child agents; it is
+        # never demoted by a queue/steer busy-input policy.
+        self._activate_invoked_turn(self._last_keyterm)
+        source = self.build_source(
+            chat_id=self._room_name,
+            chat_name=self._room_name,
+            chat_type="group",
+            user_id=identity or "client",
+            user_name=self._participant_display_name(identity),
+        )
+        event = MessageEvent(
+            text="/stop",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=str(msg.get("request_id") or uuid.uuid4().hex[:12]),
+            media_urls=[],
+            media_types=[],
+            timestamp=datetime.now(tz=timezone.utc),
+        )
+        setattr(event, "_livekit_invocation_checked", True)
+        await self._publish_agent_event(
+            "agent:interrupted",
+            {
+                "identity": identity,
+                "request_id": str(msg.get("request_id") or ""),
+                "reason": "user-request",
+            },
+        )
+        await self.handle_message(event)
 
     # -- Remote tools (client-registered) -----------------------------------
 
@@ -2641,6 +2701,7 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         async with self._playback_lock:
             speaking_generation = 0
+            turn_generation = self._invoked_turn_generation
             try:
                 self._playback_interrupt.clear()
                 self._is_playing = True
@@ -2699,7 +2760,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             finally:
                 self._is_playing = False
                 if not (metadata or {}).get("non_conversational"):
-                    self._finish_invoked_turn()
+                    self._finish_invoked_turn(turn_generation)
                 await self._publish_agent_event("agent:speaking-stop")
                 if speaking_generation:
                     await self._finish_state_if_current(speaking_generation)
