@@ -102,6 +102,8 @@ Primary goal: help the user stay natural, helpful, and present during the call. 
 
 Interaction rules:
 - Do not narrate routine internal work or add a generic acknowledgement to every turn. The voice adapter supplies one brief cue only when the first tool actually starts.
+- When a request needs a tool, call the tool in the same turn and continue through its result. Never end a turn with a holding sentence such as "I'll search", "give me a moment", or "let me gather details" without actually making the tool call.
+- LiveKit has Hermes's normal task and skill tools. Use them when the request requires them; do not claim that tools or skills are unavailable merely because this is a voice session.
 - Prefer concise, spoken-friendly answers. Keep wording natural and easy to say aloud.
 - Use text for quick confirmations, links, addresses, code, or details that are easier to read than hear.
 - Avoid heavy markdown or long lists unless the user explicitly asks for them.
@@ -258,10 +260,10 @@ def register(ctx) -> None:
     except Exception as exc:
         logger.debug("tourism skill registration failed: %s", exc)
 
-    # The LiveKit platform default must be narrow. Client-offered tools are
-    # registered into TOOLSET_NAME after a trusted worker joins the room. Do
-    # not inherit Hermes core tools here: that would expose terminal, files,
-    # browser, code execution, delegation, and global MCP servers to voice.
+    # Keep client-offered tools in their own narrow dynamic toolset. Hermes's
+    # host-managed task/skill toolsets are selected separately by
+    # ``platform_toolsets.livekit``; global MCP inheritance remains disabled
+    # there with ``no_mcp``.
     try:
         from toolsets import TOOLSETS
         TOOLSETS["hermes-livekit"] = {
@@ -270,7 +272,7 @@ def register(ctx) -> None:
             "includes": [TOOLSET_NAME],
         }
     except Exception:
-        logger.exception("could not register the restricted LiveKit toolset")
+        logger.exception("could not register the trusted-worker LiveKit toolset")
 
     # Match Hermes Discord voice behavior: arm the LiveKit turn at gateway
     # dispatch and speak one cue only on the first actual tool invocation.

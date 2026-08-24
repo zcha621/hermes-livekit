@@ -51,7 +51,7 @@ class AdapterTests(unittest.TestCase):
         source.clear_queue = lambda: setattr(source, "cleared", True)
         self.adapter._audio_source = source
         self.adapter._is_playing = True
-        self.adapter._activate_conversation("Hermes")
+        self.adapter._activate_invoked_turn("Hermes")
 
         self.adapter._interrupt_playback("phone")
 
@@ -168,6 +168,17 @@ class AdapterTests(unittest.TestCase):
         )
         self.assertEqual(len(loop.calls), 1)
 
+    def test_prepare_tts_text_suppresses_leaked_function_invocation(self):
+        leaked = "find_local_recommendations(query='places to visit in Auckland', location='Auckland', limit=2)"
+        self.assertEqual(self.adapter.prepare_tts_text(leaked), "")
+
+    def test_prepare_tts_text_keeps_conversational_text_around_tool_leak(self):
+        text = "I'll check that.\nfind_local_recommendations(query='walks', limit=2)\nI found two options."
+        self.assertEqual(
+            self.adapter.prepare_tts_text(text),
+            "I'll check that.\n\nI found two options.",
+        )
+
 
 class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -196,12 +207,13 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received["event"].text, "Hermes, hello from phone")
         self.assertEqual(received["event"].source.user_id, "phone")
 
-    async def test_message_without_keyterm_is_ignored_until_invoked(self):
+    async def test_message_without_keyterm_is_transcribed_but_not_dispatched(self):
         dispatched = AsyncMock()
         self.adapter._room = SimpleNamespace(
             remote_participants={},
             local_participant=SimpleNamespace(set_attributes=AsyncMock()),
         )
+
         event = livekit_adapter.MessageEvent(
             text="What is the weather?",
             message_type=livekit_adapter.MessageType.VOICE,
@@ -221,7 +233,7 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         dispatched.assert_not_awaited()
 
-    async def test_keyterm_opens_room_for_another_speaker_and_adds_context(self):
+    async def test_each_utterance_requires_keyterm_and_ambient_speech_is_context(self):
         self.adapter._room = SimpleNamespace(
             remote_participants={
                 "alice": SimpleNamespace(name="Alice"),
@@ -231,28 +243,127 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         published = AsyncMock()
         with patch.object(self.adapter, "_publish_agent_event", published):
-            first = livekit_adapter.MessageEvent(
-                text="Hermes, plan a Rotorua walk for us",
+            ambient = livekit_adapter.MessageEvent(
+                text="We should find an accessible Rotorua walk",
                 message_type=livekit_adapter.MessageType.VOICE,
                 source=self.adapter.build_source(
                     chat_id="test-room", chat_type="group", user_id="alice"
                 ),
             )
-            second = livekit_adapter.MessageEvent(
-                text="Make it accessible too",
+            invoked = livekit_adapter.MessageEvent(
+                text="Hermes, which option would suit us?",
                 message_type=livekit_adapter.MessageType.VOICE,
                 source=self.adapter.build_source(
                     chat_id="test-room", chat_type="group", user_id="bob"
                 ),
             )
+            followup_without_keyterm = livekit_adapter.MessageEvent(
+                text="And make it short",
+                message_type=livekit_adapter.MessageType.VOICE,
+                source=self.adapter.build_source(
+                    chat_id="test-room", chat_type="group", user_id="alice"
+                ),
+            )
 
-            self.assertTrue(await self.adapter._prepare_invoked_event(first))
-            self.assertTrue(await self.adapter._prepare_invoked_event(second))
+            self.assertFalse(await self.adapter._prepare_invoked_event(ambient))
+            self.assertTrue(await self.adapter._prepare_invoked_event(invoked))
+            self.assertTrue(self.adapter._conversation_is_active())
+            self.assertFalse(
+                await self.adapter._prepare_invoked_event(followup_without_keyterm)
+            )
 
-        self.assertEqual(first.source.user_name, "Alice")
-        self.assertEqual(second.source.user_name, "Bob")
-        self.assertIn("Alice: plan a Rotorua walk for us", second.channel_prompt)
-        self.assertIn("Bob: Make it accessible too", second.channel_prompt)
+        self.assertEqual(invoked.source.user_name, "Bob")
+        self.assertIn(
+            "Alice (user): We should find an accessible Rotorua walk",
+            invoked.channel_prompt,
+        )
+        self.assertIn(
+            "Bob (user): Hermes, which option would suit us?",
+            invoked.channel_prompt,
+        )
+        self.assertEqual(invoked.text, "which option would suit us")
+        user_events = [
+            call.args[1]
+            for call in published.await_args_list
+            if call.args[0] == "agent:user-transcript"
+        ]
+        self.assertEqual(
+            [event["name"] for event in user_events], ["Alice", "Bob", "Alice"]
+        )
+        self.assertEqual(
+            [event["invoked"] for event in user_events], [False, True, False]
+        )
+
+    async def test_native_transcripts_include_participant_and_agent_speech(self):
+        publish_transcription = AsyncMock()
+        self.adapter._room = SimpleNamespace(
+            remote_participants={"alice": SimpleNamespace(name="Alice")},
+            local_participant=SimpleNamespace(
+                identity="hermes-mira",
+                publish_transcription=publish_transcription,
+            ),
+        )
+        self.adapter._audio_track_sids["alice"] = "TR-user"
+        self.adapter._local_audio_track_sid = "TR-agent"
+
+        user_entry = self.adapter._append_transcript(
+            role="user",
+            identity="alice",
+            name="Alice",
+            text="We were discussing geothermal walks",
+        )
+        await self.adapter._publish_transcript_entry(user_entry)
+        await self.adapter._record_agent_transcript(
+            "Waimangu fits that conversation.", kind="speech"
+        )
+
+        user_transcription = publish_transcription.await_args_list[0].args[0]
+        agent_transcription = publish_transcription.await_args_list[1].args[0]
+        self.assertEqual(user_transcription.participant_identity, "alice")
+        self.assertEqual(user_transcription.track_sid, "TR-user")
+        self.assertEqual(agent_transcription.participant_identity, "hermes-mira")
+        self.assertEqual(agent_transcription.track_sid, "TR-agent")
+        self.assertTrue(user_transcription.segments[0].final)
+        self.assertIn(
+            "Hermes (assistant): Waimangu fits that conversation.",
+            self.adapter._transcript_context(),
+        )
+
+    async def test_tts_speech_is_logged_once_and_reused_as_future_context(self):
+        publish_transcription = AsyncMock()
+        local_participant = SimpleNamespace(
+            identity="hermes-mira",
+            publish_data=AsyncMock(),
+            publish_transcription=publish_transcription,
+            set_attributes=AsyncMock(),
+        )
+        self.adapter._room = SimpleNamespace(
+            remote_participants={}, local_participant=local_participant
+        )
+        self.adapter._audio_source = SimpleNamespace(
+            capture_frame=AsyncMock(), clear_queue=lambda: None
+        )
+        response = "The earlier group discussion points to Waimangu."
+        self.adapter._activate_invoked_turn("MiRA")
+        self.assertEqual(self.adapter.prepare_tts_text(response), response)
+
+        with patch.object(
+            self.adapter, "_decode_audio_to_pcm", return_value=b"\x00" * 1920
+        ):
+            played = await self.adapter.play_tts("test-room", __file__)
+        sent = await self.adapter.send("test-room", response)
+
+        self.assertTrue(played.success)
+        self.assertTrue(sent.success)
+        assistant_entries = [
+            entry
+            for entry in self.adapter._conversation_transcript
+            if entry["role"] == "assistant"
+        ]
+        self.assertEqual(len(assistant_entries), 1)
+        self.assertEqual(assistant_entries[0]["text"], response)
+        self.assertEqual(publish_transcription.await_count, 1)
+        self.assertIn(response, self.adapter._transcript_context())
 
     async def test_standalone_keyterm_invokes_without_empty_llm_turn(self):
         self.adapter._room = SimpleNamespace(
@@ -271,7 +382,7 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
             accepted = await self.adapter._prepare_invoked_event(event)
 
         self.assertFalse(accepted)
-        self.assertTrue(self.adapter._conversation_is_active())
+        self.assertFalse(self.adapter._conversation_is_active())
         published.assert_any_await(
             "agent:invoked",
             {"identity": "alice", "name": "Alice", "keyterm": "MiRA"},
@@ -283,7 +394,7 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
             remote_participants={},
             local_participant=SimpleNamespace(set_attributes=set_attributes),
         )
-        self.adapter._activate_conversation("Hermes")
+        self.adapter._activate_invoked_turn("Hermes")
         self.adapter._active_speaker_identity = "alice"
         self.adapter._active_speaker_name = "Alice"
         self.adapter._active_topic = "accessible Rotorua walks"
@@ -356,6 +467,49 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         published.assert_awaited_once()
         self.assertEqual(published.await_args.args[0]["reason"], "tool-not-allowed")
 
+    async def test_simulated_worker_registration_requires_agent_kind(self):
+        identity = "simulated-agent-af292dcc9e40"
+        self.adapter._room = SimpleNamespace(
+            remote_participants={
+                identity: SimpleNamespace(kind=SimpleNamespace(name="PARTICIPANT_KIND_AGENT"))
+            }
+        )
+        message = {
+            "name": "find_local_recommendations",
+            "description": "Grounded tourism retrieval",
+            "input_schema": {"type": "object"},
+        }
+
+        with (
+            patch.object(livekit_adapter, "TOOLSET_NAME", "hermes-livekit-tools"),
+            patch("tools.registry.registry.register") as register,
+            patch.object(self.adapter, "_publish_typed", AsyncMock()) as published,
+        ):
+            await self.adapter._register_client_tool(message, identity)
+
+        register.assert_called_once()
+        self.assertTrue(published.await_args.args[0]["success"])
+
+    async def test_simulated_phone_cannot_register_remote_tool(self):
+        identity = "simulated-agent-phone"
+        self.adapter._room = SimpleNamespace(
+            remote_participants={
+                identity: SimpleNamespace(kind=SimpleNamespace(name="PARTICIPANT_KIND_STANDARD"))
+            }
+        )
+        message = {
+            "name": "find_local_recommendations",
+            "description": "Grounded tourism retrieval",
+            "input_schema": {"type": "object"},
+        }
+
+        with patch.object(self.adapter, "_publish_typed", AsyncMock()) as published:
+            await self.adapter._register_client_tool(message, identity)
+
+        self.assertEqual(
+            published.await_args.args[0]["reason"], "owner-kind-not-agent"
+        )
+
     async def test_senderless_text_packet_is_not_collapsed_into_client_identity(self):
         packet = SimpleNamespace(
             topic="hermes-control",
@@ -392,7 +546,7 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         os.unlink(path)
         published.assert_awaited()
 
-    async def test_tool_acknowledgement_is_spoken_without_chat_transcript(self):
+    async def test_tool_acknowledgement_is_spoken_with_transcript_caption(self):
         self.adapter._room = object()
         self.adapter._active_sessions["session"] = asyncio.Event()
         phrase = livekit_adapter.DEFAULT_ACK_PHRASES[0]
@@ -408,6 +562,7 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
             "test-room",
             __file__,
             metadata={"non_conversational": True, "tool_acknowledgement": True},
+            caption=phrase,
         )
 
 

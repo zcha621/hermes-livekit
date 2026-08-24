@@ -45,13 +45,19 @@ class ConfigureYamlTests(unittest.TestCase):
                 extra["vision"]["image_stream_topics"], ["test", "hermes-image"]
             )
             self.assertEqual(extra["invocation"]["keyterms"], INVOCATION_KEYTERMS)
-            self.assertEqual(extra["invocation"]["conversation_timeout_seconds"], 120)
+            self.assertNotIn("conversation_timeout_seconds", extra["invocation"])
+            self.assertEqual(extra["transcription"]["history_max_entries"], 80)
+            self.assertEqual(extra["transcription"]["history_max_chars"], 12000)
             self.assertEqual(extra["remote_tools"]["allowed_names"], REMOTE_TOOL_NAMES)
             self.assertEqual(
                 extra["remote_tools"]["allowed_owner_prefixes"],
                 REMOTE_TOOL_OWNER_PREFIXES,
             )
             self.assertEqual(config["platform_toolsets"]["livekit"], LIVEKIT_TOOLSETS)
+            self.assertIn("skills", config["platform_toolsets"]["livekit"])
+            self.assertIn("terminal", config["platform_toolsets"]["livekit"])
+            self.assertIn("web", config["platform_toolsets"]["livekit"])
+            self.assertIn("no_mcp", config["platform_toolsets"]["livekit"])
             self.assertEqual(config["tts"]["provider"], "edge")
             self.assertEqual(
                 config["tts"]["edge"]["voice"], DEFAULT_NEW_ZEALAND_VOICE

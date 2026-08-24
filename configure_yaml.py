@@ -18,9 +18,41 @@ ACKNOWLEDGEMENT_PHRASES = [
     "On it.",
 ]
 INVOCATION_KEYTERMS = ["Hermes", "MiRA"]
-LIVEKIT_TOOLSETS = ["hermes-livekit", "no_mcp"]
+# LiveKit is a full Hermes conversation surface, just like Discord.  Keep the
+# platform-specific MiRA tool and Hermes's normal task/skill toolsets together
+# so a voice request can actually be completed instead of ending with a
+# holding sentence.  ``no_mcp`` remains explicit: enabled global MCP servers
+# must not silently leak into a room.
+LIVEKIT_TOOLSETS = [
+    "hermes-livekit",
+    "browser",
+    "clarify",
+    "code_execution",
+    "computer_use",
+    "cronjob",
+    "delegation",
+    "file",
+    "image_gen",
+    "memory",
+    "session_search",
+    "skills",
+    "terminal",
+    "todo",
+    "tts",
+    "vision",
+    "web",
+    "no_mcp",
+]
+DEFAULT_WEB_SEARCH_BACKEND = "ddgs"
 REMOTE_TOOL_NAMES = ["find_local_recommendations"]
-REMOTE_TOOL_OWNER_PREFIXES = ["agent-mira-knowledge-worker-"]
+REMOTE_TOOL_OWNER_PREFIXES = [
+    "agent-mira-knowledge-worker-",
+    # LiveKit Agents 1.2.x uses this identity in ``connect --room`` mode,
+    # which is how MiRA's room-bound worker is launched locally.  The adapter
+    # additionally requires LiveKit's participant kind to be AGENT for this
+    # compatibility prefix.
+    "simulated-agent-",
+]
 DEFAULT_NEW_ZEALAND_VOICE = "en-NZ-MollyNeural"
 STOCK_EDGE_VOICES = {"", "en-US-JennyNeural"}
 LEGACY_MIRA_SYSTEM_PROMPT = (
@@ -66,8 +98,11 @@ def update_config(config_path: Path) -> None:
     extra["invocation"] = {
         "enabled": True,
         "keyterms": list(INVOCATION_KEYTERMS),
-        "conversation_timeout_seconds": 120,
         "strip_keyterm": True,
+    }
+    extra["transcription"] = {
+        "history_max_entries": 80,
+        "history_max_chars": 12000,
     }
     extra["remote_tools"] = {
         "allowed_names": list(REMOTE_TOOL_NAMES),
@@ -82,6 +117,16 @@ def update_config(config_path: Path) -> None:
     if not isinstance(platform_toolsets, dict):
         raise ValueError("Hermes platform_toolsets config must be a YAML mapping")
     platform_toolsets["livekit"] = list(LIVEKIT_TOOLSETS)
+
+    # The LiveKit fallback is read-only web search. Prefer the bundled,
+    # keyless DDGS provider when no explicit search backend was selected; an
+    # operator-configured provider remains authoritative.
+    web = config.setdefault("web", {})
+    if not isinstance(web, dict):
+        raise ValueError("Hermes web config must be a YAML mapping")
+    web["search_backend"] = str(
+        web.get("search_backend") or DEFAULT_WEB_SEARCH_BACKEND
+    )
 
     # SOUL.md is the primary identity. Remove only the previous MiRA setup's
     # known overlay; preserve any operator-authored system prompt.

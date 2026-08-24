@@ -74,6 +74,10 @@ class PluginHookTests(unittest.TestCase):
     def test_tourism_guidance_is_always_in_livekit_platform_hint(self):
         self.assertIn("Aotearoa New Zealand", plugin._LIVEKIT_PLATFORM_HINT)
         self.assertIn("find_local_recommendations", plugin._LIVEKIT_PLATFORM_HINT)
+        self.assertIn(
+            "Never end a turn with a holding sentence", plugin._LIVEKIT_PLATFORM_HINT
+        )
+        self.assertIn("normal task and skill tools", plugin._LIVEKIT_PLATFORM_HINT)
 
     def test_register_exposes_bundled_skill_read_only(self):
         context = Mock()

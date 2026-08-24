@@ -16,24 +16,20 @@ opts out of global MCP servers. The complete operator guide is
 
 ## Invocation keyterms and shared meeting context
 
-MiRA listens for speech activity but does not send ordinary room conversation
-to Hermes until someone says a configured invocation keyterm. The defaults are
-`Hermes` and `MiRA`. A phrase such as “MiRA, find an accessible Rotorua walk”
-opens a room-wide conversation window and strips the invocation phrase before
-the request reaches the LLM.
+MiRA transcribes every completed room utterance but creates a Hermes response
+turn only when that same utterance contains a configured invocation keyterm.
+The defaults are `Hermes` and `MiRA`. A phrase such as “MiRA, find an accessible
+Rotorua walk” is logged with its speaker, then the invocation phrase is stripped
+before the request reaches the LLM. The next utterance requires its own keyterm;
+there is no room-wide follow-up window.
 
-While the window is open:
-
-- any participant can continue the conversation without repeating a keyterm;
-- LiveKit identity and display name are attached to every turn;
-- the latest substantive topic/request is retained separately for each speaker;
-- short follow-ups such as “yes please” retain that speaker's prior topic; and
-- speech from any participant interrupts TTS immediately and becomes the next
-  Hermes turn through the gateway's `busy_input_mode: interrupt` behavior.
-
-The window closes after 120 seconds without an accepted turn. Saying a keyterm
-again opens or refreshes it. A keyterm spoken on its own opens the window but
-does not create an empty LLM request.
+The adapter keeps a bounded chronological transcript containing every
+participant and Hermes's own speech. It publishes finalized segments both as
+participant-labeled `agent:*transcript` data events and, for speech, through
+LiveKit's native transcription API. Ambient conversation is not discarded: the
+recent transcript is included as quoted context whenever a participant invokes
+MiRA, so the reply can understand references without answering uninvoked speech.
+A standalone keyterm is logged but does not arm the next utterance.
 
 This is application-level invocation policy built on LiveKit participant audio
 and Hermes STT. LiveKit itself supplies per-participant identity, synchronized
@@ -49,7 +45,7 @@ and mirrors richer context in an `agent:status` data envelope using schema
 | LiveKit state | Meeting UI | Meaning |
 | --- | --- | --- |
 | `initializing` | Agent is starting | The adapter is joining and publishing media. |
-| `idle` | Agent is ready | Say a keyterm, or continue while already invoked. |
+| `idle` | Agent is ready | Include a keyterm in each request to MiRA. |
 | `listening` | Listening to _name_ | A participant is currently talking. |
 | `thinking` | Working for _name_ | STT has completed and the Hermes backend is working. |
 | `speaking` | Agent is speaking | TTS is playing; any participant may interrupt. |
@@ -76,7 +72,7 @@ LiveKit follows Hermes Discord voice behavior:
 - ordinary conversational turns receive no holding phrase;
 - only one acknowledgement is used per turn, even when several tools run;
 - the phrase is selected from the same five defaults as Discord; and
-- acknowledgement audio is not added to the visible chat transcript.
+- acknowledgement audio is labeled and added to the room transcript.
 
 The default end-of-utterance silence threshold is also aligned with Discord at
 1.5 seconds. Barge-in still interrupts playback immediately.
@@ -90,9 +86,12 @@ the tool to its registry, targets `agent:tool-call` envelopes back to the owner,
 and waits for a matching `client:tool-result`. Registrations and results are
 control messages and do not need a fake text/content field.
 
-Registration is fail-closed: the participant identity must begin with
-`agent-mira-knowledge-worker-`, and the tool name must be exactly
-`find_local_recommendations`. All other identities and names are rejected.
+Registration is fail-closed: the production participant identity must begin
+with `agent-mira-knowledge-worker-`. LiveKit Agents 1.2.x local
+`connect --room` workers use `simulated-agent-`; that compatibility identity is
+accepted only when LiveKit marks the participant kind as `AGENT`. The tool name
+must be exactly `find_local_recommendations`. All other identities and names
+are rejected.
 
 The MiRA worker currently includes a harmless `content` compatibility marker in
 these envelopes so an installed pre-fix adapter can also route them. Updated
@@ -152,6 +151,22 @@ existing `LIVEKIT_*` values unless replacements are supplied. Use
 `-ReplaceSoul` only after reviewing a customized SOUL; setup saves the previous
 file as `SOUL.md.mira.bak`.
 
+## Evidence routes
+
+LiveKit sessions expose two preferred tourism evidence routes:
+
+- `find_local_recommendations` — the authenticated MiRA graph/RAG route for
+  curated, session-scoped tourism evidence;
+- `web_search` — Hermes's read-only online-search fallback for fresh facts or
+  locations not covered by the pilot graph.
+
+LiveKit also receives the same normal Hermes task and skill toolsets as Discord,
+so a spoken request can be completed rather than acknowledged and abandoned.
+`no_mcp` remains explicit, preventing globally enabled MCP servers from
+silently entering a room. The tourism skill tells Hermes when to prefer the
+graph and when to fall back to online search, and requires source URLs for
+web-derived claims.
+
 ## Hermes YAML
 
 The relevant section of `%LOCALAPPDATA%\hermes\config.yaml` is:
@@ -160,6 +175,22 @@ The relevant section of `%LOCALAPPDATA%\hermes\config.yaml` is:
 platform_toolsets:
   livekit:
     - hermes-livekit
+    - browser
+    - clarify
+    - code_execution
+    - computer_use
+    - cronjob
+    - delegation
+    - file
+    - image_gen
+    - memory
+    - session_search
+    - skills
+    - terminal
+    - todo
+    - tts
+    - vision
+    - web
     - no_mcp
 
 platforms:
@@ -196,8 +227,10 @@ platforms:
         keyterms:
           - Hermes
           - MiRA
-        conversation_timeout_seconds: 120
         strip_keyterm: true
+      transcription:
+        history_max_entries: 80
+        history_max_chars: 12000
       remote_tools:
         allowed_names:
           - find_local_recommendations
@@ -258,13 +291,12 @@ A useful call check is:
    the first tool starts, then deliver the answer.
 3. Ask a multi-tool question. The cue should still occur only once.
 4. Speak during playback. MiRA should stop and listen.
-5. Before invocation, speak without a keyterm. The agent should return to ready
-   without sending the transcript to Hermes.
-6. Say “MiRA” plus a request as one participant, then continue as a second
-   participant without repeating it. The status should show the correct names
-   and latest topics.
-7. Wait for the invocation timeout and confirm the UI returns to “say MiRA to
-   begin”.
+5. Speak without a keyterm. The utterance should appear in the labeled room
+   transcript, but no Hermes response turn should be created.
+6. Say “MiRA” plus a request. MiRA should answer using relevant context from the
+   preceding ambient transcript.
+7. Speak again without a keyterm. MiRA should remain quiet; repeat with a
+   keyterm and confirm the correct participant name appears in context.
 
 ## Runtime files
 

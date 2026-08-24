@@ -54,7 +54,7 @@ class SetupAssetTests(unittest.TestCase):
         self.assertIn("## One-click setup on Windows", readme)
         self.assertIn("Setup-HermesLiveKit.cmd", readme)
 
-    def test_setup_installs_identity_skill_and_restricted_tool_surface(self):
+    def test_setup_installs_identity_skill_and_task_capable_tool_surface(self):
         setup = (PLUGIN_ROOT / "Setup-HermesLiveKit.ps1").read_text(
             encoding="utf-8-sig"
         )
@@ -68,7 +68,11 @@ class SetupAssetTests(unittest.TestCase):
         self.assertIn('Join-Path $sourcePlugin "skills"', setup)
 
         configure = (PLUGIN_ROOT / "configure_yaml.py").read_text(encoding="utf-8")
-        self.assertIn('LIVEKIT_TOOLSETS = ["hermes-livekit", "no_mcp"]', configure)
+        self.assertIn('"hermes-livekit",', configure)
+        self.assertIn('"skills",', configure)
+        self.assertIn('"terminal",', configure)
+        self.assertIn('"web",', configure)
+        self.assertIn('"no_mcp",', configure)
         self.assertIn('REMOTE_TOOL_NAMES = ["find_local_recommendations"]', configure)
         self.assertIn(
             "plugins enable hermes-livekit --no-allow-tool-override", setup

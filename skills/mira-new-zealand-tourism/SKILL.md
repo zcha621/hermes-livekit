@@ -23,7 +23,22 @@ Use this guidance for tourism questions and recommendations in Aotearoa New Zeal
 
 ## Ground local recommendations
 
-Use `find_local_recommendations` before recommending a specific New Zealand attraction, activity, venue, or local experience. Pass only useful filters:
+Use the two available evidence routes deliberately:
+
+1. Prefer `find_local_recommendations` for the curated MiRA graph. It is the
+   retrieval-augmented route and is best for known Auckland pilot entities,
+   accessibility filters, and session-grounded evidence.
+2. Use Hermes's read-only `web_search` when the graph has no match, the user
+   asks for current online information, or broader coverage is needed. Search
+   authoritative sources (venue/operator, council, DOC, MetService, NZTA,
+   transport operators) and cite the returned URLs. Never use browser
+   automation, shell, files, or arbitrary HTTP tools for this fallback.
+
+Do not present a graph result and a web result as if they have the same
+freshness. Say which route supplied the evidence when it matters. Use
+`find_local_recommendations` before recommending a specific New Zealand
+attraction, activity, venue, or local experience when the graph route applies.
+Pass only useful filters:
 
 - `query`: the traveller's need in natural language
 - `location`: the requested area when known
@@ -31,7 +46,11 @@ Use `find_local_recommendations` before recommending a specific New Zealand attr
 - `accessibility`: only requirements the traveller has stated or confirmed
 - `limit`: normally 2 or 3
 
-The current curated graph is an Auckland pilot, not comprehensive national coverage. Never imply that an empty result means no suitable place exists. Say that MiRA does not have a grounded match in its current knowledge, then ask whether the user wants to change the area or criteria.
+The current curated graph is an Auckland pilot, not comprehensive national
+coverage. An empty graph result is not a dead end: use `web_search` when the
+user wants broader or current online information. If web search is unavailable,
+say that MiRA does not have a grounded match in its current knowledge rather
+than inventing one.
 
 Use retrieved facts only as the evidence supports them. Mention the source naturally and put URLs or detailed citations in text when possible rather than reading a long URL aloud.
 
@@ -44,7 +63,10 @@ Never invent or silently fill in:
 
 When a result lists `verification_required`, name the important live checks before the traveller acts. A concise pattern is: "This fits what you described. We'd still want to check today's opening and booking status."
 
-If the tool is missing, times out, or fails, say that MiRA's grounded tourism knowledge is temporarily unavailable. Do not replace it with a confident recommendation from model memory.
+If the graph tool is missing, times out, or fails, use `web_search` when the
+question permits an online fallback. If both routes fail, say that MiRA's
+grounded tourism knowledge is temporarily unavailable. Do not replace either
+route with a confident recommendation from model memory.
 
 ## New Zealand travel fundamentals
 
