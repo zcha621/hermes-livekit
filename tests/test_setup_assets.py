@@ -66,6 +66,7 @@ class SetupAssetTests(unittest.TestCase):
         self.assertIn("[switch]$ReplaceSoul", setup)
         self.assertIn("Install-MiraSoul", setup)
         self.assertIn('Join-Path $sourcePlugin "skills"', setup)
+        self.assertIn('"adapter.py", "__init__.py", "tools.py"', setup)
 
         configure = (PLUGIN_ROOT / "configure_yaml.py").read_text(encoding="utf-8")
         self.assertIn('"hermes-livekit",', configure)

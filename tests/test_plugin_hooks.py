@@ -6,13 +6,15 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PLUGIN_ROOT))
 
 spec = importlib.util.spec_from_file_location(
-    "hermes_livekit_plugin_test", PLUGIN_ROOT / "__init__.py"
+    "hermes_livekit_plugin_test",
+    PLUGIN_ROOT / "__init__.py",
+    submodule_search_locations=[str(PLUGIN_ROOT)],
 )
 plugin = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
+sys.modules[spec.name] = plugin
 spec.loader.exec_module(plugin)
 
 
@@ -91,9 +93,21 @@ class PluginHookTests(unittest.TestCase):
             "mira-new-zealand-tourism", plugin._TOURISM_SKILL_PATH
         )
         context.register_platform.assert_called_once()
+        context.register_tool.assert_called_once()
+        tool_call = context.register_tool.call_args.kwargs
+        self.assertEqual(tool_call["name"], "manage_trip_itinerary")
+        self.assertEqual(tool_call["toolset"], "hermes-livekit")
+        self.assertTrue(tool_call["is_async"])
         hook_names = [call.args[0] for call in context.register_hook.call_args_list]
         self.assertIn("pre_llm_call", hook_names)
         self.assertIn("post_llm_call", hook_names)
+
+    def test_manifest_declares_cross_platform_itinerary_tool(self):
+        manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
+
+        self.assertIn("provides_tools:", manifest)
+        self.assertIn("  - manage_trip_itinerary", manifest)
+        self.assertTrue((PLUGIN_ROOT / "tools.py").is_file())
 
     def test_pre_llm_hook_injects_linked_cross_channel_workspace(self):
         workspace = {
@@ -131,6 +145,32 @@ class PluginHookTests(unittest.TestCase):
             },
             session_id="livekit-session",
         )
+
+    def test_pre_llm_hook_executes_explicit_account_link_before_model(self):
+        unlinked = {"linked": False}
+        linked = {
+            "linked": True,
+            "draft": None,
+            "itinerary": None,
+            "conversation": [],
+        }
+        with patch.object(
+            plugin,
+            "_dispatch_account_workspace",
+            side_effect=[unlinked, linked],
+        ) as dispatch:
+            result = plugin._on_pre_llm_account_context(
+                session_id="discord-session",
+                user_message="link my account ABCDEFGHIJKLMNOPQRSTUVWX",
+            )
+
+        self.assertEqual(dispatch.call_count, 2)
+        dispatch.assert_any_call({"action": "load"}, session_id="discord-session")
+        dispatch.assert_any_call(
+            {"action": "link", "link_code": "ABCDEFGHIJKLMNOPQRSTUVWX"},
+            session_id="discord-session",
+        )
+        self.assertIn("registered-account planning context", result["context"])
 
 
 if __name__ == "__main__":

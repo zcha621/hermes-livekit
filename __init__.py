@@ -5,23 +5,27 @@ point. No core hermes-agent edits are required — every integration touch
 point uses an existing ``register_platform()`` hook.
 """
 
-import logging
 import json
+import logging
 import os
-import sys
+import re
 from pathlib import Path
 from typing import Optional
 
-_PLUGIN_DIR = str(Path(__file__).resolve().parent)
-if _PLUGIN_DIR not in sys.path:
-    sys.path.insert(0, _PLUGIN_DIR)
-
-from adapter import (  # noqa: E402
-    LIVE_ADAPTERS,
-    TOOLSET_NAME,
-    LiveKitAdapter,
-    check_livekit_requirements,
-)
+try:
+    from .adapter import (  # type: ignore[import-not-found]  # noqa: E402
+        LIVE_ADAPTERS,
+        TOOLSET_NAME,
+        LiveKitAdapter,
+        check_livekit_requirements,
+    )
+except ImportError:  # Direct-file test and legacy entry-point compatibility.
+    from adapter import (  # noqa: E402
+        LIVE_ADAPTERS,
+        TOOLSET_NAME,
+        LiveKitAdapter,
+        check_livekit_requirements,
+    )
 
 logger = logging.getLogger("gateway.platforms.livekit")
 
@@ -31,6 +35,98 @@ _PLUGIN_ROOT = Path(__file__).resolve().parent
 _TOURISM_SKILL_PATH = (
     _PLUGIN_ROOT / "skills" / "mira-new-zealand-tourism" / "SKILL.md"
 )
+
+_ACCOUNT_LINK_REQUEST = re.compile(
+    r"\b(?:link|connect)\b.{0,40}\b(?:account|profile)\b",
+    re.IGNORECASE,
+)
+_ACCOUNT_LINK_CODE = re.compile(
+    r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{16,128})(?![A-Za-z0-9_-])"
+)
+
+_MANAGE_TRIP_ITINERARY_SCHEMA = {
+    "name": "manage_trip_itinerary",
+    "description": (
+        "Load, link, revise, or explicitly confirm the registered traveller's "
+        "account-wide itinerary. Revise stores an editable draft; confirm is "
+        "allowed only after explicit approval of the exact current revision."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["action"],
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["load", "link", "revise", "confirm"],
+            },
+            "link_code": {"type": "string", "minLength": 16, "maxLength": 128},
+            "expected_revision": {"type": "integer", "minimum": 1},
+            "draft": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "title",
+                    "summary",
+                    "timezone",
+                    "requirements",
+                    "items",
+                ],
+                "properties": {
+                    "title": {"type": "string", "minLength": 1, "maxLength": 255},
+                    "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+                    "timezone": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "requirements": {"type": "string", "minLength": 1, "maxLength": 5000},
+                    "items": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 100,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": [
+                                "item_id",
+                                "starts_at",
+                                "ends_at",
+                                "location",
+                                "activity",
+                                "transportation",
+                            ],
+                            "properties": {
+                                "item_id": {"type": "string", "format": "uuid"},
+                                "starts_at": {"type": "string", "format": "date-time"},
+                                "ends_at": {"type": "string", "format": "date-time"},
+                                "activity": {"type": "string", "minLength": 1, "maxLength": 500},
+                                "notes": {"type": ["string", "null"], "maxLength": 1000},
+                                "location": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "required": ["name"],
+                                    "properties": {
+                                        "name": {"type": "string", "minLength": 1, "maxLength": 255},
+                                        "address": {"type": ["string", "null"], "maxLength": 500},
+                                        "latitude": {"type": ["number", "null"], "minimum": -90, "maximum": 90},
+                                        "longitude": {"type": ["number", "null"], "minimum": -180, "maximum": 180},
+                                    },
+                                },
+                                "transportation": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "required": ["mode"],
+                                    "properties": {
+                                        "mode": {"type": "string", "minLength": 1, "maxLength": 64},
+                                        "details": {"type": ["string", "null"], "maxLength": 500},
+                                        "duration_minutes": {"type": ["integer", "null"], "minimum": 0, "maximum": 1440},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+}
 
 
 def _skill_body(path: Path) -> str:
@@ -120,12 +216,50 @@ def _dispatch_account_workspace(arguments: dict, *, session_id: str = "") -> dic
     return None
 
 
+async def _route_account_planning_tool(arguments=None, **kwargs):
+    """Route the host-registered itinerary tool to its trusted room worker."""
+    tool_name = "manage_trip_itinerary"
+    for adapter in list(LIVE_ADAPTERS):
+        owner = adapter._tool_owners.get(tool_name)
+        if not owner:
+            continue
+        handler = adapter._build_tool_handler(owner, tool_name)
+        return await handler(arguments or {}, **kwargs)
+    return json.dumps(
+        {
+            "error": (
+                "MiRA's itinerary worker is temporarily unavailable. "
+                "Please retry after the live services reconnect."
+            )
+        }
+    )
+
+
 def _on_pre_llm_account_context(
     session_id="", user_message="", **_kwargs
 ) -> dict | None:
     workspace = _dispatch_account_workspace({"action": "load"}, session_id=session_id)
     if not workspace:
         return None
+    if workspace.get("linked") is not True:
+        message = str(user_message)
+        code_match = _ACCOUNT_LINK_CODE.search(message)
+        if _ACCOUNT_LINK_REQUEST.search(message) and code_match:
+            linked = _dispatch_account_workspace(
+                {"action": "link", "link_code": code_match.group(1)},
+                session_id=session_id,
+            )
+            if linked and linked.get("linked") is True:
+                workspace = linked
+            else:
+                return {
+                    "context": (
+                        "MiRA attempted the requested registered-account link, but the "
+                        "one-time code was invalid, expired, or already used. Ask the "
+                        "traveller to create a fresh code on the MiRA itinerary page."
+                    )
+                }
+
     if workspace.get("linked") is not True:
         planning_terms = ("itinerary", "trip", "travel", "plan", "link code")
         if not any(term in str(user_message).lower() for term in planning_terms):
@@ -349,6 +483,18 @@ def register(ctx) -> None:
         }
     except Exception:
         logger.exception("could not register the trusted-worker LiveKit toolset")
+
+    # Register account planning through the supported plugin API. tools.py and
+    # plugin.yaml also pre-register it while this platform is deferred, which
+    # keeps the tool available to Discord, CLI, and other Hermes surfaces.
+    try:
+        try:
+            from .tools import register_tools
+        except ImportError:
+            from tools import register_tools
+        register_tools(ctx)
+    except Exception:
+        logger.exception("could not register the account itinerary tool")
 
     # Match Hermes Discord voice behavior: arm the LiveKit turn at gateway
     # dispatch and speak one cue only on the first actual tool invocation.

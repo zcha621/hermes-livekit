@@ -139,6 +139,13 @@ draft, confirmed plan, and recent conversation to continue across Hermes
 sessions and explicitly configured gateway channels. An unlinked channel can
 be attached with the portal's 15-minute one-time code.
 
+The `/trips` text box is a dedicated chat surface: pressing **Send** is an
+explicit Hermes invocation and does not require the `MiRA` voice wake term.
+The wake term still applies to ambient speech in a live room. The plugin
+declares `manage_trip_itinerary` in `plugin.yaml` and pre-registers it from
+`tools.py`, so Discord and other configured Hermes channels can discover the
+same tool even while the LiveKit adapter itself is deferred.
+
 ## One-click setup on Windows
 
 After Hermes is installed, open the MiRA repository and double-click:
@@ -329,8 +336,26 @@ voice, but preserves any custom voice or provider. It does not alter STT.
 $hermes = "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\hermes.exe"
 & $hermes config check
 & $hermes gateway status
+& $hermes tools list --platform discord
 python -m unittest discover -s .\agents\hermes-livekit\tests -v
 ```
+
+The Discord tool listing must show the `hermes-livekit` toolset as enabled;
+`plugin.yaml` declares its `manage_trip_itinerary` tool. To exercise the same
+typed-data path used by `/trips` against a running local room:
+
+```powershell
+$python = "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\python.exe"
+& $python .\agents\python-agent\scripts\verify_livekit_chat.py `
+  --env-file "$env:LOCALAPPDATA\hermes\.env" `
+  --room ECL `
+  --message "Plan a relaxed one-day visit to Christchurch"
+```
+
+The command prints the Hermes reply as JSON. A transcript entry with no
+subsequent Hermes turn usually means the installed adapter predates explicit
+typed-chat invocation handling; rerun the setup command and restart the
+gateway.
 
 A useful call check is:
 
@@ -352,6 +377,7 @@ A useful call check is:
 
 - `adapter.py` — LiveKit transport, media, voice activity, hooks, and tools.
 - `__init__.py` — Hermes plugin registration and lifecycle hooks.
+- `tools.py` — discovery-time cross-platform itinerary tool registration.
 - `configure_yaml.py` — atomic non-secret behavior configuration.
 - `assets/SOUL.md` — canonical MiRA conversational identity.
 - `skills/mira-new-zealand-tourism/SKILL.md` — grounded Aotearoa tourism procedure.

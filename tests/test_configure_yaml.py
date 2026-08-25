@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import tempfile
 import unittest
@@ -5,16 +6,22 @@ from pathlib import Path
 
 import yaml
 
-from configure_yaml import (
-    ACKNOWLEDGEMENT_PHRASES,
-    DEFAULT_NEW_ZEALAND_VOICE,
-    INVOCATION_KEYTERMS,
-    LEGACY_MIRA_SYSTEM_PROMPT,
-    LIVEKIT_TOOLSETS,
-    REMOTE_TOOL_NAMES,
-    REMOTE_TOOL_OWNER_PREFIXES,
-    update_config,
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+CONFIGURE_SPEC = importlib.util.spec_from_file_location(
+    "hermes_livekit_configure_test", PLUGIN_ROOT / "configure_yaml.py"
 )
+configure_yaml = importlib.util.module_from_spec(CONFIGURE_SPEC)
+assert CONFIGURE_SPEC.loader is not None
+CONFIGURE_SPEC.loader.exec_module(configure_yaml)
+
+ACKNOWLEDGEMENT_PHRASES = configure_yaml.ACKNOWLEDGEMENT_PHRASES
+DEFAULT_NEW_ZEALAND_VOICE = configure_yaml.DEFAULT_NEW_ZEALAND_VOICE
+INVOCATION_KEYTERMS = configure_yaml.INVOCATION_KEYTERMS
+LEGACY_MIRA_SYSTEM_PROMPT = configure_yaml.LEGACY_MIRA_SYSTEM_PROMPT
+LIVEKIT_TOOLSETS = configure_yaml.LIVEKIT_TOOLSETS
+REMOTE_TOOL_NAMES = configure_yaml.REMOTE_TOOL_NAMES
+REMOTE_TOOL_OWNER_PREFIXES = configure_yaml.REMOTE_TOOL_OWNER_PREFIXES
+update_config = configure_yaml.update_config
 
 
 class ConfigureYamlTests(unittest.TestCase):

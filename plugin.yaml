@@ -2,9 +2,16 @@
 name: hermes-livekit
 label: LiveKit WebRTC
 kind: platform
-version: 1.4.0
+version: 1.4.1
 description: Restricted MiRA voice and tourism gateway for Hermes over LiveKit
 author: kortexa-ai
+
+# The itinerary tool is useful on Discord and other Hermes surfaces even when
+# the LiveKit platform adapter is deferred. Declaring it here asks Hermes to
+# import tools.py during plugin discovery and makes the toolset selectable for
+# every configured gateway platform.
+provides_tools:
+  - manage_trip_itinerary
 
 requires_env:
   - name: LIVEKIT_URL

@@ -167,6 +167,7 @@ DEFAULT_REMOTE_TOOL_NAMES = (
     "get_current_trip_context",
     "manage_trip_itinerary",
 )
+HOST_MANAGED_REMOTE_TOOL_NAMES = frozenset({"manage_trip_itinerary"})
 DEFAULT_REMOTE_TOOL_OWNER_PREFIXES = (
     "agent-mira-knowledge-worker-",
     "simulated-agent-",
@@ -687,13 +688,21 @@ class LiveKitAdapter(BasePlatformAdapter):
         )
         return entry
 
-    async def _prepare_invoked_event(self, event: MessageEvent) -> bool:
-        """Log every utterance, then gate this one turn on its own keyterm."""
+    async def _prepare_invoked_event(
+        self, event: MessageEvent, *, force_invoke: bool = False
+    ) -> bool:
+        """Log a turn and apply the room wake-term policy.
+
+        Dedicated typed-chat clients publish ``client:message`` only when the
+        traveller presses Send. Those explicit actions are already invocations,
+        so callers may bypass the voice-only wake-term gate while retaining the
+        same transcript, speaker, status, and context handling.
+        """
         identity = str(getattr(event.source, "user_id", "") or "client")
         display_name = self._participant_display_name(identity)
         original_text = str(event.text or "").strip()
         matched_keyterm, cleaned = self._match_keyterm(original_text)
-        invoked = bool(matched_keyterm) or not self._invocation_enabled
+        invoked = force_invoke or bool(matched_keyterm) or not self._invocation_enabled
         entry = self._append_transcript(
             role="user",
             identity=identity,
@@ -2189,6 +2198,11 @@ class LiveKitAdapter(BasePlatformAdapter):
             timestamp=datetime.now(tz=timezone.utc),
         )
 
+        # A submitted chat message is an explicit request to MiRA. Requiring
+        # the spoken wake phrase here made the portal silently transcribe the
+        # message and then discard the turn without a reply.
+        if not await self._prepare_invoked_event(event, force_invoke=True):
+            return
         await self.handle_message(event)
 
     async def _handle_client_control(self, msg: Dict[str, Any], identity: str) -> None:
@@ -2377,51 +2391,52 @@ class LiveKitAdapter(BasePlatformAdapter):
             )
             return
 
-        try:
-            from tools.registry import registry
-        except Exception as exc:
-            logger.error("[%s] tool registry unavailable: %s", self.name, exc)
-            await self._publish_typed(
-                {"type": "agent:tool-registered", "name": name, "success": False, "reason": "registry-unavailable"},
-                identity=identity,
-            )
-            return
+        if name not in HOST_MANAGED_REMOTE_TOOL_NAMES:
+            try:
+                from tools.registry import registry
+            except Exception as exc:
+                logger.error("[%s] tool registry unavailable: %s", self.name, exc)
+                await self._publish_typed(
+                    {"type": "agent:tool-registered", "name": name, "success": False, "reason": "registry-unavailable"},
+                    identity=identity,
+                )
+                return
 
-        handler = self._build_tool_handler(identity, name)
-        # The registry's `schema` is the OpenAI function-envelope shape
-        # (`{name, description, parameters}`), not a bare JSON Schema. Wrap
-        # the client-supplied input_schema accordingly.
-        registry_schema = {
-            "name": name,
-            "description": description,
-            "parameters": input_schema,
-        }
-        try:
-            # override=True so a reconnecting client can re-register without
-            # an explicit unregister round-trip. Single-client v1 — collisions
-            # between distinct clients are undefined per design doc.
-            registry.register(
-                name=name,
-                toolset=TOOLSET_NAME,
-                schema=registry_schema,
-                handler=handler,
-                is_async=True,
-                description=description,
-                override=True,
-            )
-        except Exception as exc:
-            logger.warning("[%s] tool register %r failed: %s", self.name, name, exc)
-            await self._publish_typed(
-                {
-                    "type": "agent:tool-registered",
-                    "name": name,
-                    "success": False,
-                    "reason": "register-failed",
-                    "detail": str(exc),
-                },
-                identity=identity,
-            )
-            return
+            handler = self._build_tool_handler(identity, name)
+            # The registry's `schema` is the OpenAI function-envelope shape
+            # (`{name, description, parameters}`), not a bare JSON Schema. Wrap
+            # the client-supplied input_schema accordingly.
+            registry_schema = {
+                "name": name,
+                "description": description,
+                "parameters": input_schema,
+            }
+            try:
+                # override=True so a reconnecting client can re-register without
+                # an explicit unregister round-trip. Single-client v1 — collisions
+                # between distinct clients are undefined per design doc.
+                registry.register(
+                    name=name,
+                    toolset=TOOLSET_NAME,
+                    schema=registry_schema,
+                    handler=handler,
+                    is_async=True,
+                    description=description,
+                    override=True,
+                )
+            except Exception as exc:
+                logger.warning("[%s] tool register %r failed: %s", self.name, name, exc)
+                await self._publish_typed(
+                    {
+                        "type": "agent:tool-registered",
+                        "name": name,
+                        "success": False,
+                        "reason": "register-failed",
+                        "detail": str(exc),
+                    },
+                    identity=identity,
+                )
+                return
 
         self._client_tools.setdefault(identity, set()).add(name)
         self._tool_owners[name] = identity
@@ -2556,11 +2571,12 @@ class LiveKitAdapter(BasePlatformAdapter):
 
     def _deregister_tool(self, name: str, identity: str) -> None:
         """Remove a single tool from the hermes registry and our maps."""
-        try:
-            from tools.registry import registry
-            registry.deregister(name)
-        except Exception as exc:
-            logger.debug("[%s] tool deregister %r failed: %s", self.name, name, exc)
+        if name not in HOST_MANAGED_REMOTE_TOOL_NAMES:
+            try:
+                from tools.registry import registry
+                registry.deregister(name)
+            except Exception as exc:
+                logger.debug("[%s] tool deregister %r failed: %s", self.name, name, exc)
         self._tool_owners.pop(name, None)
         tools = self._client_tools.get(identity)
         if tools:

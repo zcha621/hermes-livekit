@@ -1,4 +1,5 @@
 import asyncio
+import importlib.util
 import json
 import os
 import sys
@@ -8,12 +9,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 import gateway.config as gateway_config
 from gateway.config import PlatformConfig
 
-import adapter as livekit_adapter
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+ADAPTER_SPEC = importlib.util.spec_from_file_location(
+    "hermes_livekit_adapter_test", PLUGIN_ROOT / "adapter.py"
+)
+livekit_adapter = importlib.util.module_from_spec(ADAPTER_SPEC)
+assert ADAPTER_SPEC.loader is not None
+sys.modules[ADAPTER_SPEC.name] = livekit_adapter
+ADAPTER_SPEC.loader.exec_module(livekit_adapter)
 
 # The production plugin registry is populated before its adapter factory runs.
 # Unit tests import the module directly, so seed the same dynamic enum allowlist.
@@ -268,6 +274,31 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(received["event"].text, "Hermes, hello from phone")
         self.assertEqual(received["event"].source.user_id, "phone")
+
+    async def test_client_message_is_an_explicit_invocation_without_wake_term(self):
+        self.adapter._room = SimpleNamespace(
+            remote_participants={"traveller": SimpleNamespace(name="Traveller")},
+            local_participant=SimpleNamespace(set_attributes=AsyncMock()),
+        )
+
+        with (
+            patch.object(self.adapter, "_publish_agent_event", AsyncMock()),
+            patch.object(
+                livekit_adapter.BasePlatformAdapter,
+                "handle_message",
+                AsyncMock(),
+            ) as dispatched,
+        ):
+            await self.adapter._handle_client_message(
+                {"text": "Plan a relaxed day in Christchurch"}, "traveller"
+            )
+
+        dispatched.assert_awaited_once()
+        event = dispatched.await_args.args[0]
+        self.assertEqual(event.text, "Plan a relaxed day in Christchurch")
+        self.assertTrue(getattr(event, "_livekit_invocation_checked"))
+        self.assertTrue(self.adapter._conversation_is_active())
+        self.assertTrue(self.adapter._conversation_transcript[-1]["invoked"])
 
     async def test_message_without_keyterm_is_transcribed_but_not_dispatched(self):
         dispatched = AsyncMock()
@@ -588,6 +619,28 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             json.loads(result), {"linked": True, "draft": {"revision": 4}}
         )
+
+    async def test_account_tool_registration_keeps_host_registered_handler(self):
+        owner = "agent-mira-knowledge-worker-12345678"
+        self.adapter._room = SimpleNamespace(
+            remote_participants={owner: SimpleNamespace(kind=4)}
+        )
+        message = {
+            "name": "manage_trip_itinerary",
+            "description": "Account itinerary planning",
+            "input_schema": {"type": "object"},
+        }
+
+        with (
+            patch("tools.registry.registry.register") as register,
+            patch.object(self.adapter, "_publish_typed", AsyncMock()) as published,
+        ):
+            await self.adapter._register_client_tool(message, owner)
+
+        register.assert_not_called()
+        self.assertEqual(self.adapter._tool_owners["manage_trip_itinerary"], owner)
+        self.assertIn("manage_trip_itinerary", self.adapter._client_tools[owner])
+        self.assertTrue(published.await_args.args[0]["success"])
 
     async def test_remote_tool_registration_rejects_non_allowlisted_tool(self):
         message = {
