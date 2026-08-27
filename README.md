@@ -29,6 +29,17 @@ wake phrase before the question; in that one case, only the same participant's
 next utterance is accepted for five seconds. There is no room-wide follow-up
 window.
 
+The Android Compose client and web meeting also expose a press-and-hold
+`@Agent` button. Press publishes `push-to-talk-start`; release publishes the
+matching `push-to-talk-end` on the reliable `hermes-control` topic. While held,
+internal pauses do not endpoint the request. Release finalizes that complete
+audio buffer and applies the same invocation gate as a spoken keyterm. The
+adapter ignores any claimed identity in the JSON and binds the turn to the
+authenticated LiveKit packet sender, so the speaker name, transcript, history,
+and tool context all belong to the participant who held the button. If that
+participant was muted, the clients enable their microphone only for the held
+turn and then restore its previous state.
+
 The adapter keeps a bounded chronological transcript containing every
 participant and Hermes's own speech. It publishes finalized segments both as
 participant-labeled `agent:*transcript` data events and, for speech, through
@@ -62,7 +73,7 @@ and mirrors richer context in an `agent:status` data envelope using schema
 | LiveKit state | Meeting UI | Meaning |
 | --- | --- | --- |
 | `initializing` | Agent is starting | The adapter is joining and publishing media. |
-| `idle` | Agent is ready | Include a keyterm in each request to MiRA. |
+| `idle` | Agent is ready | Include a keyterm or hold `@Agent` for each request to MiRA. |
 | `listening` | Listening to _name_ | A participant is currently talking. |
 | `thinking` | Working for _name_ | STT has completed and the Hermes backend is working. |
 | `speaking` | Agent is speaking | TTS is playing; any participant may interrupt. |
@@ -140,6 +151,15 @@ claims those bounded routes with a `client:tool-register` JSON envelope on the
 `hermes-control` topic. Hermes then targets `agent:tool-call` envelopes to that
 owner and waits for a matching `client:tool-result`. Registrations and results
 are control messages and do not need a fake text/content field.
+
+Hermes GUI/TUI sessions execute in a process separate from the messaging
+gateway. When that process has no in-memory LiveKit adapter, the same tool
+handler opens a short-lived data-only LiveKit connection, waits for the
+worker's targeted registration, and exchanges the normal tool-call/result
+envelopes. It never calls the tourism backend directly and never receives the
+worker's backend credential. Desktop/TUI account linking uses Hermes's stable
+installation identity; the backend stores only its channel-subject hash and
+still requires a one-time portal link code.
 
 Registration is fail-closed: the production participant identity must begin
 with `agent-mira-knowledge-worker-`. LiveKit Agents 1.2.x local

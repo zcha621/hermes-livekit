@@ -5,10 +5,12 @@ point. No core hermes-agent edits are required — every integration touch
 point uses an existing ``register_platform()`` hook.
 """
 
+import asyncio
 import json
 import logging
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -174,6 +176,14 @@ _TEXT_TOOL_CALL_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+_CONTROL_TOPIC = "hermes-control"
+_REMOTE_TOOL_REGISTRATION_TIMEOUT_SECONDS = 10.0
+_REMOTE_TOOL_CALL_TIMEOUT_SECONDS = 30.0
+_TRUSTED_WORKER_IDENTITY_PREFIXES = (
+    "agent-mira-knowledge-worker-",
+    "simulated-agent-",
+)
+
 
 def _qwen_realtime_request_middleware(**kwargs):
     """Put Spark's native non-thinking flag on realtime LiveKit requests."""
@@ -308,6 +318,14 @@ async def _route_remote_tool(tool_name, arguments=None, **kwargs):
             continue
         handler = adapter._build_tool_handler(owner, tool_name)
         return await handler(arguments or {}, **kwargs)
+    try:
+        return await _route_remote_tool_via_livekit(
+            tool_name, arguments or {}, **kwargs
+        )
+    except Exception as exc:
+        logger.warning(
+            "cross-process MiRA tool %r unavailable: %s", tool_name, exc
+        )
     return json.dumps(
         {
             "error": (
@@ -316,6 +334,203 @@ async def _route_remote_tool(tool_name, arguments=None, **kwargs):
             )
         }
     )
+
+
+def _livekit_setting(name: str, default: str = "") -> str:
+    """Read a LiveKit setting through Hermes's live env/config resolver."""
+    try:
+        from hermes_cli.config import get_env_value
+
+        value = get_env_value(name)
+    except Exception:
+        value = os.getenv(name)
+    return str(value or default).strip()
+
+
+def _stable_local_user_id() -> str:
+    """Return a stable, non-account local identity for GUI/CLI linking."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        install_id = (get_hermes_home() / "install_id").read_text(
+            encoding="utf-8"
+        ).strip()
+        if install_id:
+            return f"hermes-install:{install_id[:128]}"
+    except (ImportError, OSError, UnicodeError):
+        pass
+    return f"hermes-process:{os.getpid()}"
+
+
+def _mira_source_context(kwargs: dict) -> Optional[dict]:
+    """Build the trusted gateway source attached after model validation.
+
+    Gateway platforms already bind platform/user/chat fields. Desktop and TUI
+    sessions bind only their source and durable session id, so they use the
+    Hermes installation id as a stable local channel identity. The backend
+    stores only its SHA-256 channel subject hash; linking still requires the
+    traveller's one-time portal code.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return None
+
+    platform = (
+        get_session_env("HERMES_SESSION_PLATFORM", "")
+        or get_session_env("HERMES_SESSION_SOURCE", "")
+        or str(kwargs.get("platform") or "")
+    ).strip().lower()
+    session_id = (
+        str(kwargs.get("session_id") or "")
+        or get_session_env("HERMES_SESSION_ID", "")
+    ).strip()
+    if not platform or not session_id:
+        return None
+
+    user_id = get_session_env("HERMES_SESSION_USER_ID", "").strip()
+    if not user_id:
+        user_id = get_session_env(
+            "HERMES_BROWSER_CONTROL_PRINCIPAL", ""
+        ).strip()
+    if not user_id and platform in {"desktop", "tui", "cli", "local"}:
+        user_id = _stable_local_user_id()
+    if not user_id:
+        return None
+
+    return {
+        "platform": platform,
+        "user_id": user_id,
+        "user_name": (
+            get_session_env("HERMES_SESSION_USER_NAME", "").strip()
+            or "Local Hermes user"
+        ),
+        "chat_id": (
+            get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+            or get_session_env("HERMES_UI_SESSION_ID", "").strip()
+            or session_id
+        ),
+        "hermes_session_id": session_id,
+    }
+
+
+async def _route_remote_tool_via_livekit(
+    tool_name: str, arguments: dict, **kwargs
+):
+    """Proxy a GUI/CLI tool call through the existing LiveKit worker.
+
+    GUI and standalone CLI agents load plugin tools in a process that has no
+    platform adapter, so ``LIVE_ADAPTERS`` cannot contain the gateway's
+    LiveKit connection. A short-lived, data-only participant preserves the
+    same worker protocol and trust boundary instead of calling the tourism
+    backend directly or copying its credential into Hermes.
+    """
+    from livekit import api, rtc
+
+    livekit_url = _livekit_setting("LIVEKIT_URL")
+    api_key = _livekit_setting("LIVEKIT_API_KEY")
+    api_secret = _livekit_setting("LIVEKIT_API_SECRET")
+    room_name = _livekit_setting("LIVEKIT_ROOM", "hermes")
+    if not (livekit_url and api_key and api_secret and room_name):
+        raise RuntimeError("LiveKit transport credentials are incomplete")
+
+    identity = f"hermes-tool-proxy-{os.getpid()}-{uuid.uuid4().hex[:10]}"
+    token = (
+        api.AccessToken(api_key, api_secret)
+        .with_identity(identity)
+        .with_name("Hermes project-tool proxy")
+        .with_grants(
+            api.VideoGrants(
+                room_join=True,
+                room=room_name,
+                can_publish=False,
+                can_subscribe=False,
+                can_publish_data=True,
+            )
+        )
+        .to_jwt()
+    )
+    room = rtc.Room()
+    loop = asyncio.get_running_loop()
+    owner: asyncio.Future[str] = loop.create_future()
+    call_id = f"tc_{uuid.uuid4().hex[:20]}"
+    result: asyncio.Future[dict] = loop.create_future()
+    selected_owner = ""
+
+    def resolve_once(future, value) -> None:
+        if not future.done():
+            future.set_result(value)
+
+    @room.on("data_received")
+    def on_data(packet) -> None:
+        if str(getattr(packet, "topic", "") or "") != _CONTROL_TOPIC:
+            return
+        participant = getattr(packet, "participant", None)
+        sender = str(getattr(participant, "identity", "") or "")
+        if not sender.startswith(_TRUSTED_WORKER_IDENTITY_PREFIXES):
+            return
+        try:
+            message = json.loads(bytes(packet.data).decode("utf-8"))
+        except (AttributeError, TypeError, ValueError, UnicodeDecodeError):
+            return
+        if not isinstance(message, dict):
+            return
+        if (
+            message.get("type") == "client:tool-register"
+            and message.get("name") == tool_name
+            and not owner.done()
+        ):
+            loop.call_soon_threadsafe(resolve_once, owner, sender)
+            return
+        if (
+            message.get("type") == "client:tool-result"
+            and message.get("call_id") == call_id
+            and sender == selected_owner
+            and not result.done()
+        ):
+            loop.call_soon_threadsafe(resolve_once, result, message)
+
+    started = time.monotonic()
+    await room.connect(livekit_url, token)
+    try:
+        selected_owner = await asyncio.wait_for(
+            owner, timeout=_REMOTE_TOOL_REGISTRATION_TIMEOUT_SECONDS
+        )
+        routed_arguments = dict(arguments)
+        source = _mira_source_context(kwargs)
+        if source:
+            routed_arguments["_mira_source"] = source
+        await room.local_participant.publish_data(
+            json.dumps(
+                {
+                    "type": "agent:tool-call",
+                    "call_id": call_id,
+                    "name": tool_name,
+                    "arguments": routed_arguments,
+                },
+                ensure_ascii=False,
+            ).encode("utf-8"),
+            reliable=True,
+            topic=_CONTROL_TOPIC,
+            destination_identities=[selected_owner],
+        )
+        envelope = await asyncio.wait_for(
+            result, timeout=_REMOTE_TOOL_CALL_TIMEOUT_SECONDS
+        )
+        if envelope.get("error") is not None:
+            raise RuntimeError(str(envelope.get("error")))
+        payload = envelope.get("result")
+        logger.info(
+            "cross-process MiRA tool %r completed in %.3fs via %s",
+            tool_name,
+            time.monotonic() - started,
+            selected_owner,
+        )
+        if isinstance(payload, str):
+            return payload
+        return json.dumps(payload, ensure_ascii=False, default=str)
+    finally:
+        await room.disconnect()
 
 
 async def _route_local_recommendations_tool(arguments=None, **kwargs):

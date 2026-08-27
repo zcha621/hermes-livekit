@@ -2,7 +2,7 @@
 name: hermes-livekit
 label: LiveKit WebRTC
 kind: platform
-version: 1.6.6
+version: 1.8.0
 description: Hermes-native voice, vision, and MiRA context transport over LiveKit
 author: kortexa-ai
 

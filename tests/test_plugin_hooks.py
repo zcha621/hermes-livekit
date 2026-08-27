@@ -195,6 +195,191 @@ class PluginHookTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result, '{"contexts":[]}')
 
+    async def test_gui_tool_uses_cross_process_livekit_relay_without_adapter(self):
+        plugin.LIVE_ADAPTERS.discard(self.adapter)
+        relay = AsyncMock(return_value='{"linked":true}')
+
+        with patch.object(plugin, "_route_remote_tool_via_livekit", relay):
+            result = await plugin._route_remote_tool(
+                "manage_trip_itinerary",
+                {"action": "load"},
+                session_id="20260827_172156_c71fef",
+            )
+
+        relay.assert_awaited_once_with(
+            "manage_trip_itinerary",
+            {"action": "load"},
+            session_id="20260827_172156_c71fef",
+        )
+        self.assertEqual(result, '{"linked":true}')
+
+    async def test_cross_process_relay_uses_worker_protocol_and_source(self):
+        worker = SimpleNamespace(identity="simulated-agent-worker")
+
+        class FakeAccessToken:
+            def __init__(self, *_args):
+                pass
+
+            def with_identity(self, _identity):
+                return self
+
+            def with_name(self, _name):
+                return self
+
+            def with_grants(self, _grants):
+                return self
+
+            def to_jwt(self):
+                return "token"
+
+        class FakeLocalParticipant:
+            def __init__(self, room):
+                self.room = room
+                self.published = []
+
+            async def publish_data(self, data, **kwargs):
+                message = json.loads(data)
+                self.published.append((message, kwargs))
+                result = {
+                    "type": "client:tool-result",
+                    "call_id": message["call_id"],
+                    "result": {"linked": False},
+                }
+                self.room.handlers["data_received"](
+                    SimpleNamespace(
+                        topic="hermes-control",
+                        participant=worker,
+                        data=json.dumps(result).encode(),
+                    )
+                )
+
+        class FakeRoom:
+            latest = None
+
+            def __init__(self):
+                FakeRoom.latest = self
+                self.handlers = {}
+                self.local_participant = FakeLocalParticipant(self)
+                self.disconnected = False
+
+            def on(self, name):
+                def register(callback):
+                    self.handlers[name] = callback
+                    return callback
+
+                return register
+
+            async def connect(self, _url, _token):
+                registration = {
+                    "type": "client:tool-register",
+                    "name": "manage_trip_itinerary",
+                }
+                self.handlers["data_received"](
+                    SimpleNamespace(
+                        topic="hermes-control",
+                        participant=worker,
+                        data=json.dumps(registration).encode(),
+                    )
+                )
+
+            async def disconnect(self):
+                self.disconnected = True
+
+        fake_livekit = SimpleNamespace(
+            api=SimpleNamespace(
+                AccessToken=FakeAccessToken,
+                VideoGrants=lambda **kwargs: kwargs,
+            ),
+            rtc=SimpleNamespace(Room=FakeRoom),
+        )
+        source = {
+            "platform": "desktop",
+            "user_id": "hermes-install:test",
+            "user_name": "Local Hermes user",
+            "chat_id": "gui-1",
+            "hermes_session_id": "session-1",
+        }
+
+        with (
+            patch.dict(sys.modules, {"livekit": fake_livekit}),
+            patch.object(
+                plugin,
+                "_livekit_setting",
+                side_effect=lambda name, default="": {
+                    "LIVEKIT_URL": "ws://livekit.test:7880",
+                    "LIVEKIT_API_KEY": "key",
+                    "LIVEKIT_API_SECRET": "secret",
+                    "LIVEKIT_ROOM": "ECL",
+                }.get(name, default),
+            ),
+            patch.object(plugin, "_mira_source_context", return_value=source),
+        ):
+            result = await plugin._route_remote_tool_via_livekit(
+                "manage_trip_itinerary", {"action": "load"}
+            )
+
+        self.assertEqual(json.loads(result), {"linked": False})
+        published, publish_kwargs = FakeRoom.latest.local_participant.published[0]
+        self.assertEqual(published["name"], "manage_trip_itinerary")
+        self.assertEqual(published["arguments"]["_mira_source"], source)
+        self.assertEqual(
+            publish_kwargs["destination_identities"],
+            ["simulated-agent-worker"],
+        )
+        self.assertTrue(FakeRoom.latest.disconnected)
+
+    def test_desktop_source_uses_stable_install_identity(self):
+        values = {
+            "HERMES_SESSION_PLATFORM": "",
+            "HERMES_SESSION_SOURCE": "desktop",
+            "HERMES_SESSION_ID": "20260827_172156_c71fef",
+            "HERMES_UI_SESSION_ID": "4967c651",
+        }
+
+        with (
+            patch(
+                "gateway.session_context.get_session_env",
+                side_effect=lambda name, default="": values.get(name, default),
+            ),
+            patch.object(
+                plugin,
+                "_stable_local_user_id",
+                return_value="hermes-install:test-install",
+            ),
+        ):
+            source = plugin._mira_source_context({})
+
+        self.assertEqual(
+            source,
+            {
+                "platform": "desktop",
+                "user_id": "hermes-install:test-install",
+                "user_name": "Local Hermes user",
+                "chat_id": "4967c651",
+                "hermes_session_id": "20260827_172156_c71fef",
+            },
+        )
+
+    def test_gateway_source_preserves_bound_platform_identity(self):
+        values = {
+            "HERMES_SESSION_PLATFORM": "discord",
+            "HERMES_SESSION_SOURCE": "discord",
+            "HERMES_SESSION_USER_ID": "discord-user-42",
+            "HERMES_SESSION_USER_NAME": "Traveller",
+            "HERMES_SESSION_CHAT_ID": "channel-1",
+            "HERMES_SESSION_ID": "discord-session",
+        }
+
+        with patch(
+            "gateway.session_context.get_session_env",
+            side_effect=lambda name, default="": values.get(name, default),
+        ):
+            source = plugin._mira_source_context({})
+
+        self.assertEqual(source["platform"], "discord")
+        self.assertEqual(source["user_id"], "discord-user-42")
+        self.assertEqual(source["hermes_session_id"], "discord-session")
+
     def test_manifest_declares_cross_platform_mira_tools(self):
         manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
 

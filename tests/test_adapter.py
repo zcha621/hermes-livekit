@@ -815,6 +815,108 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received["message"]["action"], "interrupt")
         self.assertEqual(received["message"]["request_id"], "request-123")
 
+    async def test_push_to_talk_release_invokes_only_the_authenticated_sender(self):
+        bytes_per_second = (
+            livekit_adapter.SAMPLE_RATE * livekit_adapter.NUM_CHANNELS * 2
+        )
+        self.adapter._audio_buffers["alice"] = bytearray()
+        self.adapter._room = SimpleNamespace(
+            remote_participants={"alice": SimpleNamespace(name="Alice")},
+            local_participant=SimpleNamespace(set_attributes=AsyncMock()),
+        )
+
+        with (
+            patch.object(self.adapter, "_publish_agent_event", AsyncMock()),
+            patch.object(self.adapter, "_process_voice_input", AsyncMock()) as process,
+            patch.object(
+                livekit_adapter, "PUSH_TO_TALK_RELEASE_GRACE_SECONDS", 0
+            ),
+        ):
+            await self.adapter._handle_client_control(
+                {
+                    "action": "push-to-talk-start",
+                    "request_id": "press-123",
+                    "identity": "spoofed-user",
+                },
+                "alice",
+            )
+            self.adapter._audio_buffers["alice"] = bytearray(bytes_per_second)
+            await self.adapter._handle_client_control(
+                {"action": "push-to-talk-end", "request_id": "press-123"},
+                "alice",
+            )
+            await asyncio.sleep(0)
+
+        process.assert_awaited_once()
+        self.assertEqual(process.await_args.args[0], "alice")
+        self.assertTrue(process.await_args.kwargs["force_invoke"])
+        self.assertEqual(
+            process.await_args.kwargs["invocation_keyterm"], "@Agent"
+        )
+        self.assertNotIn("alice", self.adapter._push_to_talk_sessions)
+
+    async def test_push_to_talk_release_cannot_flush_another_participant(self):
+        self.adapter._audio_buffers["alice"] = bytearray(64_000)
+        self.adapter._room = SimpleNamespace(
+            remote_participants={"alice": SimpleNamespace(name="Alice")},
+            local_participant=SimpleNamespace(set_attributes=AsyncMock()),
+        )
+
+        with (
+            patch.object(self.adapter, "_publish_agent_event", AsyncMock()) as published,
+            patch.object(self.adapter, "_process_voice_input", AsyncMock()) as process,
+        ):
+            await self.adapter._handle_client_control(
+                {"action": "push-to-talk-start", "request_id": "press-123"},
+                "alice",
+            )
+            await self.adapter._handle_client_control(
+                {"action": "push-to-talk-end", "request_id": "press-123"},
+                "bob",
+            )
+
+        process.assert_not_awaited()
+        self.assertEqual(
+            self.adapter._push_to_talk_sessions["alice"], "press-123"
+        )
+        published.assert_any_await(
+            "agent:push-to-talk-ignored",
+            {
+                "identity": "bob",
+                "request_id": "press-123",
+                "reason": "not-active",
+            },
+        )
+
+    async def test_forced_agent_button_turn_preserves_speaker_identity(self):
+        self.adapter._room = SimpleNamespace(
+            remote_participants={"alice": SimpleNamespace(name="Alice")},
+            local_participant=SimpleNamespace(set_attributes=AsyncMock()),
+        )
+        event = livekit_adapter.MessageEvent(
+            text="What is next on my itinerary?",
+            message_type=livekit_adapter.MessageType.VOICE,
+            source=self.adapter.build_source(
+                chat_id="test-room",
+                chat_type="group",
+                user_id="alice",
+                user_name="alice",
+            ),
+        )
+
+        with patch.object(self.adapter, "_publish_agent_event", AsyncMock()):
+            accepted = await self.adapter._prepare_invoked_event(
+                event,
+                force_invoke=True,
+                invocation_keyterm="@Agent",
+            )
+
+        self.assertTrue(accepted)
+        self.assertEqual(event.source.user_id, "alice")
+        self.assertEqual(event.source.user_name, "Alice")
+        self.assertEqual(self.adapter._active_speaker_identity, "alice")
+        self.assertEqual(self.adapter._conversation_transcript[-1]["keyterm"], "@Agent")
+
     async def test_remote_tool_registration_rejects_untrusted_participant(self):
         message = {
             "name": "get_current_trip_context",

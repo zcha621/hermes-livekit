@@ -124,6 +124,8 @@ DEFAULT_ACK_PHRASES = (
     "On it.",
 )
 DEFAULT_INVOCATION_KEYTERMS = ("Hermes", "MiRA")
+PUSH_TO_TALK_KEYTERM = "@Agent"
+PUSH_TO_TALK_RELEASE_GRACE_SECONDS = 0.2
 DEFAULT_TRANSCRIPT_MAX_ENTRIES = 80
 DEFAULT_TRANSCRIPT_MAX_CHARS = 12_000
 DEFAULT_TRANSCRIPT_PROMPT_MAX_ENTRIES = 12
@@ -430,6 +432,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._participant_topics: Dict[str, str] = {}
         self._participant_call_ids: Dict[str, str] = {}
         self._armed_participant_wakes: Dict[str, tuple[str, float]] = {}
+        self._push_to_talk_sessions: Dict[str, str] = {}
         self._conversation_transcript: list[Dict[str, Any]] = []
         self._transcript_sequence = 0
         self._prepared_tts_source = ""
@@ -568,6 +571,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._participant_topics.clear()
         self._participant_call_ids.clear()
         self._armed_participant_wakes.clear()
+        self._push_to_talk_sessions.clear()
         self._conversation_transcript.clear()
         self._transcript_sequence = 0
         self._invoked_turn_active = False
@@ -780,7 +784,11 @@ class LiveKitAdapter(BasePlatformAdapter):
         return entry
 
     async def _prepare_invoked_event(
-        self, event: MessageEvent, *, force_invoke: bool = False
+        self,
+        event: MessageEvent,
+        *,
+        force_invoke: bool = False,
+        invocation_keyterm: str = "",
     ) -> bool:
         """Log a turn and apply the room wake-term policy.
 
@@ -797,7 +805,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         armed = self._armed_participant_wakes.pop(identity, None)
         if armed is not None and armed[1] >= time.monotonic():
             armed_keyterm = armed[0]
-        effective_keyterm = matched_keyterm or armed_keyterm
+        effective_keyterm = matched_keyterm or armed_keyterm or invocation_keyterm
         invoked = force_invoke or bool(effective_keyterm) or not self._invocation_enabled
         entry = self._append_transcript(
             role="user",
@@ -1414,7 +1422,15 @@ class LiveKitAdapter(BasePlatformAdapter):
             return
 
         if not getattr(event, "_livekit_invocation_checked", False):
-            if not await self._prepare_invoked_event(event):
+            if not await self._prepare_invoked_event(
+                event,
+                force_invoke=bool(
+                    getattr(event, "_livekit_force_invoke", False)
+                ),
+                invocation_keyterm=str(
+                    getattr(event, "_livekit_invocation_keyterm", "") or ""
+                ),
+            ):
                 return
 
         await self._set_agent_state("thinking", force=True)
@@ -1527,6 +1543,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._cleanup_participant_video(identity)
         self._participant_call_ids.pop(identity, None)
         self._armed_participant_wakes.pop(identity, None)
+        self._push_to_talk_sessions.pop(identity, None)
         # Drop any tools this client had registered + fail their pending calls.
         self._cleanup_client_tools(identity)
 
@@ -1677,7 +1694,11 @@ class LiveKitAdapter(BasePlatformAdapter):
         """
         # Flush a pending utterance, if any, before tearing buffers down.
         buf = self._audio_buffers.get(identity)
-        if buf is not None and identity in self._speaking_participants and len(buf) > 0:
+        push_to_talk_request = self._push_to_talk_sessions.pop(identity, None)
+        should_flush = identity in self._speaking_participants or bool(
+            push_to_talk_request
+        )
+        if buf is not None and should_flush and len(buf) > 0:
             # Use the whole buffer: the track just ended, so there is no
             # "ongoing silence" to trim — the buffer ends at (or very close
             # to) the last spoken word. The steady-state path in
@@ -1701,7 +1722,18 @@ class LiveKitAdapter(BasePlatformAdapter):
                             "agent:listening-stop", {"identity": identity}
                         )
                     )
-                    asyncio.create_task(self._process_voice_input(identity, pcm_data))
+                    asyncio.create_task(
+                        self._process_voice_input(
+                            identity,
+                            pcm_data,
+                            force_invoke=bool(push_to_talk_request),
+                            invocation_keyterm=(
+                                PUSH_TO_TALK_KEYTERM
+                                if push_to_talk_request
+                                else ""
+                            ),
+                        )
+                    )
                 except RuntimeError:
                     # No running event loop (e.g. during disconnect path) — skip flush.
                     pass
@@ -1997,6 +2029,12 @@ class LiveKitAdapter(BasePlatformAdapter):
                             asyncio.create_task(self._set_listening_state(identity))
                         continue
 
+                    # A held @Agent button defines the utterance boundary. Do
+                    # not endpoint on an internal pause; release finalizes the
+                    # participant's complete push-to-talk request.
+                    if identity in self._push_to_talk_sessions:
+                        continue
+
                     # Silent — check if silence has lasted long enough
                     last_time = self._last_audio_time.get(identity)
                     if last_time is None:
@@ -2046,7 +2084,14 @@ class LiveKitAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             return
 
-    async def _process_voice_input(self, identity: str, pcm_data: bytes):
+    async def _process_voice_input(
+        self,
+        identity: str,
+        pcm_data: bytes,
+        *,
+        force_invoke: bool = False,
+        invocation_keyterm: str = "",
+    ):
         """Transcribe audio and feed into the agent loop."""
         try:
             # Write PCM to WAV temp file
@@ -2081,6 +2126,13 @@ class LiveKitAdapter(BasePlatformAdapter):
             logger.info("[%s] Transcript from %s: %s", self.name, identity, transcript[:80])
 
             event = self._build_spoken_transcript_event(transcript, identity)
+            if force_invoke:
+                setattr(event, "_livekit_force_invoke", True)
+                setattr(
+                    event,
+                    "_livekit_invocation_keyterm",
+                    invocation_keyterm or PUSH_TO_TALK_KEYTERM,
+                )
 
             await self.handle_message(event)
         except Exception as e:
@@ -2376,6 +2428,10 @@ class LiveKitAdapter(BasePlatformAdapter):
           - ``resume`` — re-enable audio sampling.
           - ``interrupt`` — flush speech immediately and dispatch Hermes's
             priority ``/stop`` command.
+          - ``push-to-talk-start`` — bind an explicit @Agent turn to the
+            authenticated sending participant.
+          - ``push-to-talk-end`` — finalize that participant's buffered audio
+            and invoke Hermes without requiring a spoken keyterm.
         """
         action = (msg.get("action") or "").strip().lower()
         if action == "pause":
@@ -2386,8 +2442,111 @@ class LiveKitAdapter(BasePlatformAdapter):
             logger.info("[%s] resumed by client %s", self.name, identity)
         elif action == "interrupt":
             await self._handle_client_interrupt(msg, identity)
+        elif action == "push-to-talk-start":
+            await self._handle_push_to_talk_start(msg, identity)
+        elif action == "push-to-talk-end":
+            await self._handle_push_to_talk_end(msg, identity)
         else:
             logger.debug("[%s] unknown client:control action %r", self.name, action)
+
+    async def _handle_push_to_talk_start(
+        self, msg: Dict[str, Any], identity: str
+    ) -> None:
+        """Start one identity-bound explicit voice request."""
+        request_id = str(msg.get("request_id") or uuid.uuid4().hex[:12])[:128]
+        active_request = self._push_to_talk_sessions.get(identity)
+        if active_request:
+            await self._publish_agent_event(
+                "agent:push-to-talk-ignored",
+                {
+                    "identity": identity,
+                    "request_id": request_id,
+                    "reason": "already-active",
+                },
+            )
+            return
+
+        self._push_to_talk_sessions[identity] = request_id
+        if identity in self._audio_buffers:
+            self._audio_buffers[identity] = bytearray()
+        self._last_audio_time.pop(identity, None)
+        self._speaking_participants.discard(identity)
+        await self._set_listening_state(identity)
+        await self._publish_agent_event(
+            "agent:push-to-talk-started",
+            {"identity": identity, "request_id": request_id},
+        )
+
+    async def _handle_push_to_talk_end(
+        self, msg: Dict[str, Any], identity: str
+    ) -> None:
+        """Finalize only the authenticated sender's held @Agent request."""
+        request_id = str(msg.get("request_id") or "")[:128]
+        if not request_id or self._push_to_talk_sessions.get(identity) != request_id:
+            await self._publish_agent_event(
+                "agent:push-to-talk-ignored",
+                {
+                    "identity": identity,
+                    "request_id": request_id,
+                    "reason": "not-active",
+                },
+            )
+            return
+
+        # Let the final WebRTC audio frames arrive before taking the buffer.
+        # The session remains active during this grace period, so the normal
+        # silence endpoint cannot race the explicit release boundary.
+        await asyncio.sleep(PUSH_TO_TALK_RELEASE_GRACE_SECONDS)
+        if self._push_to_talk_sessions.get(identity) != request_id:
+            return
+        self._push_to_talk_sessions.pop(identity, None)
+
+        buffer = self._audio_buffers.get(identity)
+        pcm_data = bytes(buffer or b"")
+        if buffer is not None:
+            self._audio_buffers[identity] = bytearray()
+        self._last_audio_time.pop(identity, None)
+        self._speaking_participants.discard(identity)
+        await self._publish_agent_event(
+            "agent:listening-stop", {"identity": identity}
+        )
+        await self._finish_listening_state()
+
+        duration = len(pcm_data) / (SAMPLE_RATE * NUM_CHANNELS * 2)
+        if duration < self._min_speech_duration_seconds:
+            await self._publish_agent_event(
+                "agent:push-to-talk-ended",
+                {
+                    "identity": identity,
+                    "request_id": request_id,
+                    "accepted": False,
+                    "reason": "speech-too-short",
+                },
+            )
+            return
+
+        await self._publish_agent_event(
+            "agent:push-to-talk-ended",
+            {
+                "identity": identity,
+                "request_id": request_id,
+                "accepted": True,
+            },
+        )
+        logger.info(
+            "[%s] @Agent utterance from %s: %.1fs audio",
+            self.name,
+            identity,
+            duration,
+        )
+        asyncio.create_task(
+            self._process_voice_input(
+                identity,
+                pcm_data,
+                force_invoke=True,
+                invocation_keyterm=PUSH_TO_TALK_KEYTERM,
+            )
+        )
 
     async def _handle_client_interrupt(
         self, msg: Dict[str, Any], identity: str
