@@ -105,9 +105,12 @@ _apply_env_log_level()
 # Voice defaults. Behavioral settings are resolved from
 # ``platforms.livekit.extra`` in Hermes config.yaml for each adapter instance.
 # Keep .env for transport credentials only.
-DEFAULT_SILENCE_THRESHOLD_SECONDS = 1.5  # Discord voice-channel parity
-DEFAULT_MIN_SPEECH_DURATION_SECONDS = 0.5
+# A short endpointing window keeps the voice transport close to typed Hermes
+# latency while retaining enough pause tolerance for ordinary speech.
+DEFAULT_SILENCE_THRESHOLD_SECONDS = 0.7
+DEFAULT_MIN_SPEECH_DURATION_SECONDS = 0.3
 DEFAULT_RMS_SILENCE_FLOOR = 50
+DEFAULT_STANDALONE_WAKE_FOLLOWUP_SECONDS = 5.0
 POLL_INTERVAL = 0.2               # silence check interval when active
 IDLE_POLL_INTERVAL = 2.0          # silence check interval when no remote participants
 DEFAULT_VIDEO_SAMPLE_INTERVAL_SECONDS = 1.0
@@ -123,6 +126,8 @@ DEFAULT_ACK_PHRASES = (
 DEFAULT_INVOCATION_KEYTERMS = ("Hermes", "MiRA")
 DEFAULT_TRANSCRIPT_MAX_ENTRIES = 80
 DEFAULT_TRANSCRIPT_MAX_CHARS = 12_000
+DEFAULT_TRANSCRIPT_PROMPT_MAX_ENTRIES = 12
+DEFAULT_TRANSCRIPT_PROMPT_MAX_CHARS = 3_000
 AGENT_STATUS_SCHEMA = "mira-agent-status.v1"
 AGENT_STATES = frozenset({"initializing", "idle", "listening", "thinking", "speaking"})
 TOPIC_MAX_LENGTH = 180
@@ -135,6 +140,22 @@ VISUAL_UTTERANCE_RE = re.compile(
     r"this|that|these|those|here|there"
     r")\b",
     re.IGNORECASE,
+)
+
+# Hermes keeps a terminal reasoning-only fallback useful for visual clients:
+# it explains that no final answer was produced and appends a labeled excerpt
+# of the model's private reasoning.  That excerpt must never become speech.
+# Match only the exact core-generated prefix at the start of a response so a
+# normal answer discussing reasoning is not accidentally rewritten.
+REASONING_ONLY_FALLBACK_RE = re.compile(
+    r"^\s*(?:\N{WARNING SIGN}\N{VARIATION SELECTOR-16}?\s*)?"
+    r"The model produced only internal reasoning and no final answer, "
+    r"despite retries(?: and fallback)?\.\s*Its last reasoning, "
+    r"which may contain the answer:\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+REASONING_ONLY_SPOKEN_FAILURE = (
+    "I couldn't produce a final answer. Please try again."
 )
 
 # LiveKit audio defaults
@@ -161,13 +182,17 @@ PRESENCE_POLL_INTERVAL_LOCAL = 5.0
 # small-result tools; large/binary results are Phase 1.5.
 TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 TOOL_CALL_TIMEOUT_DEFAULT = 30.0
-TOOLSET_NAME = "hermes-livekit-tools"
+# Dynamic worker tools join the plugin's declared toolset so they are visible
+# on every Hermes surface where the plugin toolset is enabled (including
+# LiveKit and Discord). A second hidden toolset would be filtered at turn build.
+TOOLSET_NAME = "hermes-livekit"
+CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 DEFAULT_REMOTE_TOOL_NAMES = (
     "find_local_recommendations",
     "get_current_trip_context",
     "manage_trip_itinerary",
 )
-HOST_MANAGED_REMOTE_TOOL_NAMES = frozenset({"manage_trip_itinerary"})
+HOST_MANAGED_REMOTE_TOOL_NAMES = frozenset(DEFAULT_REMOTE_TOOL_NAMES)
 DEFAULT_REMOTE_TOOL_OWNER_PREFIXES = (
     "agent-mira-knowledge-worker-",
     "simulated-agent-",
@@ -280,7 +305,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._image_stream_topics = tuple(
             str(topic).strip() for topic in topics if str(topic).strip()
         ) if isinstance(topics, (list, tuple)) else DEFAULT_IMAGE_STREAM_TOPICS
-        self._ack_enabled = self._config_bool(ack_config.get("enabled"), True)
+        self._ack_enabled = self._config_bool(ack_config.get("enabled"), False)
         phrases = ack_config.get("phrases", DEFAULT_ACK_PHRASES)
         if isinstance(phrases, str):
             phrases = [phrases]
@@ -306,6 +331,10 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._strip_keyterm = self._config_bool(
             invocation_config.get("strip_keyterm"), True
         )
+        self._standalone_wake_followup_seconds = self._nonnegative_float(
+            invocation_config.get("standalone_followup_seconds"),
+            DEFAULT_STANDALONE_WAKE_FOLLOWUP_SECONDS,
+        )
         self._keyterm_patterns = tuple(
             (
                 keyterm,
@@ -325,6 +354,14 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._transcript_max_chars = self._positive_int(
             transcript_config.get("history_max_chars"),
             DEFAULT_TRANSCRIPT_MAX_CHARS,
+        )
+        self._transcript_prompt_max_entries = self._positive_int(
+            transcript_config.get("prompt_max_entries"),
+            DEFAULT_TRANSCRIPT_PROMPT_MAX_ENTRIES,
+        )
+        self._transcript_prompt_max_chars = self._positive_int(
+            transcript_config.get("prompt_max_chars"),
+            DEFAULT_TRANSCRIPT_PROMPT_MAX_CHARS,
         )
         allowed_tool_names = remote_tools_config.get(
             "allowed_names", DEFAULT_REMOTE_TOOL_NAMES
@@ -391,6 +428,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._invoked_turn_active = False
         self._invoked_turn_generation = 0
         self._participant_topics: Dict[str, str] = {}
+        self._participant_call_ids: Dict[str, str] = {}
+        self._armed_participant_wakes: Dict[str, tuple[str, float]] = {}
         self._conversation_transcript: list[Dict[str, Any]] = []
         self._transcript_sequence = 0
         self._prepared_tts_source = ""
@@ -527,6 +566,8 @@ class LiveKitAdapter(BasePlatformAdapter):
     def _reset_room_context(self) -> None:
         """Forget conversational state when the room session ends."""
         self._participant_topics.clear()
+        self._participant_call_ids.clear()
+        self._armed_participant_wakes.clear()
         self._conversation_transcript.clear()
         self._transcript_sequence = 0
         self._invoked_turn_active = False
@@ -538,6 +579,47 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._prepared_tts_source = ""
         self._prepared_tts_text = ""
         self._last_spoken_source = ""
+
+    def _participant_connection_metadata(self, identity: str) -> Dict[str, str]:
+        """Return the trusted token metadata for a connected participant."""
+        if not self._room:
+            return {}
+        participant = getattr(self._room, "remote_participants", {}).get(identity)
+        raw = getattr(participant, "metadata", "") if participant is not None else ""
+        if not isinstance(raw, str) or not raw.strip():
+            return {}
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(decoded, dict):
+            return {}
+        return {
+            key: value.strip()
+            for key, value in decoded.items()
+            if isinstance(key, str) and isinstance(value, str) and value.strip()
+        }
+
+    def _source_chat_id(self, identity: str) -> str:
+        """Scope Hermes history to the call/planning connection, not the room."""
+        conversation_id = self._participant_connection_metadata(identity).get(
+            "mira_conversation_id", ""
+        )
+        if CONVERSATION_ID_RE.fullmatch(conversation_id):
+            return f"{self._room_name}:conversation:{conversation_id}"
+        call_id = self._participant_call_ids.setdefault(
+            identity or "client", uuid.uuid4().hex
+        )
+        return f"{self._room_name}:call:{call_id}"
+
+    def source_connection_metadata(self, identity: str) -> Dict[str, str]:
+        """Expose only bounded fields used by plugin lifecycle hooks."""
+        metadata = self._participant_connection_metadata(identity)
+        return {
+            key: metadata[key]
+            for key in ("purpose", "mira_conversation_id", "aware_device_id")
+            if key in metadata
+        }
 
     def _append_transcript(
         self,
@@ -591,9 +673,18 @@ class LiveKitAdapter(BasePlatformAdapter):
         """Render recent labeled room speech as untrusted conversational context."""
         if not self._conversation_transcript:
             return ""
+        prompt_entries = self._conversation_transcript[
+            -self._transcript_prompt_max_entries:
+        ]
+        while (
+            len(prompt_entries) > 1
+            and sum(len(str(item.get("text", ""))) for item in prompt_entries)
+            > self._transcript_prompt_max_chars
+        ):
+            prompt_entries = prompt_entries[1:]
         lines = [
             f'[{item["sequence"]}] {item["name"]} ({item["role"]}): {item["text"]}'
-            for item in self._conversation_transcript
+            for item in prompt_entries
         ]
         return (
             "Recent LiveKit room transcript (chronological, participant-labeled). "
@@ -702,18 +793,31 @@ class LiveKitAdapter(BasePlatformAdapter):
         display_name = self._participant_display_name(identity)
         original_text = str(event.text or "").strip()
         matched_keyterm, cleaned = self._match_keyterm(original_text)
-        invoked = force_invoke or bool(matched_keyterm) or not self._invocation_enabled
+        armed_keyterm = ""
+        armed = self._armed_participant_wakes.pop(identity, None)
+        if armed is not None and armed[1] >= time.monotonic():
+            armed_keyterm = armed[0]
+        effective_keyterm = matched_keyterm or armed_keyterm
+        invoked = force_invoke or bool(effective_keyterm) or not self._invocation_enabled
         entry = self._append_transcript(
             role="user",
             identity=identity,
             name=display_name,
             text=original_text,
             invoked=invoked,
-            keyterm=matched_keyterm,
+            keyterm=effective_keyterm,
         )
         await self._publish_transcript_entry(
             entry,
-            publish_standard=event.message_type == MessageType.VOICE,
+            # LiveKit audio has already been transcribed before it reaches the
+            # gateway.  Such turns are deliberately represented as TEXT so
+            # Hermes does not mistake an attached camera JPEG for a VOICE
+            # attachment and send the JPEG through STT.  Retain native
+            # transcription publication through explicit event metadata.
+            publish_standard=(
+                event.message_type == MessageType.VOICE
+                or bool((event.metadata or {}).get("livekit_spoken_transcript"))
+            ),
         )
 
         if not invoked:
@@ -724,7 +828,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             await self._set_agent_state("idle", force=True)
             return False
 
-        self._activate_invoked_turn(matched_keyterm)
+        self._activate_invoked_turn(effective_keyterm)
 
         self._active_speaker_identity = identity
         self._active_speaker_name = display_name
@@ -739,12 +843,18 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         await self._publish_agent_event(
             "agent:invoked",
-            {"identity": identity, "name": display_name, "keyterm": matched_keyterm},
+            {"identity": identity, "name": display_name, "keyterm": effective_keyterm},
         )
 
-        # A standalone wake phrase is visible in the transcript but cannot arm
-        # a later utterance: invocation is deliberately checked every time.
+        # Mobile endpointing commonly finalizes "MiRA" before the traveller's
+        # question. Arm only this participant, briefly, so their next utterance
+        # continues the invocation without opening a room-wide response window.
         if not cleaned:
+            if matched_keyterm and self._standalone_wake_followup_seconds > 0:
+                self._armed_participant_wakes[identity] = (
+                    matched_keyterm,
+                    time.monotonic() + self._standalone_wake_followup_seconds,
+                )
             self._finish_invoked_turn()
             await self._set_agent_state("idle", force=True)
             return False
@@ -1291,20 +1401,10 @@ class LiveKitAdapter(BasePlatformAdapter):
                 logger.debug("[%s] handle_message: empty transcript", self.name)
                 return
 
-            msg_event = MessageEvent(
-                text=transcript,
-                message_type=MessageType.VOICE,
-                source=self.build_source(
-                    chat_id=self._room_name,
-                    chat_name=self._room_name,
-                    chat_type="group",
-                    user_id=identity,
-                    user_name=identity,
-                ),
+            msg_event = self._build_spoken_transcript_event(
+                transcript,
+                identity,
                 message_id=getattr(packet, "id", uuid.uuid4().hex[:12]),
-                media_urls=[],
-                media_types=[],
-                timestamp=datetime.now(tz=timezone.utc),
             )
             await self.handle_message(msg_event)
             return
@@ -1318,7 +1418,6 @@ class LiveKitAdapter(BasePlatformAdapter):
                 return
 
         await self._set_agent_state("thinking", force=True)
-        self._arm_tool_acknowledgement()
         await super().handle_message(event)
 
     # -- LiveKit event handlers ---------------------------------------------
@@ -1331,10 +1430,9 @@ class LiveKitAdapter(BasePlatformAdapter):
     ):
         """Start capturing media when a participant's track is subscribed.
 
-        Audio tracks are buffered continuously for VAD/STT. Video tracks are
-        stored but NOT iterated eagerly — frames are pulled on demand when a
-        client sends a ``client:capture-frame`` message on the
-        ``hermes-control`` data-channel topic.
+        Audio tracks are buffered continuously for VAD/STT. Video streams are
+        continuously drained into a throttled latest-frame cache; a frame is
+        attached only for an explicit visual reference or capture request.
         """
         identity = participant.identity
 
@@ -1427,6 +1525,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         logger.info("[%s] Participant disconnected: %s", self.name, identity)
         self._cleanup_participant(identity)
         self._cleanup_participant_video(identity)
+        self._participant_call_ids.pop(identity, None)
+        self._armed_participant_wakes.pop(identity, None)
         # Drop any tools this client had registered + fail their pending calls.
         self._cleanup_client_tools(identity)
 
@@ -1717,24 +1817,62 @@ class LiveKitAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[%s] Video receive error for %s: %s", self.name, track_key, exc)
 
+    @staticmethod
+    def _video_source_matches(source_name: str, preferred_source: str) -> bool:
+        normalized = source_name.lower().replace("_", "")
+        if preferred_source == "screen":
+            return "screen" in normalized
+        if preferred_source == "camera":
+            return "camera" in normalized
+        return True
+
+    @staticmethod
+    def _preferred_video_source(text: str) -> str:
+        lowered = str(text or "").lower()
+        if re.search(r"\b(screen|screenshare|screen-share|share screen|presentation|slide)\b", lowered):
+            return "screen"
+        if re.search(r"\b(camera|webcam|face|wearing|behind me)\b", lowered):
+            return "camera"
+        return ""
+
     def _latest_frame_for_identity(
-        self, identity: str
+        self, identity: str, *, preferred_source: str = ""
     ) -> Optional[tuple[bytes, float, str, int, int]]:
-        candidates = []
+        identity_candidates = []
         for key, frame_info in self._latest_video_frames.items():
             meta = self._video_track_meta.get(key)
             if meta is not None and (not identity or meta[0] == identity):
-                candidates.append(frame_info)
-        if not candidates and identity:
-            # A text sender may not be the participant publishing the shared
-            # screen. Fall back to the freshest room video.
+                identity_candidates.append(frame_info)
+
+        if preferred_source:
+            candidates = [
+                item for item in identity_candidates
+                if self._video_source_matches(item[2], preferred_source)
+            ]
+        else:
+            candidates = identity_candidates
+
+        if not candidates and preferred_source == "screen":
+            # The current speaker may be discussing a screen published by a
+            # different room participant. Prefer that screen over their camera.
+            candidates = [
+                item for item in self._latest_video_frames.values()
+                if self._video_source_matches(item[2], "screen")
+            ]
+        if not candidates and not preferred_source and identity:
+            # For generic visual references, fall back to the freshest room
+            # video because the shared-screen publisher may not be the speaker.
             candidates = list(self._latest_video_frames.values())
         if not candidates:
             return None
         return max(candidates, key=lambda item: item[1])
 
-    def _queue_latest_video_frame(self, identity: str) -> Optional[tuple[str, str]]:
-        latest = self._latest_frame_for_identity(identity)
+    def _queue_latest_video_frame(
+        self, identity: str, *, preferred_source: str = ""
+    ) -> Optional[tuple[str, str]]:
+        latest = self._latest_frame_for_identity(
+            identity, preferred_source=preferred_source
+        )
         if latest is None:
             return None
         jpeg, captured_at, source_name, _width, _height = latest
@@ -1751,6 +1889,13 @@ class LiveKitAdapter(BasePlatformAdapter):
         capture = (path, "image/jpeg")
         self._pending_captures.append(capture)
         return capture
+
+    def _queue_video_for_text(
+        self, text: str, identity: str
+    ) -> Optional[tuple[str, str]]:
+        return self._queue_latest_video_frame(
+            identity, preferred_source=self._preferred_video_source(text)
+        )
 
     @staticmethod
     def _should_attach_video(text: str) -> bool:
@@ -1935,34 +2080,50 @@ class LiveKitAdapter(BasePlatformAdapter):
 
             logger.info("[%s] Transcript from %s: %s", self.name, identity, transcript[:80])
 
-            # Drain any captured frames into this message so the agent's
-            # vision pipeline sees them alongside the transcript.
-            if self._auto_vision and self._should_attach_video(transcript):
-                self._queue_latest_video_frame(identity)
-            media_urls, media_types = self._drain_pending_captures()
-
-            # Build message event
-            source = self.build_source(
-                chat_id=self._room_name,
-                chat_name=self._room_name,
-                chat_type="group",
-                user_id=identity,
-                user_name=identity,
-            )
-
-            event = MessageEvent(
-                text=transcript,
-                message_type=MessageType.VOICE,
-                source=source,
-                message_id=uuid.uuid4().hex[:12],
-                media_urls=media_urls,
-                media_types=media_types,
-                timestamp=datetime.now(tz=timezone.utc),
-            )
+            event = self._build_spoken_transcript_event(transcript, identity)
 
             await self.handle_message(event)
         except Exception as e:
             logger.error("[%s] Error processing voice from %s: %s", self.name, identity, e)
+
+    def _build_spoken_transcript_event(
+        self,
+        transcript: str,
+        identity: str,
+        *,
+        message_id: Optional[str] = None,
+    ) -> MessageEvent:
+        """Build a gateway event for audio that LiveKit already transcribed.
+
+        Hermes reserves ``MessageType.VOICE`` for events whose media URLs are
+        audio files that still need transcription.  A LiveKit turn is already
+        text by this point; its optional media URLs are camera/screen images.
+        Labeling the event as VOICE therefore causes Hermes core to run STT on
+        the JPEG after vision analysis.  Use TEXT for correct media routing and
+        carry the spoken origin in metadata for transcript publication.
+        """
+        if self._auto_vision and self._should_attach_video(transcript):
+            self._queue_video_for_text(transcript, identity)
+        media_urls, media_types = self._drain_pending_captures()
+        return MessageEvent(
+            text=transcript,
+            message_type=MessageType.TEXT,
+            source=self.build_source(
+                chat_id=self._source_chat_id(identity),
+                chat_name=self._room_name,
+                chat_type="group",
+                user_id=identity,
+                user_name=identity,
+            ),
+            message_id=message_id or uuid.uuid4().hex[:12],
+            media_urls=media_urls,
+            media_types=media_types,
+            metadata={
+                "livekit_spoken_transcript": True,
+                "media_already_transcribed": True,
+            },
+            timestamp=datetime.now(tz=timezone.utc),
+        )
 
     # -- Inbound data channel + frame capture -------------------------------
 
@@ -2045,13 +2206,13 @@ class LiveKitAdapter(BasePlatformAdapter):
         # Handle direct text messages (browser chatbox input).
         if is_text_message and msg_type == "text":
             if self._auto_vision and self._should_attach_video(text_content):
-                self._queue_latest_video_frame(participant_identity)
+                self._queue_video_for_text(text_content, participant_identity)
             media_urls, media_types = self._drain_pending_captures()
             asyncio.create_task(self.handle_message(MessageEvent(
                 text=text_content,
                 message_type=MessageType.TEXT,
                 source=self.build_source(
-                    chat_id=self._room_name,
+                    chat_id=self._source_chat_id(participant_identity),
                     chat_name=self._room_name,
                     chat_type="direct",
                     user_id=participant_identity,
@@ -2178,11 +2339,11 @@ class LiveKitAdapter(BasePlatformAdapter):
             return
 
         if self._auto_vision and self._should_attach_video(text):
-            self._queue_latest_video_frame(identity)
+            self._queue_video_for_text(text, identity)
         media_urls, media_types = self._drain_pending_captures()
 
         source = self.build_source(
-            chat_id=self._room_name,
+            chat_id=self._source_chat_id(identity),
             chat_name=self._room_name,
             chat_type="group",
             user_id=identity or "client",
@@ -2251,7 +2412,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         # never demoted by a queue/steer busy-input policy.
         self._activate_invoked_turn(self._last_keyterm)
         source = self.build_source(
-            chat_id=self._room_name,
+            chat_id=self._source_chat_id(identity),
             chat_name=self._room_name,
             chat_type="group",
             user_id=identity or "client",
@@ -2507,13 +2668,14 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         async def proxy(args: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Any:
             arguments: Dict[str, Any] = dict(args or {})
+            tool_started = time.monotonic()
             try:
                 from gateway.session_context import get_session_env
 
                 platform = get_session_env("HERMES_SESSION_PLATFORM", "")
                 user_id = get_session_env("HERMES_SESSION_USER_ID", "")
                 if platform and user_id:
-                    arguments["_mira_source"] = {
+                    source = {
                         "platform": platform,
                         "user_id": user_id,
                         "user_name": get_session_env("HERMES_SESSION_USER_NAME", ""),
@@ -2523,6 +2685,9 @@ class LiveKitAdapter(BasePlatformAdapter):
                             or get_session_env("HERMES_SESSION_ID", "")
                         ),
                     }
+                    if platform == "livekit":
+                        source.update(self.source_connection_metadata(user_id))
+                    arguments["_mira_source"] = source
             except Exception:
                 logger.debug("[%s] could not attach account source context", self.name)
             if not self._room or owner_identity not in self._room.remote_participants:
@@ -2535,6 +2700,12 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._pending_tool_calls[call_id] = future
             self._pending_tool_owners[call_id] = owner_identity
             try:
+                logger.info(
+                    "[%s] remote tool %r started via %s",
+                    self.name,
+                    registered_name,
+                    owner_identity,
+                )
                 await self._publish_typed(
                     {
                         "type": "agent:tool-call",
@@ -2545,10 +2716,24 @@ class LiveKitAdapter(BasePlatformAdapter):
                     identity=owner_identity,
                 )
                 result = await asyncio.wait_for(future, timeout=self._tool_call_timeout)
+                logger.info(
+                    "[%s] remote tool %r completed in %.3fs via %s",
+                    self.name,
+                    registered_name,
+                    time.monotonic() - tool_started,
+                    owner_identity,
+                )
                 if isinstance(result, str):
                     return result
                 return json.dumps(result, ensure_ascii=False, default=str)
             except asyncio.TimeoutError:
+                logger.warning(
+                    "[%s] remote tool %r timed out in %.3fs via %s",
+                    self.name,
+                    registered_name,
+                    time.monotonic() - tool_started,
+                    owner_identity,
+                )
                 await self._publish_typed(
                     {"type": "agent:tool-call-timeout", "call_id": call_id, "name": registered_name},
                     identity=owner_identity,
@@ -2815,6 +3000,31 @@ class LiveKitAdapter(BasePlatformAdapter):
                 if speaking_generation:
                     await self._finish_state_if_current(speaking_generation)
 
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> SendResult:
+        """Route Hermes voice attachments through the room's audio track.
+
+        LiveKit speech is normalized to a text-typed gateway event after STT so
+        image attachments are never mistaken for audio. Hermes core can then
+        deliver auto-TTS through ``send_voice`` rather than ``play_tts``. The
+        base implementation only posts an attachment warning, so bridge that
+        delivery API back to LiveKit's PCM playback path.
+        """
+        return await self.play_tts(
+            chat_id,
+            audio_path,
+            reply_to=reply_to,
+            metadata=metadata,
+            caption=caption,
+        )
+
     @staticmethod
     def _decode_audio_to_pcm(audio_path: str) -> Optional[bytes]:
         """Decode an audio file to raw 16-bit PCM using ffmpeg."""
@@ -2844,22 +3054,55 @@ class LiveKitAdapter(BasePlatformAdapter):
             return None
 
     def prepare_tts_text(self, text: str) -> str:
-        """Strip tool output, code blocks, URLs, and file paths for voice.
+        """Strip reasoning, tool output, and visual-only syntax for voice.
 
         The full response is already sent via data channel — TTS should
         only speak the conversational parts.
 
         Overrides ``BasePlatformAdapter.prepare_tts_text``, which upstream
         calls in the auto-TTS path (the hook landed via NousResearch/
-        hermes-agent#27308). The base default does a basic markdown strip;
-        this override additionally removes code fences, inline code, URLs,
-        file paths, and MEDIA: tags.
+        hermes-agent#27308). Keep Hermes's shared non-spoken-block cleanup,
+        then additionally remove code fences, inline code, URLs, file paths,
+        and MEDIA: tags.
         """
         import re as _re
 
-        source_text = text
+        source_text = str(text or "")
         self._prepared_tts_source = ""
         self._prepared_tts_text = ""
+
+        # Hermes's terminal recovery response intentionally includes a
+        # clearly-labeled reasoning excerpt for visual clients.  Preserve the
+        # original data-channel response, but replace the entire spoken script
+        # with a neutral failure so no part of the scratchpad reaches TTS.
+        if REASONING_ONLY_FALLBACK_RE.match(source_text):
+            prepared = REASONING_ONLY_SPOKEN_FAILURE
+            self._prepared_tts_source = source_text
+            self._prepared_tts_text = prepared
+            logger.info("[%s] Suppressed reasoning-only fallback from TTS", self.name)
+            return prepared
+
+        # The plugin overrides BasePlatformAdapter.prepare_tts_text, so retain
+        # the core non-spoken-block stage explicitly.  It handles complete and
+        # truncated <think> blocks without changing the data-channel response.
+        try:
+            from tools.tts_text_normalize import strip_nonspoken_blocks
+
+            text = strip_nonspoken_blocks(source_text)
+        except Exception:
+            # Best-effort compatibility with older Hermes installations.
+            text = _re.sub(
+                r"<think(?:\s[^>]*)?>.*?</think\s*>",
+                " ",
+                source_text,
+                flags=_re.IGNORECASE | _re.DOTALL,
+            )
+            text = _re.sub(
+                r"<think(?:\s[^>]*)?>.*\Z",
+                " ",
+                text,
+                flags=_re.IGNORECASE | _re.DOTALL,
+            )
 
         # Some model/provider combinations leak a function invocation as
         # ordinary assistant text instead of returning a structured tool

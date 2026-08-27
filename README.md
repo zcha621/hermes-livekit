@@ -4,24 +4,30 @@ This submodule connects Hermes to a LiveKit room as a voice-first participant.
 It supports audio, typed messages, camera/screen context, interruption, and
 client-provided tools without modifying Hermes core.
 
-Hermes is configured on its host through `config.yaml`. There is no HTTP
-control bridge or web-portal control page.
+Hermes is configured on its host through `config.yaml`; there is no HTTP
+control bridge. MiRA's administrator portal stores pending LiveKit agent-name,
+invocation-keyterm, and SOUL revisions in its database. Explicit short-lived
+deployment tools import or apply only `config.yaml` and `SOUL.md`; the public
+portal receives no Hermes host mount. Gateway lifecycle remains host-managed.
 
 MiRA's conversational setup has three deliberate layers: `assets/SOUL.md`
-defines identity and voice, the bundled `mira-new-zealand-tourism` skill defines
-tourism procedure and grounding, and the trusted Python worker supplies the one
-implemented domain tool. LiveKit receives no Hermes core tools and explicitly
-opts out of global MCP servers. The complete operator guide is
+defines identity and voice, the bundled `mira-new-zealand-tourism` skill is an
+optional Hermes skill, and the trusted Python worker supplies bounded domain
+tools. LiveKit and Discord receive the same configured Hermes tools, skills,
+and MCP servers as the GUI/CLI, plus the MiRA tools. The plugin does not call
+the backend before or after ordinary model turns. The complete operator guide is
 [`docs/deployment/HERMES-SETUP.md`](../../docs/deployment/HERMES-SETUP.md).
 
 ## Invocation keyterms and shared meeting context
 
-MiRA transcribes every completed room utterance but creates a Hermes response
-turn only when that same utterance contains a configured invocation keyterm.
+MiRA transcribes every completed room utterance but normally creates a Hermes
+response turn only when that utterance contains a configured invocation keyterm.
 The defaults are `Hermes` and `MiRA`. A phrase such as “MiRA, find an accessible
 Rotorua walk” is logged with its speaker, then the invocation phrase is stripped
-before the request reaches the LLM. The next utterance requires its own keyterm;
-there is no room-wide follow-up window.
+before the request reaches the LLM. Mobile endpointing can finalize a standalone
+wake phrase before the question; in that one case, only the same participant's
+next utterance is accepted for five seconds. There is no room-wide follow-up
+window.
 
 The adapter keeps a bounded chronological transcript containing every
 participant and Hermes's own speech. It publishes finalized segments both as
@@ -29,7 +35,18 @@ participant-labeled `agent:*transcript` data events and, for speech, through
 LiveKit's native transcription API. Ambient conversation is not discarded: the
 recent transcript is included as quoted context whenever a participant invokes
 MiRA, so the reply can understand references without answering uninvoked speech.
-A standalone keyterm is logged but does not arm the next utterance.
+A standalone keyterm does not create an empty model turn.
+
+Portal clients should set `mira_conversation_id`; Hermes then keeps history for
+that explicit conversation. A participant without that metadata receives a
+fresh call-scoped ID for each connection instead of inheriting permanent room
+history. The bounded participant transcript above still supplies current
+multi-speaker context without allowing old calls to grow every new prompt.
+
+When location, local time, itinerary, or durable room history matters, Hermes
+can select `get_current_trip_context`. No database snapshot is fetched or
+injected automatically. This keeps direct conversation on the same model path
+as the Hermes GUI while leaving current context available on demand.
 
 This is application-level invocation policy built on LiveKit participant audio
 and Hermes STT. LiveKit itself supplies per-participant identity, synchronized
@@ -89,27 +106,40 @@ Hermes immediately clears queued audio, publishes `agent:interrupted`, and
 dispatches its canonical `/stop` command. The gateway cancels in-flight model,
 tool, and child-agent work regardless of the configured busy-input mode.
 
-## Natural voice acknowledgements
+## Low-latency voice path
 
-LiveKit follows Hermes Discord voice behavior:
+Tool acknowledgements are disabled and the plugin registers no pre-tool cue
+hook, so a selected tool starts without an extra TTS request. Ordinary and
+tool-using turns both stay in Hermes's normal response loop.
 
-- an acknowledgement is spoken only when the first tool in a turn starts;
-- ordinary conversational turns receive no holding phrase;
-- only one acknowledgement is used per turn, even when several tools run;
-- the phrase is selected from the same five defaults as Discord; and
-- acknowledgement audio is labeled and added to the room transcript.
+The realtime Spark Qwen request middleware sends its native
+`extra_body.enable_thinking: false` flag and a final `/no_think` marker on the
+provider payload without changing the stored participant transcript. If its
+OpenAI-compatible endpoint returns the model-selected call as a
+`<tool_call>` JSON block instead of the standard `tool_calls` field, a scoped
+post-response compatibility hook converts that existing decision to Hermes's
+canonical tool-call type. The hook does not select or execute a tool; Hermes's
+registry, approval, and dispatch boundaries remain unchanged.
 
-The default end-of-utterance silence threshold is also aligned with Discord at
-1.5 seconds. Barge-in still interrupts playback immediately.
+LiveKit's TTS boundary independently removes `<think>` blocks. If Hermes
+exhausts its reasoning-only retries and returns a visual diagnostic containing
+a labeled reasoning excerpt, the data-channel text remains available to the
+UI, but voice playback substitutes a short retry message and never synthesizes
+the excerpt.
+
+The default end-of-utterance silence threshold is 0.7 seconds and the minimum
+speech duration is 0.3 seconds. Barge-in still interrupts playback immediately.
 
 ## MiRA domain tools over LiveKit
 
-A trusted room participant such as MiRA's silent Python worker can register a
-bounded tool by publishing a `client:tool-register` JSON envelope on the
-`hermes-control` topic. Hermes validates the name and object input schema, adds
-the tool to its registry, targets `agent:tool-call` envelopes back to the owner,
-and waits for a matching `client:tool-result`. Registrations and results are
-control messages and do not need a fake text/content field.
+The plugin pre-registers stable schemas for `find_local_recommendations`,
+`get_current_trip_context`, and `manage_trip_itinerary`, so GUI/CLI, Discord,
+and LiveKit expose the same MiRA tool surface even before the LiveKit adapter is
+materialized. A trusted room participant such as MiRA's silent Python worker
+claims those bounded routes with a `client:tool-register` JSON envelope on the
+`hermes-control` topic. Hermes then targets `agent:tool-call` envelopes to that
+owner and waits for a matching `client:tool-result`. Registrations and results
+are control messages and do not need a fake text/content field.
 
 Registration is fail-closed: the production participant identity must begin
 with `agent-mira-knowledge-worker-`. LiveKit Agents 1.2.x local
@@ -123,9 +153,10 @@ these envelopes so an installed pre-fix adapter can also route them. Updated
 adapters dispatch on `type` and ignore that marker.
 
 MiRA uses this protocol for grounded recommendation retrieval and for a bounded
-current-context read. The latter returns current server time, an optional saved
-itinerary, latest consented Android context, and recent participant-labelled
-transcripts. The worker, not the LLM, injects the Tourism AI session ID and
+current-context read. The latter returns current server time, participant-local
+time, an optional saved itinerary, latest consented Android context, and recent
+participant-labelled transcripts. Hermes decides whether and when to call it.
+The worker, not the LLM, injects the Tourism AI session ID and
 holds the short-lived backend credential. Do not expose arbitrary HTTP, SQL,
 Cypher, shell, or filesystem tools through this protocol.
 
@@ -133,18 +164,17 @@ Cypher, shell, or filesystem tools through this protocol.
 gateway platform/user/session context from the adapter, never an account ID
 from the model. `revise` stores an editable draft; `confirm` requires the exact
 current revision and explicit traveller approval before the backend promotes it
-to the confirmed itinerary. The plugin loads the linked workspace before each
-turn and records the completed user/assistant turn afterward, allowing the
-draft, confirmed plan, and recent conversation to continue across Hermes
-sessions and explicitly configured gateway channels. An unlinked channel can
-be attached with the portal's 15-minute one-time code.
+to the confirmed itinerary. Hermes calls `load`, `link`, `revise`, or `confirm`
+when the conversation requires that action; there is no pre/post-turn planning
+hook. An unlinked channel can be attached with the portal's 15-minute one-time
+code.
 
 The `/trips` text box is a dedicated chat surface: pressing **Send** is an
 explicit Hermes invocation and does not require the `MiRA` voice wake term.
 The wake term still applies to ambient speech in a live room. The plugin
-declares `manage_trip_itinerary` in `plugin.yaml` and pre-registers it from
-`tools.py`, so Discord and other configured Hermes channels can discover the
-same tool even while the LiveKit adapter itself is deferred.
+declares all three MiRA tools in `plugin.yaml` and pre-registers them from
+`tools.py`, so Discord and other configured Hermes channels retain the same
+model-visible schemas even while the LiveKit adapter itself is deferred.
 
 ## One-click setup on Windows
 
@@ -197,28 +227,25 @@ file as `SOUL.md.mira.bak`.
 
 ## Evidence routes
 
-LiveKit sessions expose three preferred tourism evidence routes:
+LiveKit sessions expose optional tourism evidence routes:
 
-- `get_current_trip_context` - current time, optional itinerary, consented
+- `get_current_trip_context` - server and participant-local time, optional itinerary, consented
   location/device/social context, and recent room conversation;
 
 - `find_local_recommendations` — the authenticated MiRA graph/RAG route for
   curated, session-scoped tourism evidence;
 - `manage_trip_itinerary` - account linking plus conversational draft revision
   and explicit confirmation. A draft is not a saved itinerary;
-- `web_search` — Hermes's read-only online-search fallback for fresh facts or
-  locations not covered by the pilot graph.
+- Hermes web and MCP search capabilities for fresh facts or locations not
+  covered by the pilot graph.
 
-LiveKit also receives the same normal Hermes task and skill toolsets as Discord,
-so a spoken request can be completed rather than acknowledged and abandoned.
-Setup also adds the narrow `hermes-livekit` toolset to every explicitly
-configured Hermes gateway surface, allowing linked Discord, Telegram, or other
-channels to continue account planning while the trusted LiveKit worker remains
-connected.
-`no_mcp` remains explicit, preventing globally enabled MCP servers from
-silently entering a room. The tourism skill tells Hermes when to prefer the
-graph and when to fall back to online search, and requires source URLs for
-web-derived claims.
+Setup resolves the GUI/CLI toolset surface—including Hermes additions that are
+effective but not yet present in an older saved list—and persists that same
+selection for CLI, LiveKit, and configured Discord. It adds `hermes-livekit`
+and removes the old `no_mcp` sentinel, so globally enabled MCP servers follow
+Hermes's normal platform resolution.
+The tourism skill is registered for Hermes to load when useful; it is not
+concatenated into every voice prompt.
 
 ## Hermes YAML
 
@@ -226,8 +253,7 @@ The relevant section of `%LOCALAPPDATA%\hermes\config.yaml` is:
 
 ```yaml
 platform_toolsets:
-  livekit:
-    - hermes-livekit
+  cli: &hermes-conversation-tools
     - browser
     - clarify
     - code_execution
@@ -244,7 +270,9 @@ platform_toolsets:
     - tts
     - vision
     - web
-    - no_mcp
+    - hermes-livekit
+  livekit: *hermes-conversation-tools
+  discord: *hermes-conversation-tools
 
 platforms:
   livekit:
@@ -257,8 +285,8 @@ platforms:
       room: ${LIVEKIT_ROOM}
       agent_name: ${LIVEKIT_AGENT_NAME}
       audio:
-        silence_threshold_seconds: 1.5
-        min_speech_duration_seconds: 0.5
+        silence_threshold_seconds: 0.7
+        min_speech_duration_seconds: 0.3
         rms_silence_floor: 50
       vision:
         auto_attach: true
@@ -268,22 +296,19 @@ platforms:
           - test
           - hermes-image
       acknowledgements:
-        enabled: true
-        phrases:
-          - Let me look into that.
-          - One moment.
-          - Checking on that now.
-          - Give me a sec.
-          - On it.
+        enabled: false
       invocation:
         enabled: true
         keyterms:
           - Hermes
           - MiRA
         strip_keyterm: true
+        standalone_followup_seconds: 5.0
       transcription:
         history_max_entries: 80
         history_max_chars: 12000
+        prompt_max_entries: 12
+        prompt_max_chars: 3000
       remote_tools:
         allowed_names:
           - find_local_recommendations
@@ -325,10 +350,16 @@ isolated research room must be accepted, rerun setup with `-AllowAllUsers` after
 reviewing the room-token and participant-admission policy. Upgrades preserve an
 existing explicit `true` or `false` value.
 
-Set `acknowledgements.enabled: false` to disable tool acknowledgements, or edit
-the phrase list to match MiRA's voice. Restart the gateway after changing YAML.
+The setup keeps `acknowledgements.enabled: false` for the thin transport path.
 The setup changes the stock US Edge voice to the New Zealand English Molly
 voice, but preserves any custom voice or provider. It does not alter STT.
+
+To route Hermes-selected delegated subtasks and background title/compression
+work to the local LM Studio model without putting it in the foreground response
+path, run setup with
+`-ConfigureAuxiliaryModel`. The defaults target
+`qwythos-9b-claude-mythos-5-1m` at `http://127.0.0.1:1234/v1`; override them
+with `-AuxiliaryBaseUrl` and `-AuxiliaryModel` when needed.
 
 ## Validate
 
@@ -337,12 +368,13 @@ $hermes = "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\hermes.exe"
 & $hermes config check
 & $hermes gateway status
 & $hermes tools list --platform discord
+& $hermes plugins doctor --ci .\agents\hermes-livekit
 python -m unittest discover -s .\agents\hermes-livekit\tests -v
 ```
 
-The Discord tool listing must show the `hermes-livekit` toolset as enabled;
-`plugin.yaml` declares its `manage_trip_itinerary` tool. To exercise the same
-typed-data path used by `/trips` against a running local room:
+The Discord tool listing must show the `hermes-livekit` toolset with all three
+MiRA tools enabled. To exercise the same typed-data path used by `/trips`
+against a running local room:
 
 ```powershell
 $python = "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\python.exe"
@@ -360,9 +392,9 @@ gateway.
 A useful call check is:
 
 1. Ask a question that needs no tool. MiRA should answer directly.
-2. Ask a question that requires a tool. MiRA should speak one short cue when
-   the first tool starts, then deliver the answer.
-3. Ask a multi-tool question. The cue should still occur only once.
+2. Ask a question that requires a tool. The tool should start without a
+   separate acknowledgement turn, then MiRA should deliver the answer.
+3. Ask a multi-tool question. Hermes should choose and sequence the tools.
 4. Speak during playback. MiRA should stop and listen.
 5. While MiRA is working or speaking, use **Stop agent** and confirm playback
    stops immediately. Repeat with the microphone muted.
@@ -372,12 +404,18 @@ A useful call check is:
    preceding ambient transcript.
 8. Speak again without a keyterm. MiRA should remain quiet; repeat with a
    keyterm and confirm the correct participant name appears in context.
+9. With camera and screen share enabled, refer explicitly to each source in
+   separate turns. Confirm MiRA selects the current speaker's camera for the
+   camera request and the room screen-share for the screen request, and that the
+   gateway does not attempt voice transcription on a `.jpg` file.
+10. Ask for the current location, local time, itinerary, and a detail from the
+    earlier call. Confirm one answer can use all four bounded context sources.
 
 ## Runtime files
 
 - `adapter.py` — LiveKit transport, media, voice activity, hooks, and tools.
 - `__init__.py` — Hermes plugin registration and lifecycle hooks.
-- `tools.py` — discovery-time cross-platform itinerary tool registration.
+- `tools.py` — discovery-time cross-platform MiRA tool registration.
 - `configure_yaml.py` — atomic non-secret behavior configuration.
 - `assets/SOUL.md` — canonical MiRA conversational identity.
 - `skills/mira-new-zealand-tourism/SKILL.md` — grounded Aotearoa tourism procedure.

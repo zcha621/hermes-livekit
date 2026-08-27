@@ -12,7 +12,11 @@ param(
     [switch]$InstallHermes,
     [switch]$InstallFfmpeg,
     [switch]$RestartGateway,
-    [switch]$InstallAutoStart
+    [switch]$InstallAutoStart,
+    [switch]$ConfigureAuxiliaryModel,
+    [string]$AuxiliaryModel = "qwythos-9b-claude-mythos-5-1m",
+    [string]$AuxiliaryBaseUrl = "http://127.0.0.1:1234/v1",
+    [string]$AuxiliaryApiKey = "lm-studio"
 )
 
 $ErrorActionPreference = "Stop"
@@ -366,8 +370,27 @@ try {
         & $hermesExe config set platforms.livekit.extra.api_key '${LIVEKIT_API_KEY}'
         & $hermesExe config set platforms.livekit.extra.api_secret '${LIVEKIT_API_SECRET}'
         & $hermesExe config set platforms.livekit.extra.room '${LIVEKIT_ROOM}'
-        & $hermesExe config set platforms.livekit.extra.agent_name '${LIVEKIT_AGENT_NAME}'
-        & $pythonExe (Join-Path $targetPlugin "configure_yaml.py") --config $configPath
+        # Do not overwrite platforms.livekit.extra.agent_name on upgrades.
+        # The adapter uses LIVEKIT_AGENT_NAME as its fallback, while an explicit
+        # value may be managed by the MiRA web portal.
+        $yamlArguments = @(
+            (Join-Path $targetPlugin "configure_yaml.py"),
+            "--config",
+            $configPath,
+            "--hermes-root",
+            (Join-Path $HermesHome "hermes-agent")
+        )
+        if ($ConfigureAuxiliaryModel) {
+            $yamlArguments += @(
+                "--auxiliary-model",
+                $AuxiliaryModel,
+                "--auxiliary-base-url",
+                $AuxiliaryBaseUrl,
+                "--auxiliary-api-key",
+                $AuxiliaryApiKey
+            )
+        }
+        & $pythonExe @yamlArguments
         if ($LASTEXITCODE -ne 0) { throw "Hermes LiveKit YAML update failed." }
         & $hermesExe config set voice.auto_tts true
         & $hermesExe config set display.busy_input_mode interrupt
@@ -377,6 +400,8 @@ try {
 
         & $pythonExe -c "import livekit.rtc, livekit.api, PIL, yaml; print('Dependency check: OK')"
         if ($LASTEXITCODE -ne 0) { throw "Dependency import check failed." }
+        & $hermesExe plugins doctor --ci $targetPlugin
+        if ($LASTEXITCODE -ne 0) { throw "Hermes LiveKit plugin validation failed." }
         & $hermesExe config check
         if ($LASTEXITCODE -ne 0) { throw "Hermes configuration validation failed." }
 

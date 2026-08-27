@@ -9,20 +9,19 @@ import json
 import logging
 import os
 import re
+import uuid
 from pathlib import Path
 from typing import Optional
 
 try:
     from .adapter import (  # type: ignore[import-not-found]  # noqa: E402
         LIVE_ADAPTERS,
-        TOOLSET_NAME,
         LiveKitAdapter,
         check_livekit_requirements,
     )
 except ImportError:  # Direct-file test and legacy entry-point compatibility.
     from adapter import (  # noqa: E402
         LIVE_ADAPTERS,
-        TOOLSET_NAME,
         LiveKitAdapter,
         check_livekit_requirements,
     )
@@ -36,13 +35,55 @@ _TOURISM_SKILL_PATH = (
     _PLUGIN_ROOT / "skills" / "mira-new-zealand-tourism" / "SKILL.md"
 )
 
-_ACCOUNT_LINK_REQUEST = re.compile(
-    r"\b(?:link|connect)\b.{0,40}\b(?:account|profile)\b",
-    re.IGNORECASE,
-)
-_ACCOUNT_LINK_CODE = re.compile(
-    r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{16,128})(?![A-Za-z0-9_-])"
-)
+_FIND_LOCAL_RECOMMENDATIONS_SCHEMA = {
+    "name": "find_local_recommendations",
+    "description": (
+        "Search MiRA's grounded New Zealand tourism knowledge when local evidence "
+        "would improve the answer. Hermes decides whether the search is useful."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["query"],
+        "properties": {
+            "query": {"type": "string", "minLength": 2, "maxLength": 500},
+            "location": {"type": "string", "minLength": 2, "maxLength": 100},
+            "category": {"type": "string", "minLength": 2, "maxLength": 100},
+            "top_k": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20,
+                "default": 5,
+            },
+        },
+    },
+}
+
+_GET_CURRENT_TRIP_CONTEXT_SCHEMA = {
+    "name": "get_current_trip_context",
+    "description": (
+        "Get current server and participant-local time, saved itinerary, consented "
+        "location/device/social context, and recent participant-labelled conversation. "
+        "Hermes decides whether these live facts are relevant to the current request."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "participant_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Optional participant UUID; omit for all consented participants.",
+            },
+            "transcript_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 30,
+                "default": 12,
+            },
+        },
+    },
+}
 
 _MANAGE_TRIP_ITINERARY_SCHEMA = {
     "name": "manage_trip_itinerary",
@@ -128,20 +169,120 @@ _MANAGE_TRIP_ITINERARY_SCHEMA = {
     },
 }
 
+_TEXT_TOOL_CALL_RE = re.compile(
+    r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
+    re.IGNORECASE | re.DOTALL,
+)
 
-def _skill_body(path: Path) -> str:
-    """Load a bundled skill body without its YAML frontmatter."""
+
+def _qwen_realtime_request_middleware(**kwargs):
+    """Put Spark's native non-thinking flag on realtime LiveKit requests."""
+    if str(kwargs.get("platform") or "").lower() != "livekit":
+        return None
+    if "qwen3" not in str(kwargs.get("model") or "").lower():
+        return None
+    request = kwargs.get("request")
+    if not isinstance(request, dict):
+        return None
+    updated = dict(request)
+    current_extra_body = updated.get("extra_body")
+    extra_body = (
+        dict(current_extra_body) if isinstance(current_extra_body, dict) else {}
+    )
+    extra_body["enable_thinking"] = False
+    updated["extra_body"] = extra_body
+
+    messages = updated.get("messages")
+    if isinstance(messages, list):
+        rewritten_messages = list(messages)
+        for index in range(len(rewritten_messages) - 1, -1, -1):
+            message = rewritten_messages[index]
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            rewritten = dict(message)
+            content = rewritten.get("content")
+            if isinstance(content, str):
+                if "/no_think" not in content:
+                    rewritten["content"] = content.rstrip() + "\n\n/no_think"
+            elif isinstance(content, list):
+                parts = list(content)
+                parts.append({"type": "text", "text": "/no_think"})
+                rewritten["content"] = parts
+            rewritten_messages[index] = rewritten
+            break
+        updated["messages"] = rewritten_messages
+    return {
+        "request": updated,
+        "reason": "livekit_qwen_realtime_nonthinking",
+    }
+
+
+def _on_post_api_request_hook(**kwargs) -> None:
+    """Normalize Qwen's text-encoded tool decision before Hermes dispatch.
+
+    The Spark Qwen3-VL chat template can emit a correct ``<tool_call>`` JSON
+    block while its OpenAI-compatible server leaves ``message.tool_calls``
+    empty. Hermes otherwise strips the block as non-user-facing markup and
+    retries the whole model request. This hook translates only that existing
+    model decision into Hermes's canonical response type; tool selection,
+    registry validation, approval, and execution remain owned by Hermes.
+    """
+    if str(kwargs.get("platform") or "").lower() not in {"livekit", "discord"}:
+        return
+    if "qwen3" not in str(kwargs.get("model") or "").lower():
+        return
+    assistant_message = kwargs.get("assistant_message")
+    if assistant_message is None or getattr(assistant_message, "tool_calls", None):
+        return
+    content = getattr(assistant_message, "content", None)
+    if not isinstance(content, str) or "<tool_call>" not in content.lower():
+        return
+
     try:
-        content = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
-    if not content.startswith("---"):
-        return content
-    parts = content.split("---", 2)
-    return parts[2].strip() if len(parts) == 3 else content
+        from agent.transports.types import ToolCall
+    except Exception:
+        logger.debug("Qwen text tool-call compatibility type unavailable", exc_info=True)
+        return
 
+    tool_calls = []
+    valid_matches = []
+    for match in _TEXT_TOOL_CALL_RE.finditer(content):
+        try:
+            payload = json.loads(match.group(1))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        name = str(payload.get("name") or "").strip()
+        arguments = payload.get("arguments")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:-]{0,127}", name):
+            continue
+        if not isinstance(arguments, dict):
+            continue
+        tool_calls.append(
+            ToolCall(
+                id=f"call_{uuid.uuid4().hex[:24]}",
+                name=name,
+                arguments=json.dumps(arguments, ensure_ascii=False),
+            )
+        )
+        valid_matches.append(match)
 
-def _on_session_finalize_hook(**kwargs) -> None:
+    if not tool_calls:
+        return
+    visible = content
+    for match in reversed(valid_matches):
+        visible = visible[: match.start()] + visible[match.end() :]
+    assistant_message.content = visible.strip() or None
+    assistant_message.tool_calls = tool_calls
+    assistant_message.finish_reason = "tool_calls"
+    logger.info(
+        "normalized %d Qwen text tool call(s) for %s",
+        len(tool_calls),
+        str(kwargs.get("platform") or "?"),
+    )
+
+def _on_session_finalize_hook(session_id="", **kwargs) -> None:
     """Cancel pending remote tool calls when the user resets the session.
 
     Hermes fires ``on_session_finalize`` from ``_handle_reset_command`` —
@@ -159,66 +300,8 @@ def _on_session_finalize_hook(**kwargs) -> None:
             logger.debug("session-finalize cleanup failed for %s: %s", adapter, exc)
 
 
-def _livekit_source(event):
-    source = getattr(event, "source", None)
-    platform = getattr(getattr(source, "platform", None), "value", "")
-    return source if platform == "livekit" else None
-
-
-def _on_pre_gateway_dispatch_hook(event=None, session_store=None, **kwargs) -> None:
-    """Bind a new LiveKit turn to Hermes's canonical session ID."""
-    source = _livekit_source(event)
-    if source is None or session_store is None:
-        return
-    try:
-        session_id = session_store.get_or_create_session(source).session_id
-    except Exception as exc:
-        logger.debug("could not bind LiveKit acknowledgement session: %s", exc)
-        return
-
-    chat_id = str(getattr(source, "chat_id", "") or "")
-    for adapter in list(LIVE_ADAPTERS):
-        if not chat_id or adapter._room_name == chat_id:
-            adapter.bind_tool_acknowledgement_session(session_id)
-
-
-def _on_pre_tool_call_hook(
-    session_id="", turn_id="", tool_call_id="", **kwargs
-) -> None:
-    """Mirror Discord: acknowledge once, immediately before the first tool."""
-    for adapter in list(LIVE_ADAPTERS):
-        adapter.schedule_tool_acknowledgement(
-            session_id=session_id,
-            turn_id=turn_id,
-            tool_call_id=tool_call_id,
-        )
-
-
-def _dispatch_account_workspace(arguments: dict, *, session_id: str = "") -> dict | None:
-    """Call the trusted worker tool without exposing account identifiers to the model."""
-    try:
-        from tools.registry import registry
-
-        result = registry.dispatch(
-            "manage_trip_itinerary",
-            arguments,
-            session_id=session_id,
-        )
-        if isinstance(result, str):
-            parsed = json.loads(result)
-            return (
-                parsed
-                if isinstance(parsed, dict) and not isinstance(parsed.get("error"), str)
-                else None
-            )
-    except Exception as exc:
-        logger.debug("account workspace bridge unavailable: %s", exc)
-    return None
-
-
-async def _route_account_planning_tool(arguments=None, **kwargs):
-    """Route the host-registered itinerary tool to its trusted room worker."""
-    tool_name = "manage_trip_itinerary"
+async def _route_remote_tool(tool_name, arguments=None, **kwargs):
+    """Route a stable Hermes tool surface to its trusted LiveKit data worker."""
     for adapter in list(LIVE_ADAPTERS):
         owner = adapter._tool_owners.get(tool_name)
         if not owner:
@@ -228,115 +311,38 @@ async def _route_account_planning_tool(arguments=None, **kwargs):
     return json.dumps(
         {
             "error": (
-                "MiRA's itinerary worker is temporarily unavailable. "
+                f"MiRA's data worker for {tool_name} is temporarily unavailable. "
                 "Please retry after the live services reconnect."
             )
         }
     )
 
 
-def _on_pre_llm_account_context(
-    session_id="", user_message="", **_kwargs
-) -> dict | None:
-    workspace = _dispatch_account_workspace({"action": "load"}, session_id=session_id)
-    if not workspace:
-        return None
-    if workspace.get("linked") is not True:
-        message = str(user_message)
-        code_match = _ACCOUNT_LINK_CODE.search(message)
-        if _ACCOUNT_LINK_REQUEST.search(message) and code_match:
-            linked = _dispatch_account_workspace(
-                {"action": "link", "link_code": code_match.group(1)},
-                session_id=session_id,
-            )
-            if linked and linked.get("linked") is True:
-                workspace = linked
-            else:
-                return {
-                    "context": (
-                        "MiRA attempted the requested registered-account link, but the "
-                        "one-time code was invalid, expired, or already used. Ask the "
-                        "traveller to create a fresh code on the MiRA itinerary page."
-                    )
-                }
-
-    if workspace.get("linked") is not True:
-        planning_terms = ("itinerary", "trip", "travel", "plan", "link code")
-        if not any(term in str(user_message).lower() for term in planning_terms):
-            return None
-        return {
-            "context": (
-                "This Hermes channel is not linked to a registered MiRA account. "
-                "For account-wide itinerary continuity, ask the traveller to create a "
-                "one-time channel code on the MiRA itinerary page and paste it here; then "
-                "call manage_trip_itinerary with action=link and that exact code."
-            )
-        }
-    compact = json.dumps(workspace, ensure_ascii=False, separators=(",", ":"))
-    return {
-        "context": (
-            "MiRA registered-account planning context (shared across Hermes sessions and "
-            "channels). A `draft` is editable and NOT saved/confirmed. An `itinerary` is the "
-            "last explicitly confirmed plan. Recent cross-channel conversation is included. "
-            "Use manage_trip_itinerary to revise a full structured draft, and only confirm the "
-            "exact current draft revision after an explicit user approval.\n" + compact
-        )
-    }
-
-
-def _on_post_llm_account_turn(
-    session_id="",
-    turn_id="",
-    user_message="",
-    assistant_response="",
-    **_kwargs,
-) -> None:
-    if not all((session_id, turn_id, user_message, assistant_response)):
-        return
-    _dispatch_account_workspace(
-        {
-            "action": "record_turn",
-            "turn_id": str(turn_id),
-            "user_message": str(user_message),
-            "assistant_message": str(assistant_response),
-        },
-        session_id=str(session_id),
+async def _route_local_recommendations_tool(arguments=None, **kwargs):
+    return await _route_remote_tool(
+        "find_local_recommendations", arguments, **kwargs
     )
 
-_LIVEKIT_PLATFORM_HINT = """You are MiRA on LiveKit, a travel companion for people on live video calls with remote family or friends.
 
-Primary goal: help the user stay natural, helpful, and present during the call. Give practical travel guidance, conversational support, local suggestions, itinerary ideas, and help with what to say or do next.
+async def _route_current_trip_context_tool(arguments=None, **kwargs):
+    return await _route_remote_tool(
+        "get_current_trip_context", arguments, **kwargs
+    )
 
-Interaction rules:
-- Do not narrate routine internal work or add a generic acknowledgement to every turn. The voice adapter supplies one brief cue only when the first tool actually starts.
-- When a request needs a tool, call the tool in the same turn and continue through its result. Never end a turn with a holding sentence such as "I'll search", "give me a moment", or "let me gather details" without actually making the tool call.
-- LiveKit has Hermes's normal task and skill tools. Use them when the request requires them; do not claim that tools or skills are unavailable merely because this is a voice session.
-- Prefer concise, spoken-friendly answers. Keep wording natural and easy to say aloud.
-- Use text for quick confirmations, links, addresses, code, or details that are easier to read than hear.
-- Avoid heavy markdown or long lists unless the user explicitly asks for them.
-- If a tool, image, video, phone state, or other context signal is unavailable, do not pretend it exists. Be explicit about what you can and cannot verify.
-- Ask one short clarifying question only when needed; otherwise make a reasonable travel-oriented recommendation.
 
-Context-aware behavior:
-- Call `get_current_trip_context` before guidance that depends on the current time, phone location, participant conversation, or a saved itinerary. Refresh it when circumstances may have changed.
-- A saved itinerary is optional session context, never a prerequisite. If it is absent, converse from the current time, available location/device/social context, participant conversation, and relevant media instead.
-- Itinerary creation is conversational. Use `manage_trip_itinerary` action=revise to keep a complete structured draft as requirements change. Never claim a draft is saved and never call action=confirm until the traveller explicitly approves the current draft; pass its exact revision when confirming.
-- The registered-account planning context and conversation can follow a linked traveller across LiveKit, Discord, and other Hermes gateway sessions. If a channel is unlinked, help the traveller use the one-time code from the MiRA itinerary page.
-- A recent camera or shared-screen frame may be attached to a user turn. Use it when relevant, distinguish observation from inference, and do not claim to see anything when no image is attached.
-- When phone usage or call state is relevant later, favor actions that fit a live call setting: short replies, quick guidance, and minimal interruption.
+async def _route_account_planning_tool(arguments=None, **kwargs):
+    return await _route_remote_tool(
+        "manage_trip_itinerary", arguments, **kwargs
+    )
 
-Style:
-- Sound warm, calm, and confident.
-- Do not over-explain unless asked.
-- Keep voice replies short enough to feel natural in a live conversation.
-- You can send text messages alongside voice replies when that helps clarity."""
-
-_TOURISM_GUIDANCE = _skill_body(_TOURISM_SKILL_PATH)
-if _TOURISM_GUIDANCE:
-    # Platform hints are a stable prompt layer. Including the read-only bundled
-    # skill here gives every LiveKit session the same tourism operating guidance
-    # without exposing Hermes's general skill discovery or skill-write tools.
-    _LIVEKIT_PLATFORM_HINT += "\n\n" + _TOURISM_GUIDANCE
+_LIVEKIT_PLATFORM_HINT = """This conversation arrived through LiveKit. Speech is
+already transcribed, and a recent camera or shared-screen frame may be attached
+when the participant explicitly refers to visual context. The bounded MiRA
+context, itinerary, and tourism tools are optional capabilities alongside
+Hermes's normal tools, skills, and MCP servers. Decide whether and when to use
+them exactly as in any other Hermes conversation. For this realtime Qwen route,
+respond without extended reasoning so a selected tool can start immediately.
+/no_think"""
 
 
 def _env_enablement() -> Optional[dict]:
@@ -359,9 +365,14 @@ def _env_enablement() -> Optional[dict]:
         "api_key": api_key,
         "api_secret": api_secret,
         "room": room,
-        "agent_name": os.getenv("LIVEKIT_AGENT_NAME", "Hermes"),
         "agent_avatar": os.getenv("LIVEKIT_AGENT_AVATAR", ""),
     }
+
+    # Do not seed agent_name here. Hermes applies this mapping with
+    # ``PlatformConfig.extra.update()``, so an environment fallback would
+    # overwrite the explicit platforms.livekit.extra.agent_name saved by the
+    # MiRA portal. LiveKitAdapter already falls back to LIVEKIT_AGENT_NAME when
+    # no configured value exists.
 
     # LiveKit's adapter only ever joins one room, so the room IS the home
     # channel by definition. Default LIVEKIT_HOME_CHANNEL to LIVEKIT_ROOM
@@ -462,31 +473,16 @@ def register(ctx) -> None:
         platform_hint=_LIVEKIT_PLATFORM_HINT,
     )
 
-    # Keep the guidance available as a namespaced read-only plugin skill for
-    # CLI inspection. LiveKit receives the same content in its platform hint,
-    # so the voice surface does not need skill discovery or write tools.
+    # Register the domain guidance as a normal Hermes skill. It is deliberately
+    # not injected into every LiveKit prompt: Hermes decides when to load it.
     try:
         ctx.register_skill("mira-new-zealand-tourism", _TOURISM_SKILL_PATH)
     except Exception as exc:
         logger.debug("tourism skill registration failed: %s", exc)
 
-    # Keep client-offered tools in their own narrow dynamic toolset. Hermes's
-    # host-managed task/skill toolsets are selected separately by
-    # ``platform_toolsets.livekit``; global MCP inheritance remains disabled
-    # there with ``no_mcp``.
-    try:
-        from toolsets import TOOLSETS
-        TOOLSETS["hermes-livekit"] = {
-            "description": "MiRA LiveKit tools supplied by the trusted room worker",
-            "tools": [],
-            "includes": [TOOLSET_NAME],
-        }
-    except Exception:
-        logger.exception("could not register the trusted-worker LiveKit toolset")
-
-    # Register account planning through the supported plugin API. tools.py and
-    # plugin.yaml also pre-register it while this platform is deferred, which
-    # keeps the tool available to Discord, CLI, and other Hermes surfaces.
+    # Register stable MiRA tool schemas through the supported plugin API.
+    # tools.py and plugin.yaml also pre-register them while this platform is
+    # deferred, so Discord and GUI turns retain the same model-visible surface.
     try:
         try:
             from .tools import register_tools
@@ -496,19 +492,14 @@ def register(ctx) -> None:
     except Exception:
         logger.exception("could not register the account itinerary tool")
 
-    # Match Hermes Discord voice behavior: arm the LiveKit turn at gateway
-    # dispatch and speak one cue only on the first actual tool invocation.
+    # No backend orchestration hooks are registered. LiveKit and Discord use
+    # Hermes's normal model loop, and context/action calls occur only when
+    # Hermes selects a registered tool. The post-API hook only normalizes the
+    # configured Qwen server's text-encoded tool-call wire format; the lifecycle
+    # hook releases in-flight futures during reset.
     try:
-        ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch_hook)
-        ctx.register_hook("pre_tool_call", _on_pre_tool_call_hook)
-        ctx.register_hook("pre_llm_call", _on_pre_llm_account_context)
-        ctx.register_hook("post_llm_call", _on_post_llm_account_turn)
-    except Exception as exc:
-        logger.debug("acknowledgement hook registration failed: %s", exc)
-
-    # Cancel remote-tool futures at session boundaries. Regular spoken
-    # interruption is handled by Hermes's busy_input_mode=interrupt path.
-    try:
+        ctx.register_middleware("llm_request", _qwen_realtime_request_middleware)
+        ctx.register_hook("post_api_request", _on_post_api_request_hook)
         ctx.register_hook("on_session_finalize", _on_session_finalize_hook)
     except Exception as exc:
         logger.debug("hook registration failed: %s", exc)

@@ -148,6 +148,54 @@ class AdapterTests(unittest.TestCase):
 
         self.assertEqual(topic, "Rotorua family walks")
 
+    def test_source_chat_id_uses_bounded_call_fallback_without_metadata(self):
+        with patch.object(
+            self.adapter, "_participant_connection_metadata", return_value={}
+        ):
+            alice_first = self.adapter._source_chat_id("alice")
+            alice_followup = self.adapter._source_chat_id("alice")
+            bob = self.adapter._source_chat_id("bob")
+
+        self.assertEqual(alice_first, alice_followup)
+        self.assertNotEqual(alice_first, bob)
+        self.assertTrue(alice_first.startswith("test-room:call:"))
+        self.assertNotEqual(alice_first, "test-room")
+
+        self.adapter._reset_room_context()
+        with patch.object(
+            self.adapter, "_participant_connection_metadata", return_value={}
+        ):
+            self.assertNotEqual(alice_first, self.adapter._source_chat_id("alice"))
+
+    def test_source_chat_id_prefers_trusted_portal_conversation_id(self):
+        with patch.object(
+            self.adapter,
+            "_participant_connection_metadata",
+            return_value={"mira_conversation_id": "call-20260827-a"},
+        ):
+            result = self.adapter._source_chat_id("alice")
+
+        self.assertEqual(
+            result, "test-room:conversation:call-20260827-a"
+        )
+
+    def test_model_prompt_uses_only_bounded_recent_room_transcript(self):
+        for index in range(20):
+            self.adapter._append_transcript(
+                role="user",
+                identity="alice",
+                name="Alice",
+                text=f"utterance-{index}",
+                invoked=index == 19,
+            )
+
+        context = self.adapter._transcript_context()
+
+        self.assertNotIn("[8] Alice (user): utterance-7", context)
+        self.assertIn("[9] Alice (user): utterance-8", context)
+        self.assertIn("utterance-19", context)
+        self.assertEqual(context.count("Alice (user)"), 12)
+
     def test_latest_video_frame_prefers_sender_and_writes_unique_snapshot(self):
         now = time.monotonic()
         self.adapter._video_track_meta = {
@@ -168,6 +216,48 @@ class AdapterTests(unittest.TestCase):
         os.unlink(path)
         self.adapter._pending_captures.clear()
 
+    def test_visual_source_cues_select_screen_or_current_speaker_camera(self):
+        now = time.monotonic()
+        self.adapter._video_track_meta = {
+            "alice-camera": ("alice", "source_camera"),
+            "alice-screen": ("alice", "source_screenshare"),
+            "bob-camera": ("bob", "source_camera"),
+        }
+        self.adapter._latest_video_frames = {
+            "alice-camera": (b"alice-camera", now, "source_camera", 640, 480),
+            "alice-screen": (b"alice-screen", now - 0.2, "source_screenshare", 1280, 720),
+            "bob-camera": (b"bob-camera", now + 0.2, "source_camera", 640, 480),
+        }
+
+        screen = self.adapter._latest_frame_for_identity(
+            "alice", preferred_source=self.adapter._preferred_video_source(
+                "What is on the shared screen?"
+            )
+        )
+        camera = self.adapter._latest_frame_for_identity(
+            "alice", preferred_source=self.adapter._preferred_video_source(
+                "What can you see in my camera?"
+            )
+        )
+
+        self.assertEqual(screen[0], b"alice-screen")
+        self.assertEqual(camera[0], b"alice-camera")
+
+    def test_camera_cue_never_falls_back_to_another_participant(self):
+        now = time.monotonic()
+        self.adapter._video_track_meta = {
+            "bob-camera": ("bob", "source_camera"),
+        }
+        self.adapter._latest_video_frames = {
+            "bob-camera": (b"bob-camera", now, "source_camera", 640, 480),
+        }
+
+        result = self.adapter._latest_frame_for_identity(
+            "alice", preferred_source="camera"
+        )
+
+        self.assertIsNone(result)
+
     def test_video_source_name_is_stable_for_unknown_sdk_value(self):
         publication = SimpleNamespace(source="SOURCE_SCREENSHARE")
         source = livekit_adapter.LiveKitAdapter._video_source_name(publication)
@@ -179,9 +269,10 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(self.adapter._should_attach_video("Can you see my face?"))
         self.assertTrue(self.adapter._should_attach_video("Which button should I tap?"))
 
-    def test_voice_defaults_match_discord_turn_timing(self):
-        self.assertEqual(self.adapter._silence_threshold_seconds, 1.5)
-        self.assertEqual(self.adapter._min_speech_duration_seconds, 0.5)
+    def test_voice_defaults_prioritize_low_latency(self):
+        self.assertEqual(self.adapter._silence_threshold_seconds, 0.7)
+        self.assertEqual(self.adapter._min_speech_duration_seconds, 0.3)
+        self.assertFalse(self.adapter._ack_enabled)
         self.assertEqual(
             self.adapter._ack_phrases,
             livekit_adapter.DEFAULT_ACK_PHRASES,
@@ -218,6 +309,7 @@ class AdapterTests(unittest.TestCase):
         loop = Loop()
         self.adapter._room = object()
         self.adapter._event_loop = loop
+        self.adapter._ack_enabled = True
         self.adapter._tool_ack_pending = True
         self.adapter.bind_tool_acknowledgement_session("livekit-session")
 
@@ -246,6 +338,34 @@ class AdapterTests(unittest.TestCase):
             self.adapter.prepare_tts_text(text),
             "I'll check that.\n\nI found two options.",
         )
+
+    def test_prepare_tts_text_strips_thinking_and_keeps_final_answer(self):
+        text = (
+            "<think>First I should inspect the available tools.</think>"
+            "The Viaduct has several good lunch options."
+        )
+
+        self.assertEqual(
+            self.adapter.prepare_tts_text(text),
+            "The Viaduct has several good lunch options.",
+        )
+
+    def test_prepare_tts_text_does_not_speak_reasoning_only_fallback(self):
+        text = (
+            "\N{WARNING SIGN}\N{VARIATION SELECTOR-16} The model produced only "
+            "internal reasoning and no final answer, despite retries and fallback. "
+            "Its last reasoning, which may contain the answer:\n\n"
+            "I should inspect the user's profile and decide which tool to call."
+        )
+
+        self.assertEqual(
+            self.adapter.prepare_tts_text(text),
+            livekit_adapter.REASONING_ONLY_SPOKEN_FAILURE,
+        )
+        self.assertNotIn(
+            "inspect the user's profile", self.adapter._prepared_tts_text
+        )
+        self.assertEqual(self.adapter._prepared_tts_source, text)
 
 
 class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
@@ -422,6 +542,73 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.adapter._transcript_context(),
         )
 
+    async def test_spoken_visual_turn_routes_jpeg_as_image_not_voice_attachment(self):
+        now = time.monotonic()
+        self.adapter._video_track_meta = {
+            "alice-camera": ("alice", "camera"),
+        }
+        self.adapter._latest_video_frames = {
+            "alice-camera": (b"camera-jpeg", now, "camera", 640, 480),
+        }
+
+        event = self.adapter._build_spoken_transcript_event(
+            "MiRA, what can you see in my camera?", "alice"
+        )
+
+        self.assertEqual(event.message_type, livekit_adapter.MessageType.TEXT)
+        self.assertTrue(event.metadata["livekit_spoken_transcript"])
+        self.assertTrue(event.metadata["media_already_transcribed"])
+        self.assertEqual(event.media_types, ["image/jpeg"])
+        self.assertEqual(Path(event.media_urls[0]).read_bytes(), b"camera-jpeg")
+        os.unlink(event.media_urls[0])
+
+    async def test_spoken_text_event_still_publishes_native_transcription(self):
+        publish_transcription = AsyncMock()
+        self.adapter._room = SimpleNamespace(
+            remote_participants={"alice": SimpleNamespace(name="Alice")},
+            local_participant=SimpleNamespace(
+                set_attributes=AsyncMock(),
+                publish_transcription=publish_transcription,
+            ),
+        )
+        self.adapter._audio_track_sids["alice"] = "TR-user"
+        event = self.adapter._build_spoken_transcript_event(
+            "MiRA, use the live context", "alice"
+        )
+
+        with patch.object(
+            livekit_adapter.BasePlatformAdapter, "handle_message", AsyncMock()
+        ):
+            await self.adapter.handle_message(event)
+
+        publish_transcription.assert_awaited_once()
+        self.assertEqual(
+            publish_transcription.await_args.args[0].participant_identity, "alice"
+        )
+
+    async def test_send_voice_routes_auto_tts_to_livekit_audio_track(self):
+        expected = livekit_adapter.SendResult(success=True, message_id="tts-1")
+
+        with patch.object(
+            self.adapter, "play_tts", AsyncMock(return_value=expected)
+        ) as play_tts:
+            result = await self.adapter.send_voice(
+                "test-room",
+                "reply.mp3",
+                caption="The camera shows test code 7429.",
+                reply_to="turn-1",
+                metadata={"source": "auto-tts"},
+            )
+
+        self.assertIs(result, expected)
+        play_tts.assert_awaited_once_with(
+            "test-room",
+            "reply.mp3",
+            reply_to="turn-1",
+            metadata={"source": "auto-tts"},
+            caption="The camera shows test code 7429.",
+        )
+
     async def test_tts_speech_is_logged_once_and_reused_as_future_context(self):
         publish_transcription = AsyncMock()
         local_participant = SimpleNamespace(
@@ -458,13 +645,20 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(publish_transcription.await_count, 1)
         self.assertIn(response, self.adapter._transcript_context())
 
-    async def test_standalone_keyterm_invokes_without_empty_llm_turn(self):
+    async def test_standalone_keyterm_arms_same_participant_followup(self):
         self.adapter._room = SimpleNamespace(
             remote_participants={"alice": SimpleNamespace(name="Alice")},
             local_participant=SimpleNamespace(set_attributes=AsyncMock()),
         )
-        event = livekit_adapter.MessageEvent(
+        wake = livekit_adapter.MessageEvent(
             text="MiRA",
+            message_type=livekit_adapter.MessageType.VOICE,
+            source=self.adapter.build_source(
+                chat_id="test-room", chat_type="group", user_id="alice"
+            ),
+        )
+        question = livekit_adapter.MessageEvent(
+            text="Can you see my face in the camera?",
             message_type=livekit_adapter.MessageType.VOICE,
             source=self.adapter.build_source(
                 chat_id="test-room", chat_type="group", user_id="alice"
@@ -472,14 +666,77 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch.object(self.adapter, "_publish_agent_event", AsyncMock()) as published:
-            accepted = await self.adapter._prepare_invoked_event(event)
+            wake_accepted = await self.adapter._prepare_invoked_event(wake)
+            question_accepted = await self.adapter._prepare_invoked_event(question)
 
-        self.assertFalse(accepted)
-        self.assertFalse(self.adapter._conversation_is_active())
+        self.assertFalse(wake_accepted)
+        self.assertTrue(question_accepted)
+        self.assertTrue(self.adapter._conversation_is_active())
+        self.assertEqual(question.text, "Can you see my face in the camera?")
+        self.assertNotIn("alice", self.adapter._armed_participant_wakes)
         published.assert_any_await(
             "agent:invoked",
             {"identity": "alice", "name": "Alice", "keyterm": "MiRA"},
         )
+
+    async def test_standalone_keyterm_cannot_be_consumed_by_another_participant(self):
+        self.adapter._room = SimpleNamespace(
+            remote_participants={
+                "alice": SimpleNamespace(name="Alice"),
+                "bob": SimpleNamespace(name="Bob"),
+            },
+            local_participant=SimpleNamespace(set_attributes=AsyncMock()),
+        )
+        wake = livekit_adapter.MessageEvent(
+            text="MiRA",
+            message_type=livekit_adapter.MessageType.VOICE,
+            source=self.adapter.build_source(
+                chat_id="test-room", chat_type="group", user_id="alice"
+            ),
+        )
+        bob = livekit_adapter.MessageEvent(
+            text="What should we do?",
+            message_type=livekit_adapter.MessageType.VOICE,
+            source=self.adapter.build_source(
+                chat_id="test-room", chat_type="group", user_id="bob"
+            ),
+        )
+
+        with patch.object(self.adapter, "_publish_agent_event", AsyncMock()):
+            self.assertFalse(await self.adapter._prepare_invoked_event(wake))
+            self.assertFalse(await self.adapter._prepare_invoked_event(bob))
+
+        self.assertIn("alice", self.adapter._armed_participant_wakes)
+
+    async def test_standalone_keyterm_followup_expires(self):
+        self.adapter._room = SimpleNamespace(
+            remote_participants={"alice": SimpleNamespace(name="Alice")},
+            local_participant=SimpleNamespace(set_attributes=AsyncMock()),
+        )
+        wake = livekit_adapter.MessageEvent(
+            text="MiRA",
+            message_type=livekit_adapter.MessageType.VOICE,
+            source=self.adapter.build_source(
+                chat_id="test-room", chat_type="group", user_id="alice"
+            ),
+        )
+        late_question = livekit_adapter.MessageEvent(
+            text="What should we do?",
+            message_type=livekit_adapter.MessageType.VOICE,
+            source=self.adapter.build_source(
+                chat_id="test-room", chat_type="group", user_id="alice"
+            ),
+        )
+
+        with patch.object(self.adapter, "_publish_agent_event", AsyncMock()):
+            self.assertFalse(await self.adapter._prepare_invoked_event(wake))
+            self.adapter._armed_participant_wakes["alice"] = ("MiRA", 10.0)
+            with patch.object(livekit_adapter.time, "monotonic", return_value=16.0):
+                self.assertFalse(
+                    await self.adapter._prepare_invoked_event(late_question)
+                )
+
+        self.assertNotIn("alice", self.adapter._armed_participant_wakes)
 
     async def test_thinking_state_publishes_standard_and_rich_status(self):
         set_attributes = AsyncMock()
@@ -620,27 +877,28 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
             json.loads(result), {"linked": True, "draft": {"revision": 4}}
         )
 
-    async def test_account_tool_registration_keeps_host_registered_handler(self):
+    async def test_mira_tool_registration_keeps_host_registered_handler(self):
         owner = "agent-mira-knowledge-worker-12345678"
         self.adapter._room = SimpleNamespace(
             remote_participants={owner: SimpleNamespace(kind=4)}
         )
-        message = {
-            "name": "manage_trip_itinerary",
-            "description": "Account itinerary planning",
-            "input_schema": {"type": "object"},
-        }
+        for name in livekit_adapter.DEFAULT_REMOTE_TOOL_NAMES:
+            message = {
+                "name": name,
+                "description": "MiRA data tool",
+                "input_schema": {"type": "object"},
+            }
 
-        with (
-            patch("tools.registry.registry.register") as register,
-            patch.object(self.adapter, "_publish_typed", AsyncMock()) as published,
-        ):
-            await self.adapter._register_client_tool(message, owner)
+            with (
+                patch("tools.registry.registry.register") as register,
+                patch.object(self.adapter, "_publish_typed", AsyncMock()) as published,
+            ):
+                await self.adapter._register_client_tool(message, owner)
 
-        register.assert_not_called()
-        self.assertEqual(self.adapter._tool_owners["manage_trip_itinerary"], owner)
-        self.assertIn("manage_trip_itinerary", self.adapter._client_tools[owner])
-        self.assertTrue(published.await_args.args[0]["success"])
+            register.assert_not_called()
+            self.assertEqual(self.adapter._tool_owners[name], owner)
+            self.assertIn(name, self.adapter._client_tools[owner])
+            self.assertTrue(published.await_args.args[0]["success"])
 
     async def test_remote_tool_registration_rejects_non_allowlisted_tool(self):
         message = {
@@ -655,7 +913,7 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         published.assert_awaited_once()
         self.assertEqual(published.await_args.args[0]["reason"], "tool-not-allowed")
 
-    async def test_simulated_worker_registration_requires_agent_kind(self):
+    async def test_simulated_worker_registration_uses_stable_host_handler(self):
         identity = "simulated-agent-af292dcc9e40"
         self.adapter._room = SimpleNamespace(
             remote_participants={
@@ -669,13 +927,12 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with (
-            patch.object(livekit_adapter, "TOOLSET_NAME", "hermes-livekit-tools"),
             patch("tools.registry.registry.register") as register,
             patch.object(self.adapter, "_publish_typed", AsyncMock()) as published,
         ):
             await self.adapter._register_client_tool(message, identity)
 
-        register.assert_called_once()
+        register.assert_not_called()
         self.assertTrue(published.await_args.args[0]["success"])
 
     async def test_simulated_worker_accepts_livekit_numeric_agent_kind(self):

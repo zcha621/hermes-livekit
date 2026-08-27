@@ -4,26 +4,17 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import tempfile
 from pathlib import Path
 
 import yaml
 
 
-ACKNOWLEDGEMENT_PHRASES = [
-    "Let me look into that.",
-    "One moment.",
-    "Checking on that now.",
-    "Give me a sec.",
-    "On it.",
-]
 INVOCATION_KEYTERMS = ["Hermes", "MiRA"]
-# LiveKit is a full Hermes conversation surface, just like Discord.  Keep the
-# platform-specific MiRA tool and Hermes's normal task/skill toolsets together
-# so a voice request can actually be completed instead of ending with a
-# holding sentence.  ``no_mcp`` remains explicit: enabled global MCP servers
-# must not silently leak into a room.
-LIVEKIT_TOOLSETS = [
+# Fallback only for a config that has no CLI/Discord selection to copy. Normal
+# setup derives LiveKit and Discord from the user's CLI (Hermes GUI) toolsets.
+DEFAULT_HERMES_CONVERSATION_TOOLSETS = [
     "hermes-livekit",
     "browser",
     "clarify",
@@ -41,9 +32,7 @@ LIVEKIT_TOOLSETS = [
     "tts",
     "vision",
     "web",
-    "no_mcp",
 ]
-DEFAULT_WEB_SEARCH_BACKEND = "ddgs"
 REMOTE_TOOL_NAMES = [
     "find_local_recommendations",
     "get_current_trip_context",
@@ -66,7 +55,68 @@ LEGACY_MIRA_SYSTEM_PROMPT = (
 )
 
 
-def update_config(config_path: Path) -> None:
+def _hermes_effective_cli_toolsets(
+    config: dict, hermes_root: Path | None = None
+) -> tuple[str, ...]:
+    """Ask Hermes for effective GUI toolsets when its runtime is available."""
+    inserted_path = ""
+    if hermes_root is not None:
+        inserted_path = str(hermes_root.resolve())
+        if inserted_path not in sys.path:
+            sys.path.insert(0, inserted_path)
+    try:
+        from hermes_cli.tools_config import _get_platform_tools
+
+        return tuple(
+            sorted(
+                _get_platform_tools(
+                    config, "cli", include_default_mcp_servers=False
+                )
+            )
+        )
+    except Exception as exc:
+        if hermes_root is not None:
+            raise RuntimeError(
+                f"Could not resolve effective Hermes CLI toolsets from {hermes_root}"
+            ) from exc
+        return ()
+    finally:
+        if inserted_path and sys.path and sys.path[0] == inserted_path:
+            sys.path.pop(0)
+
+
+def _effective_gui_toolsets(
+    config: dict, reference: list, hermes_root: Path | None = None
+) -> list[str]:
+    """Return the saved GUI selection plus Hermes's effective CLI additions.
+
+    Hermes can automatically enable newly shipped toolsets even when they are
+    absent from an older saved ``platform_toolsets.cli`` list. Querying its
+    resolver during host setup prevents LiveKit from silently missing those
+    capabilities. The import is optional so this file remains independently
+    testable and usable before Hermes is installed.
+    """
+    names = [
+        name.strip()
+        for name in reference
+        if isinstance(name, str) and name.strip() and name.strip() != "no_mcp"
+    ]
+    names.extend(
+        name.strip()
+        for name in _hermes_effective_cli_toolsets(config, hermes_root)
+        if isinstance(name, str) and name.strip() and name.strip() != "no_mcp"
+    )
+    return list(dict.fromkeys(names))
+
+
+def update_config(
+    config_path: Path,
+    *,
+    auxiliary_model: str = "",
+    auxiliary_base_url: str = "",
+    auxiliary_api_key: str = "",
+    hermes_root: Path | None = None,
+) -> None:
     if config_path.exists():
         with config_path.open("r", encoding="utf-8-sig") as stream:
             config = yaml.safe_load(stream) or {}
@@ -85,8 +135,8 @@ def update_config(config_path: Path) -> None:
     if not isinstance(extra, dict):
         raise ValueError("Hermes LiveKit extra config must be a YAML mapping")
     extra["audio"] = {
-        "silence_threshold_seconds": 1.5,
-        "min_speech_duration_seconds": 0.5,
+        "silence_threshold_seconds": 0.7,
+        "min_speech_duration_seconds": 0.3,
         "rms_silence_floor": 50,
     }
     extra["vision"] = {
@@ -95,51 +145,89 @@ def update_config(config_path: Path) -> None:
         "frame_max_age_seconds": 10,
         "image_stream_topics": ["test", "hermes-image"],
     }
-    extra["acknowledgements"] = {
-        "enabled": True,
-        "phrases": list(ACKNOWLEDGEMENT_PHRASES),
-    }
+    extra["acknowledgements"] = {"enabled": False}
     extra["invocation"] = {
         "enabled": True,
         "keyterms": list(INVOCATION_KEYTERMS),
         "strip_keyterm": True,
+        "standalone_followup_seconds": 5.0,
     }
     extra["transcription"] = {
         "history_max_entries": 80,
         "history_max_chars": 12000,
+        "prompt_max_entries": 12,
+        "prompt_max_chars": 3000,
     }
     extra["remote_tools"] = {
         "allowed_names": list(REMOTE_TOOL_NAMES),
         "allowed_owner_prefixes": list(REMOTE_TOOL_OWNER_PREFIXES),
     }
 
-    # Hermes otherwise gives an unknown plugin platform its broad core tool
-    # bundle and automatically adds every enabled MCP server. MiRA's voice
-    # surface gets only trusted LiveKit worker tools and explicitly opts out of
-    # global MCP inheritance.
+    # Treat LiveKit and Discord as ordinary Hermes conversation surfaces. Copy
+    # the GUI/CLI selection, retain any explicitly selected MCP server names,
+    # and add only MiRA's domain bridge. Never add the ``no_mcp`` sentinel.
     platform_toolsets = config.setdefault("platform_toolsets", {})
     if not isinstance(platform_toolsets, dict):
         raise ValueError("Hermes platform_toolsets config must be a YAML mapping")
-    platform_toolsets["livekit"] = list(LIVEKIT_TOOLSETS)
-    # The trusted room worker registers account-aware planning tools in
-    # Hermes's process-wide registry. Keep that plugin toolset visible on every
-    # explicitly configured gateway surface so a linked traveller can continue
-    # the same plan from Discord, Telegram, Slack, or another supported channel.
-    for platform_name, configured_toolsets in platform_toolsets.items():
-        if not isinstance(configured_toolsets, list):
-            continue
-        if "hermes-livekit" not in configured_toolsets:
-            configured_toolsets.append("hermes-livekit")
-
-    # The LiveKit fallback is read-only web search. Prefer the bundled,
-    # keyless DDGS provider when no explicit search backend was selected; an
-    # operator-configured provider remains authoritative.
-    web = config.setdefault("web", {})
-    if not isinstance(web, dict):
-        raise ValueError("Hermes web config must be a YAML mapping")
-    web["search_backend"] = str(
-        web.get("search_backend") or DEFAULT_WEB_SEARCH_BACKEND
+    cli_configured = isinstance(platform_toolsets.get("cli"), list)
+    reference = platform_toolsets.get("cli")
+    if not isinstance(reference, list) or not reference:
+        reference = platform_toolsets.get("discord")
+    if not isinstance(reference, list) or not reference:
+        reference = DEFAULT_HERMES_CONVERSATION_TOOLSETS
+    conversation_toolsets = _effective_gui_toolsets(
+        config, reference, hermes_root
     )
+    if "hermes-livekit" not in conversation_toolsets:
+        conversation_toolsets.append("hermes-livekit")
+    if cli_configured:
+        # Persist any resolver-added GUI toolsets so parity is explicit and
+        # stable across future Hermes versions and setup reruns.
+        platform_toolsets["cli"] = list(conversation_toolsets)
+    platform_toolsets["livekit"] = list(conversation_toolsets)
+    discord_configured = isinstance(platform_toolsets.get("discord"), list)
+    raw_discord = platforms.get("discord")
+    if isinstance(raw_discord, dict) and raw_discord.get("enabled") is True:
+        discord_configured = True
+    if discord_configured:
+        platform_toolsets["discord"] = list(conversation_toolsets)
+
+    # Keep the Spark-hosted model as the sole foreground conversational model.
+    # The optional local model handles explicit delegation plus background
+    # title/compression work, preventing those auxiliary requests from
+    # contending with a realtime Spark turn.
+    if auxiliary_model.strip() and auxiliary_base_url.strip():
+        auxiliary_endpoint = auxiliary_base_url.strip().rstrip("/")
+        auxiliary_key = auxiliary_api_key or "lm-studio"
+        delegation = config.setdefault("delegation", {})
+        if not isinstance(delegation, dict):
+            raise ValueError("Hermes delegation config must be a YAML mapping")
+        delegation.update(
+            {
+                "model": auxiliary_model.strip(),
+                "provider": "custom",
+                "base_url": auxiliary_endpoint,
+                "api_key": auxiliary_key,
+                "api_mode": "chat_completions",
+            }
+        )
+        auxiliary = config.setdefault("auxiliary", {})
+        if not isinstance(auxiliary, dict):
+            raise ValueError("Hermes auxiliary config must be a YAML mapping")
+        for task_name in ("title_generation", "compression"):
+            task = auxiliary.setdefault(task_name, {})
+            if not isinstance(task, dict):
+                raise ValueError(
+                    f"Hermes auxiliary.{task_name} config must be a YAML mapping"
+                )
+            task.update(
+                {
+                    "model": auxiliary_model.strip(),
+                    "provider": "custom",
+                    "base_url": auxiliary_endpoint,
+                    "api_key": auxiliary_key,
+                }
+            )
 
     # SOUL.md is the primary identity. Remove only the previous MiRA setup's
     # known overlay; preserve any operator-authored system prompt.
@@ -182,8 +270,18 @@ def update_config(config_path: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--auxiliary-model", default="")
+    parser.add_argument("--auxiliary-base-url", default="")
+    parser.add_argument("--auxiliary-api-key", default="")
+    parser.add_argument("--hermes-root", type=Path)
     args = parser.parse_args()
-    update_config(args.config)
+    update_config(
+        args.config,
+        auxiliary_model=args.auxiliary_model,
+        auxiliary_base_url=args.auxiliary_base_url,
+        auxiliary_api_key=args.auxiliary_api_key,
+        hermes_root=args.hermes_root,
+    )
     print(f"Updated Hermes LiveKit YAML behavior: {args.config}")
 
 

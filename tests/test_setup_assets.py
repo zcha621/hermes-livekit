@@ -73,13 +73,20 @@ class SetupAssetTests(unittest.TestCase):
         self.assertIn('"skills",', configure)
         self.assertIn('"terminal",', configure)
         self.assertIn('"web",', configure)
-        self.assertIn('"no_mcp",', configure)
+        self.assertIn('name.strip() != "no_mcp"', configure)
+        self.assertIn("plugins doctor --ci", setup)
+        self.assertIn('"--hermes-root"', setup)
+        self.assertIn("[switch]$ConfigureAuxiliaryModel", setup)
+        self.assertIn('"--auxiliary-model"', setup)
         self.assertIn(
             '"manage_trip_itinerary",',
             configure,
         )
         self.assertIn(
             "plugins enable hermes-livekit --no-allow-tool-override", setup
+        )
+        self.assertNotIn(
+            "config set platforms.livekit.extra.agent_name", setup
         )
 
 
