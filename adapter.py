@@ -607,6 +607,22 @@ class LiveKitAdapter(BasePlatformAdapter):
             if isinstance(key, str) and isinstance(value, str) and value.strip()
         }
 
+    def _can_bring_agent(self, identity: str) -> bool:
+        """Whether ``identity`` created this room and controls its agent.
+
+        Set by the web portal (apps/web-portal/src/pages/api/meeting/session.ts
+        and .../trips/connect.ts) from ``roomParticipationPolicy.canBringAgent``.
+        Everyone else can still be heard and addressed by the agent once it's
+        speaking, but cannot bring it into a conversation, barge in on its
+        speech, or otherwise directly command it — only the owner can.
+        Legacy connections with no such metadata are treated as owners so
+        older clients are not silently locked out.
+        """
+        metadata = self._participant_connection_metadata(identity)
+        if "can_bring_agent" not in metadata:
+            return True
+        return metadata.get("can_bring_agent", "").strip().lower() == "true"
+
     def _source_chat_id(self, identity: str) -> str:
         """Scope Hermes history to the call/planning connection, not the room."""
         conversation_id = self._participant_connection_metadata(identity).get(
@@ -2091,7 +2107,12 @@ class LiveKitAdapter(BasePlatformAdapter):
                         # Emit listening-start on first loud chunk of an utterance
                         if identity not in self._speaking_participants:
                             self._speaking_participants.add(identity)
-                            self._interrupt_playback(identity)
+                            # Ambient conversation in the room — anyone's,
+                            # including the owner's — must not barge in on
+                            # Hermes's speech on its own. Only a deliberate
+                            # @Agent press or explicit interrupt does that
+                            # (both owner-only, see _can_bring_agent), so
+                            # casual chat doesn't cut the agent off mid-reply.
                             asyncio.create_task(
                                 self._publish_agent_event(
                                     "agent:listening-start", {"identity": identity}
@@ -2525,6 +2546,17 @@ class LiveKitAdapter(BasePlatformAdapter):
     ) -> None:
         """Start one identity-bound explicit voice request."""
         request_id = str(msg.get("request_id") or uuid.uuid4().hex[:12])[:128]
+        if not self._can_bring_agent(identity):
+            await self._publish_agent_event(
+                "agent:push-to-talk-ignored",
+                {
+                    "identity": identity,
+                    "request_id": request_id,
+                    "reason": "not-authorized",
+                },
+            )
+            return
+
         active_request = self._push_to_talk_sessions.get(identity)
         if active_request:
             await self._publish_agent_event(
@@ -2536,6 +2568,12 @@ class LiveKitAdapter(BasePlatformAdapter):
                 },
             )
             return
+
+        # Pressing @Agent is a barge-in: if Hermes is mid-speech or still
+        # generating/running tools for a prior turn, drop that work immediately
+        # instead of making this request queue behind it.
+        if self._conversation_is_active():
+            await self._cancel_active_response(identity, request_id)
 
         self._push_to_talk_sessions[identity] = request_id
         if identity in self._audio_buffers:
@@ -2623,6 +2661,16 @@ class LiveKitAdapter(BasePlatformAdapter):
         self, msg: Dict[str, Any], identity: str
     ) -> None:
         """Stop current audio and make Hermes cancel its in-flight response."""
+        if not self._can_bring_agent(identity):
+            await self._publish_agent_event(
+                "agent:interrupt-ignored",
+                {
+                    "identity": identity,
+                    "request_id": str(msg.get("request_id") or ""),
+                    "reason": "not-authorized",
+                },
+            )
+            return
         if not self._conversation_is_active():
             await self._publish_agent_event(
                 "agent:interrupt-ignored",
@@ -2634,6 +2682,28 @@ class LiveKitAdapter(BasePlatformAdapter):
             )
             return
 
+        await self._cancel_active_response(
+            identity, str(msg.get("request_id") or "")
+        )
+        await self._publish_agent_event(
+            "agent:interrupted",
+            {
+                "identity": identity,
+                "request_id": str(msg.get("request_id") or ""),
+                "reason": "user-request",
+            },
+        )
+
+    async def _cancel_active_response(self, identity: str, request_id: str) -> None:
+        """Stop TTS playback and dispatch Hermes's priority ``/stop`` command.
+
+        Shared by the explicit "Stop agent" control (`_handle_client_interrupt`)
+        and by push-to-talk-start (`_handle_push_to_talk_start`): pressing
+        @Agent while Hermes is speaking or still generating/running tools
+        must immediately barge in rather than queue behind it. Caller is
+        responsible for checking ``_conversation_is_active()`` first if it
+        needs to report a distinct "nothing to interrupt" outcome.
+        """
         self._interrupt_playback(identity)
         self._finish_tool_acknowledgement_turn()
 
@@ -2652,20 +2722,12 @@ class LiveKitAdapter(BasePlatformAdapter):
             text="/stop",
             message_type=MessageType.TEXT,
             source=source,
-            message_id=str(msg.get("request_id") or uuid.uuid4().hex[:12]),
+            message_id=request_id or uuid.uuid4().hex[:12],
             media_urls=[],
             media_types=[],
             timestamp=datetime.now(tz=timezone.utc),
         )
         setattr(event, "_livekit_invocation_checked", True)
-        await self._publish_agent_event(
-            "agent:interrupted",
-            {
-                "identity": identity,
-                "request_id": str(msg.get("request_id") or ""),
-                "reason": "user-request",
-            },
-        )
         await self.handle_message(event)
 
     # -- Remote tools (client-registered) -----------------------------------

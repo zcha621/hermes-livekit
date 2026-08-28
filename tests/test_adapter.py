@@ -917,6 +917,130 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_push_to_talk_start_barges_in_while_agent_is_speaking(self):
+        source = SimpleNamespace()
+        source.cleared = False
+        source.clear_queue = lambda: setattr(source, "cleared", True)
+        self.adapter._audio_source = source
+        self.adapter._is_playing = True
+        self.adapter._activate_invoked_turn("Hermes")
+        self.adapter._room = SimpleNamespace(
+            remote_participants={"alice": SimpleNamespace(name="Alice")},
+            local_participant=SimpleNamespace(set_attributes=AsyncMock()),
+        )
+
+        with (
+            patch.object(self.adapter, "_publish_agent_event", AsyncMock()),
+            patch.object(self.adapter, "handle_message", AsyncMock()) as dispatched,
+        ):
+            await self.adapter._handle_client_control(
+                {"action": "push-to-talk-start", "request_id": "press-1"},
+                "alice",
+            )
+
+        # The agent's speech is flushed immediately...
+        self.assertTrue(source.cleared)
+        self.assertTrue(self.adapter._playback_interrupt.is_set())
+        # ...and its in-flight backend work is dropped via the priority /stop.
+        dispatched.assert_awaited_once()
+        event = dispatched.await_args.args[0]
+        self.assertEqual(event.text, "/stop")
+        self.assertEqual(event.source.user_id, "alice")
+        # The press itself still starts a held @Agent turn as normal.
+        self.assertEqual(self.adapter._push_to_talk_sessions["alice"], "press-1")
+
+    async def test_push_to_talk_start_skips_stop_dispatch_when_agent_is_idle(self):
+        self.adapter._room = SimpleNamespace(
+            remote_participants={"alice": SimpleNamespace(name="Alice")},
+            local_participant=SimpleNamespace(set_attributes=AsyncMock()),
+        )
+
+        with (
+            patch.object(self.adapter, "_publish_agent_event", AsyncMock()),
+            patch.object(self.adapter, "handle_message", AsyncMock()) as dispatched,
+        ):
+            await self.adapter._handle_client_control(
+                {"action": "push-to-talk-start", "request_id": "press-1"},
+                "alice",
+            )
+
+        dispatched.assert_not_awaited()
+        self.assertEqual(self.adapter._push_to_talk_sessions["alice"], "press-1")
+
+    def test_can_bring_agent_defaults_true_for_legacy_connections_without_metadata(self):
+        self.adapter._room = SimpleNamespace(
+            remote_participants={"alice": SimpleNamespace(name="Alice", metadata="")}
+        )
+        self.assertTrue(self.adapter._can_bring_agent("alice"))
+
+    def test_can_bring_agent_reads_room_owner_flag_from_participant_metadata(self):
+        self.adapter._room = SimpleNamespace(
+            remote_participants={
+                "alice": SimpleNamespace(
+                    name="Alice",
+                    metadata=json.dumps({"can_bring_agent": "true"}),
+                ),
+                "bob": SimpleNamespace(
+                    name="Bob",
+                    metadata=json.dumps({"can_bring_agent": "false"}),
+                ),
+            }
+        )
+        self.assertTrue(self.adapter._can_bring_agent("alice"))
+        self.assertFalse(self.adapter._can_bring_agent("bob"))
+
+    async def test_push_to_talk_start_rejected_for_a_participant_who_did_not_create_the_room(self):
+        self.adapter._room = SimpleNamespace(
+            remote_participants={
+                "bob": SimpleNamespace(
+                    name="Bob", metadata=json.dumps({"can_bring_agent": "false"})
+                )
+            },
+            local_participant=SimpleNamespace(set_attributes=AsyncMock()),
+        )
+
+        with (
+            patch.object(self.adapter, "_publish_agent_event", AsyncMock()) as published,
+            patch.object(self.adapter, "handle_message", AsyncMock()) as dispatched,
+        ):
+            await self.adapter._handle_client_control(
+                {"action": "push-to-talk-start", "request_id": "press-1"}, "bob"
+            )
+
+        dispatched.assert_not_awaited()
+        self.assertNotIn("bob", self.adapter._push_to_talk_sessions)
+        published.assert_awaited_once_with(
+            "agent:push-to-talk-ignored",
+            {"identity": "bob", "request_id": "press-1", "reason": "not-authorized"},
+        )
+
+    async def test_explicit_interrupt_rejected_for_a_participant_who_did_not_create_the_room(self):
+        self.adapter._activate_invoked_turn("Hermes")
+        self.adapter._is_playing = True
+        self.adapter._room = SimpleNamespace(
+            remote_participants={
+                "bob": SimpleNamespace(
+                    name="Bob", metadata=json.dumps({"can_bring_agent": "false"})
+                )
+            },
+            local_participant=SimpleNamespace(set_attributes=AsyncMock()),
+        )
+
+        with (
+            patch.object(self.adapter, "_publish_agent_event", AsyncMock()) as published,
+            patch.object(self.adapter, "handle_message", AsyncMock()) as dispatched,
+        ):
+            await self.adapter._handle_client_control(
+                {"action": "interrupt", "request_id": "press-1"}, "bob"
+            )
+
+        dispatched.assert_not_awaited()
+        self.assertFalse(self.adapter._playback_interrupt.is_set())
+        published.assert_awaited_once_with(
+            "agent:interrupt-ignored",
+            {"identity": "bob", "request_id": "press-1", "reason": "not-authorized"},
+        )
+
     async def test_forced_agent_button_turn_preserves_speaker_identity(self):
         self.adapter._room = SimpleNamespace(
             remote_participants={"alice": SimpleNamespace(name="Alice")},
