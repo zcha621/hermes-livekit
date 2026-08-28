@@ -312,6 +312,21 @@ def register(ctx) -> None:
     except Exception as exc:
         logger.debug("tourism skill registration failed: %s", exc)
 
+    # Itinerary save/confirm as native tools, not MCP: this deployment's
+    # model has never once successfully invoked an MCP-prefixed tool, while
+    # natively-registered tools are called reliably (see itinerary_tools.py's
+    # docstring for the evidence). Read-only lookups (get_confirmed_itinerary,
+    # get_traveller_location, get_meeting_transcript) still come from the
+    # hermes-mira-context MCP server — lower-stakes if occasionally skipped.
+    try:
+        try:
+            from .itinerary_tools import register_tools
+        except ImportError:
+            from itinerary_tools import register_tools
+        register_tools(ctx)
+    except Exception:
+        logger.exception("could not register the itinerary save/confirm tools")
+
     # No backend orchestration hooks are registered. LiveKit and Discord use
     # Hermes's normal model loop, and context/action calls occur only when
     # Hermes selects a registered tool. The post-API hook only normalizes the

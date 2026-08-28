@@ -6,10 +6,16 @@ version: 1.8.0
 description: Hermes-native voice, vision, and MiRA context transport over LiveKit
 author: kortexa-ai
 
-# MiRA's itinerary, location, and meeting-transcript context is served by the
-# hermes-mira-context MCP server (services/hermes-mcp) instead of plugin-
-# declared tools — see agents/hermes-livekit/configure_yaml.py for how it
-# gets registered in mcp_servers.
+# Itinerary read-only context (saved itinerary, traveller location, meeting
+# transcript) is served by the hermes-mira-context MCP server
+# (services/hermes-mcp) — see agents/hermes-livekit/configure_yaml.py for
+# how it gets registered in mcp_servers. Saving/confirming an itinerary is a
+# native plugin tool instead (itinerary_tools.py) for invocation reliability.
+# (Not named tools.py: that collides with hermes-agent's own internal
+# "tools" package once this plugin directory lands on sys.path.)
+provides_tools:
+  - save_itinerary_draft
+  - confirm_itinerary_draft
 
 provides_hooks:
   - post_api_request

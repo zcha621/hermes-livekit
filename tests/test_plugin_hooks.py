@@ -37,9 +37,18 @@ class PluginHookTests(unittest.IsolatedAsyncioTestCase):
             "mira-new-zealand-tourism", plugin._TOURISM_SKILL_PATH
         )
         context.register_platform.assert_called_once()
-        # Itinerary/location/transcript context is served by the
-        # hermes-mira-context MCP server, not plugin-declared tools.
-        context.register_tool.assert_not_called()
+        # Read-only itinerary/location/transcript lookups are served by the
+        # hermes-mira-context MCP server. Saving/confirming an itinerary is
+        # registered here as native tools instead (see itinerary_tools.py)
+        # because MCP-prefixed tools are never reliably invoked by this
+        # deployment's model.
+        registered_tool_names = [
+            call.kwargs.get("name", call.args[0] if call.args else None)
+            for call in context.register_tool.call_args_list
+        ]
+        self.assertEqual(
+            registered_tool_names, ["save_itinerary_draft", "confirm_itinerary_draft"]
+        )
         hook_names = [call.args[0] for call in context.register_hook.call_args_list]
         self.assertEqual(
             hook_names, ["post_api_request", "on_session_finalize"]
