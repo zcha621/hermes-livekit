@@ -179,6 +179,35 @@ class AdapterTests(unittest.TestCase):
             result, "test-room:conversation:call-20260827-a"
         )
 
+    def test_mcp_identifier_context_includes_room_account_and_device(self):
+        with patch.object(
+            self.adapter,
+            "_participant_connection_metadata",
+            return_value={
+                "mira_account_id": "acct-1",
+                "aware_device_id": "device-1",
+            },
+        ):
+            result = self.adapter._mcp_identifier_context("alice")
+
+        self.assertIn("hermes-mira-context MCP tools", result)
+        self.assertIn("room_name='test-room'", result)
+        self.assertIn("platform='livekit'", result)
+        self.assertIn("user_id='alice'", result)
+        self.assertIn("hermes_session_id=", result)
+        self.assertIn("mira_account_id='acct-1'", result)
+        self.assertIn("aware_device_id='device-1'", result)
+
+    def test_mcp_identifier_context_omits_optional_ids_when_absent(self):
+        with patch.object(
+            self.adapter, "_participant_connection_metadata", return_value={}
+        ):
+            result = self.adapter._mcp_identifier_context("alice")
+
+        self.assertIn("room_name='test-room'", result)
+        self.assertNotIn("mira_account_id=", result)
+        self.assertNotIn("aware_device_id=", result)
+
     def test_model_prompt_uses_only_bounded_recent_room_transcript(self):
         for index in range(20):
             self.adapter._append_transcript(
@@ -329,11 +358,11 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(len(loop.calls), 1)
 
     def test_prepare_tts_text_suppresses_leaked_function_invocation(self):
-        leaked = "find_local_recommendations(query='places to visit in Auckland', location='Auckland', limit=2)"
+        leaked = "get_confirmed_itinerary(mira_account_id='acct-1')"
         self.assertEqual(self.adapter.prepare_tts_text(leaked), "")
 
     def test_prepare_tts_text_keeps_conversational_text_around_tool_leak(self):
-        text = "I'll check that.\nfind_local_recommendations(query='walks', limit=2)\nI found two options."
+        text = "I'll check that.\nget_confirmed_itinerary(mira_account_id='acct-1')\nI found two options."
         self.assertEqual(
             self.adapter.prepare_tts_text(text),
             "I'll check that.\n\nI found two options.",
@@ -778,7 +807,7 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         packet = SimpleNamespace(
             topic="hermes-control",
             data=(
-                b'{"type":"client:tool-register","name":"find_local_recommendations",'
+                b'{"type":"client:tool-register","name":"custom_client_tool",'
                 b'"description":"Grounded tourism retrieval","input_schema":{"type":"object"}}'
             ),
             participant=SimpleNamespace(identity="mira-worker"),
@@ -788,7 +817,7 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(registered.wait(), timeout=1)
 
         self.assertEqual(received["identity"], "mira-worker")
-        self.assertEqual(received["message"]["name"], "find_local_recommendations")
+        self.assertEqual(received["message"]["name"], "custom_client_tool")
 
     async def test_client_interrupt_packet_routes_from_shared_control_topic(self):
         routed = asyncio.Event()
@@ -919,7 +948,7 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_remote_tool_registration_rejects_untrusted_participant(self):
         message = {
-            "name": "get_current_trip_context",
+            "name": "custom_client_tool",
             "description": "Current consented trip context",
             "input_schema": {"type": "object"},
         }
@@ -934,7 +963,7 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_remote_tool_handler_adds_trusted_session_source_and_returns_json(self):
         owner = "agent-mira-knowledge-worker-12345678"
         self.adapter._room = SimpleNamespace(remote_participants={owner: object()})
-        handler = self.adapter._build_tool_handler(owner, "manage_trip_itinerary")
+        handler = self.adapter._build_tool_handler(owner, "custom_client_tool")
 
         async def publish(message, **_kwargs):
             await self.adapter._handle_tool_result(
@@ -979,29 +1008,6 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
             json.loads(result), {"linked": True, "draft": {"revision": 4}}
         )
 
-    async def test_mira_tool_registration_keeps_host_registered_handler(self):
-        owner = "agent-mira-knowledge-worker-12345678"
-        self.adapter._room = SimpleNamespace(
-            remote_participants={owner: SimpleNamespace(kind=4)}
-        )
-        for name in livekit_adapter.DEFAULT_REMOTE_TOOL_NAMES:
-            message = {
-                "name": name,
-                "description": "MiRA data tool",
-                "input_schema": {"type": "object"},
-            }
-
-            with (
-                patch("tools.registry.registry.register") as register,
-                patch.object(self.adapter, "_publish_typed", AsyncMock()) as published,
-            ):
-                await self.adapter._register_client_tool(message, owner)
-
-            register.assert_not_called()
-            self.assertEqual(self.adapter._tool_owners[name], owner)
-            self.assertIn(name, self.adapter._client_tools[owner])
-            self.assertTrue(published.await_args.args[0]["success"])
-
     async def test_remote_tool_registration_rejects_non_allowlisted_tool(self):
         message = {
             "name": "run_shell",
@@ -1015,15 +1021,16 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         published.assert_awaited_once()
         self.assertEqual(published.await_args.args[0]["reason"], "tool-not-allowed")
 
-    async def test_simulated_worker_registration_uses_stable_host_handler(self):
+    async def test_simulated_worker_registration_dynamically_registers_tool(self):
         identity = "simulated-agent-af292dcc9e40"
         self.adapter._room = SimpleNamespace(
             remote_participants={
                 identity: SimpleNamespace(kind=SimpleNamespace(name="PARTICIPANT_KIND_AGENT"))
             }
         )
+        self.adapter._allowed_remote_tool_names = frozenset({"trip_context_tool"})
         message = {
-            "name": "get_current_trip_context",
+            "name": "trip_context_tool",
             "description": "Current consented trip context",
             "input_schema": {"type": "object"},
         }
@@ -1034,7 +1041,8 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.adapter._register_client_tool(message, identity)
 
-        register.assert_not_called()
+        register.assert_called_once()
+        self.assertEqual(self.adapter._tool_owners["trip_context_tool"], identity)
         self.assertTrue(published.await_args.args[0]["success"])
 
     async def test_simulated_worker_accepts_livekit_numeric_agent_kind(self):
@@ -1053,7 +1061,7 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         message = {
-            "name": "find_local_recommendations",
+            "name": "custom_client_tool",
             "description": "Grounded tourism retrieval",
             "input_schema": {"type": "object"},
         }

@@ -33,11 +33,12 @@ DEFAULT_HERMES_CONVERSATION_TOOLSETS = [
     "vision",
     "web",
 ]
-REMOTE_TOOL_NAMES = [
-    "find_local_recommendations",
-    "get_current_trip_context",
-    "manage_trip_itinerary",
-]
+# No tool names are host-managed by default any more — MiRA's itinerary,
+# location, and meeting-transcript context is served by the
+# hermes-mira-context MCP server (see MCP_SERVER_NAME below) instead of
+# LiveKit remote tools. This stays configurable/non-empty for operators who
+# still want a client to offer its own tool over the data channel.
+REMOTE_TOOL_NAMES: list[str] = []
 REMOTE_TOOL_OWNER_PREFIXES = [
     "agent-mira-knowledge-worker-",
     # LiveKit Agents 1.2.x uses this identity in ``connect --room`` mode,
@@ -46,6 +47,15 @@ REMOTE_TOOL_OWNER_PREFIXES = [
     # compatibility prefix.
     "simulated-agent-",
 ]
+MCP_SERVER_NAME = "hermes-mira-context"
+MCP_SERVER_ENV_VARS = (
+    "MIRA_DATABASE_URL",
+    "MIRA_AWARE_DATABASE_HOST",
+    "MIRA_AWARE_DATABASE_PORT",
+    "MIRA_AWARE_DATABASE_NAME",
+    "MIRA_AWARE_DATABASE_USER",
+    "MIRA_AWARE_DATABASE_PASSWORD",
+)
 DEFAULT_NEW_ZEALAND_VOICE = "en-NZ-MollyNeural"
 STOCK_EDGE_VOICES = {"", "en-US-JennyNeural"}
 LEGACY_MIRA_SYSTEM_PROMPT = (
@@ -116,6 +126,7 @@ def update_config(
     auxiliary_base_url: str = "",
     auxiliary_api_key: str = "",
     hermes_root: Path | None = None,
+    mcp_python_exe: str = "",
 ) -> None:
     if config_path.exists():
         with config_path.open("r", encoding="utf-8-sig") as stream:
@@ -162,6 +173,22 @@ def update_config(
         "allowed_names": list(REMOTE_TOOL_NAMES),
         "allowed_owner_prefixes": list(REMOTE_TOOL_OWNER_PREFIXES),
     }
+
+    # Register the itinerary/location/meeting-transcript MCP server. Only
+    # touched when the caller resolved a python interpreter for it (Setup-
+    # HermesLiveKit.ps1 passes --mcp-python-exe when services/hermes-mcp has
+    # a venv) so a host without that service installed keeps whatever
+    # mcp_servers it already had — "keep the current config" applies here.
+    if mcp_python_exe.strip():
+        mcp_servers = config.setdefault("mcp_servers", {})
+        if not isinstance(mcp_servers, dict):
+            raise ValueError("Hermes mcp_servers config must be a YAML mapping")
+        mcp_servers[MCP_SERVER_NAME] = {
+            "command": mcp_python_exe.strip(),
+            "args": ["-m", "hermes_mcp.server"],
+            "env": {name: f"${{{name}}}" for name in MCP_SERVER_ENV_VARS},
+            "enabled": True,
+        }
 
     # Treat LiveKit and Discord as ordinary Hermes conversation surfaces. Copy
     # the GUI/CLI selection, retain any explicitly selected MCP server names,
@@ -274,6 +301,7 @@ def main() -> None:
     parser.add_argument("--auxiliary-base-url", default="")
     parser.add_argument("--auxiliary-api-key", default="")
     parser.add_argument("--hermes-root", type=Path)
+    parser.add_argument("--mcp-python-exe", default="")
     args = parser.parse_args()
     update_config(
         args.config,
@@ -281,6 +309,7 @@ def main() -> None:
         auxiliary_base_url=args.auxiliary_base_url,
         auxiliary_api_key=args.auxiliary_api_key,
         hermes_root=args.hermes_root,
+        mcp_python_exe=args.mcp_python_exe,
     )
     print(f"Updated Hermes LiveKit YAML behavior: {args.config}")
 

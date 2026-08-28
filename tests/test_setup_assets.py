@@ -66,7 +66,7 @@ class SetupAssetTests(unittest.TestCase):
         self.assertIn("[switch]$ReplaceSoul", setup)
         self.assertIn("Install-MiraSoul", setup)
         self.assertIn('Join-Path $sourcePlugin "skills"', setup)
-        self.assertIn('"adapter.py", "__init__.py", "tools.py"', setup)
+        self.assertIn('"adapter.py", "__init__.py", "transcript_store.py"', setup)
 
         configure = (PLUGIN_ROOT / "configure_yaml.py").read_text(encoding="utf-8")
         self.assertIn('"hermes-livekit",', configure)
@@ -78,10 +78,11 @@ class SetupAssetTests(unittest.TestCase):
         self.assertIn('"--hermes-root"', setup)
         self.assertIn("[switch]$ConfigureAuxiliaryModel", setup)
         self.assertIn('"--auxiliary-model"', setup)
-        self.assertIn(
-            '"manage_trip_itinerary",',
-            configure,
-        )
+        # Itinerary/location/transcript context is served by the
+        # hermes-mira-context MCP server, registered when the setup script
+        # resolves a python interpreter for services/hermes-mcp.
+        self.assertIn("MCP_SERVER_NAME = \"hermes-mira-context\"", configure)
+        self.assertIn('"--mcp-python-exe"', setup)
         self.assertIn(
             "plugins enable hermes-livekit --no-allow-tool-override", setup
         )

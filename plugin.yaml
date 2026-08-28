@@ -6,14 +6,10 @@ version: 1.8.0
 description: Hermes-native voice, vision, and MiRA context transport over LiveKit
 author: kortexa-ai
 
-# MiRA's data tools are useful on Discord and other Hermes surfaces even when
-# the LiveKit platform adapter is deferred. Declaring them here asks Hermes to
-# import tools.py during plugin discovery and keeps one stable selectable
-# toolset on every configured gateway platform.
-provides_tools:
-  - find_local_recommendations
-  - get_current_trip_context
-  - manage_trip_itinerary
+# MiRA's itinerary, location, and meeting-transcript context is served by the
+# hermes-mira-context MCP server (services/hermes-mcp) instead of plugin-
+# declared tools — see agents/hermes-livekit/configure_yaml.py for how it
+# gets registered in mcp_servers.
 
 provides_hooks:
   - post_api_request

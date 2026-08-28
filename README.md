@@ -54,10 +54,12 @@ fresh call-scoped ID for each connection instead of inheriting permanent room
 history. The bounded participant transcript above still supplies current
 multi-speaker context without allowing old calls to grow every new prompt.
 
-When location, local time, itinerary, or durable room history matters, Hermes
-can select `get_current_trip_context`. No database snapshot is fetched or
-injected automatically. This keeps direct conversation on the same model path
-as the Hermes GUI while leaving current context available on demand.
+When location, local time, itinerary, or earlier meeting speech matters,
+Hermes can select one of the hermes-mira-context MCP server's tools (see
+[MiRA domain context via MCP](#mira-domain-context-via-mcp) below). No
+database snapshot is fetched or injected automatically. This keeps direct
+conversation on the same model path as the Hermes GUI while leaving current
+context available on demand.
 
 This is application-level invocation policy built on LiveKit participant audio
 and Hermes STT. LiveKit itself supplies per-participant identity, synchronized
@@ -141,60 +143,56 @@ the excerpt.
 The default end-of-utterance silence threshold is 0.7 seconds and the minimum
 speech duration is 0.3 seconds. Barge-in still interrupts playback immediately.
 
-## MiRA domain tools over LiveKit
+## MiRA domain context via MCP
 
-The plugin pre-registers stable schemas for `find_local_recommendations`,
-`get_current_trip_context`, and `manage_trip_itinerary`, so GUI/CLI, Discord,
-and LiveKit expose the same MiRA tool surface even before the LiveKit adapter is
-materialized. A trusted room participant such as MiRA's silent Python worker
-claims those bounded routes with a `client:tool-register` JSON envelope on the
-`hermes-control` topic. Hermes then targets `agent:tool-call` envelopes to that
-owner and waits for a matching `client:tool-result`. Registrations and results
-are control messages and do not need a fake text/content field.
+MiRA's itinerary, location, and meeting-transcript context is served by a
+separate MCP (Model Context Protocol) server, `services/hermes-mcp`, rather
+than by tools this plugin registers. Hermes connects to it like any other MCP
+server (`mcp_servers.hermes-mira-context` in `config.yaml`, written by
+`configure_yaml.py` when `Setup-HermesLiveKit.ps1` resolves a python
+interpreter for it — see that service's README for setup). Once connected, its
+tools are available on every platform Hermes is configured for, LiveKit
+included, alongside Hermes's normal tools, skills, and other MCP servers —
+Hermes decides whether and when to call them, same as any other tool.
 
-Hermes GUI/TUI sessions execute in a process separate from the messaging
-gateway. When that process has no in-memory LiveKit adapter, the same tool
-handler opens a short-lived data-only LiveKit connection, waits for the
-worker's targeted registration, and exchanges the normal tool-call/result
-envelopes. It never calls the tourism backend directly and never receives the
-worker's backend credential. Desktop/TUI account linking uses Hermes's stable
-installation identity; the backend stores only its channel-subject hash and
-still requires a one-time portal link code.
+The server exposes four tools:
 
-Registration is fail-closed: the production participant identity must begin
-with `agent-mira-knowledge-worker-`. LiveKit Agents 1.2.x local
-`connect --room` workers use `simulated-agent-`; that compatibility identity is
-accepted only when LiveKit marks the participant kind as `AGENT`. The tool name
-must be `find_local_recommendations`, `get_current_trip_context`, or
-`manage_trip_itinerary`. All other identities and names are rejected.
+- `get_confirmed_itinerary(mira_account_id)` — the traveller's saved
+  itinerary, read from the tourism-ai-backend's `mira_account_itinerary`
+  table.
+- `get_traveller_location(aware_device_id)` — the traveller's latest GPS fix,
+  timezone, and computed local time, read from the AWARE `locations` /
+  `timezone` tables the Android client streams into.
+- `get_meeting_transcript(room_name)` — earlier speech from the current
+  LiveKit room, read from `mira_transcript_segment` (written by this
+  plugin's `transcript_store.py` as the adapter finalizes each utterance).
+- `manage_trip_itinerary(action, platform, user_id, hermes_session_id, ...)` —
+  load, link, revise, or confirm the traveller's account-wide itinerary,
+  proxied to the tourism-ai-backend's `POST /gateway/planning-workspace`.
+  `revise` stores an editable draft; `confirm` requires the exact current
+  revision and explicit traveller approval before the backend promotes it to
+  the confirmed itinerary (and clears the planning conversation so the next
+  session starts fresh). There is no pre/post-turn planning hook — Hermes
+  calls this only when the conversation requires that action.
 
-The MiRA worker currently includes a harmless `content` compatibility marker in
-these envelopes so an installed pre-fix adapter can also route them. Updated
-adapters dispatch on `type` and ignore that marker.
-
-MiRA uses this protocol for grounded recommendation retrieval and for a bounded
-current-context read. The latter returns current server time, participant-local
-time, an optional saved itinerary, latest consented Android context, and recent
-participant-labelled transcripts. Hermes decides whether and when to call it.
-The worker, not the LLM, injects the Tourism AI session ID and
-holds the short-lived backend credential. Do not expose arbitrary HTTP, SQL,
-Cypher, shell, or filesystem tools through this protocol.
-
-`manage_trip_itinerary` is the account-planning route. Hermes receives trusted
-gateway platform/user/session context from the adapter, never an account ID
-from the model. `revise` stores an editable draft; `confirm` requires the exact
-current revision and explicit traveller approval before the backend promotes it
-to the confirmed itinerary. Hermes calls `load`, `link`, `revise`, or `confirm`
-when the conversation requires that action; there is no pre/post-turn planning
-hook. An unlinked channel can be attached with the portal's 15-minute one-time
-code.
+The adapter injects the identifiers these tools need (`room_name`,
+`platform`, `user_id`, `hermes_session_id`, and — when present in the
+speaker's trusted LiveKit participant metadata — `mira_account_id` and
+`aware_device_id`) into the model's context on every invoked turn (see
+`_mcp_identifier_context` in `adapter.py`), since an MCP tool call carries no
+implicit session context the way this plugin's own framework-registered
+tools do.
 
 The `/trips` text box is a dedicated chat surface: pressing **Send** is an
 explicit Hermes invocation and does not require the `MiRA` voice wake term.
-The wake term still applies to ambient speech in a live room. The plugin
-declares all three MiRA tools in `plugin.yaml` and pre-registers them from
-`tools.py`, so Discord and other configured Hermes channels retain the same
-model-visible schemas even while the LiveKit adapter itself is deferred.
+The wake term still applies to ambient speech in a live room.
+
+A generic client-offered remote-tool channel still exists in the adapter
+(`client:tool-register` / `agent:tool-call` / `client:tool-result` over the
+`hermes-control` topic) for any future tool a connected client wants to
+offer — it just has no MiRA-specific tool names allow-listed by default any
+more. Configure `platforms.livekit.extra.remote_tools.allowed_names` to opt
+one in.
 
 ## One-click setup on Windows
 
@@ -249,15 +247,14 @@ file as `SOUL.md.mira.bak`.
 
 LiveKit sessions expose optional tourism evidence routes:
 
-- `get_current_trip_context` - server and participant-local time, optional itinerary, consented
-  location/device/social context, and recent room conversation;
-
-- `find_local_recommendations` — the authenticated MiRA graph/RAG route for
-  curated, session-scoped tourism evidence;
-- `manage_trip_itinerary` - account linking plus conversational draft revision
-  and explicit confirmation. A draft is not a saved itinerary;
-- Hermes web and MCP search capabilities for fresh facts or locations not
-  covered by the pilot graph.
+- `get_confirmed_itinerary` / `get_traveller_location` / `get_meeting_transcript`
+  (hermes-mira-context MCP server) — saved itinerary, current location and
+  local time, and earlier meeting speech;
+- `manage_trip_itinerary` (same MCP server) - account linking plus
+  conversational draft revision and explicit confirmation. A draft is not a
+  saved itinerary;
+- Hermes web and MCP search capabilities for fresh facts, local
+  recommendations, or current conditions.
 
 Setup resolves the GUI/CLI toolset surface—including Hermes additions that are
 effective but not yet present in an older saved list—and persists that same
@@ -330,12 +327,22 @@ platforms:
         prompt_max_entries: 12
         prompt_max_chars: 3000
       remote_tools:
-        allowed_names:
-          - find_local_recommendations
-          - get_current_trip_context
-          - manage_trip_itinerary
+        allowed_names: []   # opt in a client-offered tool by name here
         allowed_owner_prefixes:
           - agent-mira-knowledge-worker-
+
+mcp_servers:
+  hermes-mira-context:
+    command: C:\path\to\services\hermes-mcp\.venv\Scripts\python.exe
+    args: ["-m", "hermes_mcp.server"]
+    env:
+      MIRA_DATABASE_URL: "${MIRA_DATABASE_URL}"
+      MIRA_AWARE_DATABASE_HOST: "${MIRA_AWARE_DATABASE_HOST}"
+      MIRA_AWARE_DATABASE_PORT: "${MIRA_AWARE_DATABASE_PORT}"
+      MIRA_AWARE_DATABASE_NAME: "${MIRA_AWARE_DATABASE_NAME}"
+      MIRA_AWARE_DATABASE_USER: "${MIRA_AWARE_DATABASE_USER}"
+      MIRA_AWARE_DATABASE_PASSWORD: "${MIRA_AWARE_DATABASE_PASSWORD}"
+    enabled: true
 
 tts:
   provider: edge
@@ -435,8 +442,10 @@ A useful call check is:
 
 - `adapter.py` — LiveKit transport, media, voice activity, hooks, and tools.
 - `__init__.py` — Hermes plugin registration and lifecycle hooks.
-- `tools.py` — discovery-time cross-platform MiRA tool registration.
-- `configure_yaml.py` — atomic non-secret behavior configuration.
+- `transcript_store.py` — persists finalized meeting speech for the
+  hermes-mira-context MCP server's `get_meeting_transcript` tool.
+- `configure_yaml.py` — atomic non-secret behavior configuration, including
+  registering the hermes-mira-context MCP server.
 - `assets/SOUL.md` — canonical MiRA conversational identity.
 - `skills/mira-new-zealand-tourism/SKILL.md` — grounded Aotearoa tourism procedure.
 - `plugin.yaml` — plugin metadata.

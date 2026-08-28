@@ -256,6 +256,56 @@ class ConfigureYamlTests(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
+    def test_mcp_server_not_registered_without_python_exe(self):
+        workspace_temp = Path(__file__).resolve().parents[3] / ".tmp"
+        workspace_temp.mkdir(exist_ok=True)
+        path = workspace_temp / "hermes-livekit-no-mcp.yaml"
+        try:
+            path.write_text(
+                yaml.safe_dump({"mcp_servers": {"other": {"url": "https://x"}}}),
+                encoding="utf-8",
+            )
+
+            update_config(path)
+
+            config = yaml.safe_load(path.read_text(encoding="utf-8"))
+            # "Keep the current config": an unrelated existing MCP server is
+            # untouched, and hermes-mira-context is not added when no python
+            # interpreter for it was resolved.
+            self.assertEqual(config["mcp_servers"], {"other": {"url": "https://x"}})
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_mcp_server_registered_when_python_exe_given(self):
+        workspace_temp = Path(__file__).resolve().parents[3] / ".tmp"
+        workspace_temp.mkdir(exist_ok=True)
+        path = workspace_temp / "hermes-livekit-mcp.yaml"
+        try:
+            path.write_text(
+                yaml.safe_dump({"mcp_servers": {"other": {"url": "https://x"}}}),
+                encoding="utf-8",
+            )
+
+            update_config(
+                path,
+                mcp_python_exe=r"C:\services\hermes-mcp\.venv\Scripts\python.exe",
+            )
+
+            config = yaml.safe_load(path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                config["mcp_servers"]["other"], {"url": "https://x"}
+            )
+            mira_context = config["mcp_servers"]["hermes-mira-context"]
+            self.assertEqual(
+                mira_context["command"],
+                r"C:\services\hermes-mcp\.venv\Scripts\python.exe",
+            )
+            self.assertEqual(mira_context["args"], ["-m", "hermes_mcp.server"])
+            self.assertEqual(mira_context["env"]["MIRA_DATABASE_URL"], "${MIRA_DATABASE_URL}")
+            self.assertTrue(mira_context["enabled"])
+        finally:
+            path.unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     unittest.main()

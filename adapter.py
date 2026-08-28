@@ -182,6 +182,14 @@ PRESENCE_POLL_INTERVAL_LOCAL = 5.0
 # Remote tools (client-offered, callable by the agent). See
 # docs/remote-tools-design.md. v0.3.0 ships protocol + desktop_notify-style
 # small-result tools; large/binary results are Phase 1.5.
+#
+# MiRA's own itinerary/location/transcript context used to ship as three
+# host-managed names here (find_local_recommendations,
+# get_current_trip_context, manage_trip_itinerary) proxied to a LiveKit
+# "knowledge worker" over this same channel. That context is now served by
+# the hermes-mira-context MCP server instead (services/hermes-mcp), so no
+# tool name is allow-listed by default — an operator opts a client-offered
+# tool in explicitly via platforms.livekit.extra.remote_tools.allowed_names.
 TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 TOOL_CALL_TIMEOUT_DEFAULT = 30.0
 # Dynamic worker tools join the plugin's declared toolset so they are visible
@@ -189,12 +197,7 @@ TOOL_CALL_TIMEOUT_DEFAULT = 30.0
 # LiveKit and Discord). A second hidden toolset would be filtered at turn build.
 TOOLSET_NAME = "hermes-livekit"
 CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
-DEFAULT_REMOTE_TOOL_NAMES = (
-    "find_local_recommendations",
-    "get_current_trip_context",
-    "manage_trip_itinerary",
-)
-HOST_MANAGED_REMOTE_TOOL_NAMES = frozenset(DEFAULT_REMOTE_TOOL_NAMES)
+DEFAULT_REMOTE_TOOL_NAMES: tuple[str, ...] = ()
 DEFAULT_REMOTE_TOOL_OWNER_PREFIXES = (
     "agent-mira-knowledge-worker-",
     "simulated-agent-",
@@ -621,9 +624,44 @@ class LiveKitAdapter(BasePlatformAdapter):
         metadata = self._participant_connection_metadata(identity)
         return {
             key: metadata[key]
-            for key in ("purpose", "mira_conversation_id", "aware_device_id")
+            for key in (
+                "purpose",
+                "mira_conversation_id",
+                "mira_account_id",
+                "aware_device_id",
+            )
             if key in metadata
         }
+
+    def _mcp_identifier_context(self, identity: str) -> str:
+        """Give the model the identifiers the hermes-mira-context MCP tools need.
+
+        The read tools take plain identifier arguments (``mira_account_id``,
+        ``aware_device_id``, ``room_name``) and ``manage_trip_itinerary``
+        additionally needs a source (``platform``, ``user_id``,
+        ``hermes_session_id``) — none of which the tools can infer
+        themselves, so the model has to be told what they are for this turn.
+        Values come from trusted LiveKit participant metadata set by the web
+        portal (see apps/web-portal/src/pages/api/trips/connect.ts and
+        .../meeting/session.ts) plus this adapter's own chat-id scoping.
+        """
+        metadata = self.source_connection_metadata(identity)
+        account_id = metadata.get("mira_account_id", "")
+        device_id = metadata.get("aware_device_id", "")
+        parts = [
+            f"room_name={self._room_name!r}",
+            "platform='livekit'",
+            f"user_id={identity!r}",
+            f"hermes_session_id={self._source_chat_id(identity)!r}",
+        ]
+        if account_id:
+            parts.append(f"mira_account_id={account_id!r}")
+        if device_id:
+            parts.append(f"aware_device_id={device_id!r}")
+        return (
+            " For the hermes-mira-context MCP tools (itinerary, location, "
+            "meeting transcript), use: " + ", ".join(parts) + "."
+        )
 
     def _append_transcript(
         self,
@@ -761,6 +799,38 @@ class LiveKitAdapter(BasePlatformAdapter):
         await self._publish_agent_event(event_type, payload)
         if publish_standard:
             await self._publish_standard_transcription(entry)
+        self._schedule_transcript_persistence(entry)
+
+    def _schedule_transcript_persistence(self, entry: Dict[str, Any]) -> None:
+        """Fire-and-forget persistence so the MCP server can recall this later.
+
+        Runs off the event loop (blocking DB I/O) and never raises into the
+        caller — a persistence failure must not affect the live conversation.
+        """
+        mira_conversation_id = self.source_connection_metadata(
+            str(entry.get("identity") or "")
+        ).get("mira_conversation_id", "")
+        room_name = self._room_name
+
+        async def _run() -> None:
+            try:
+                from transcript_store import record_transcript_segment
+            except ImportError:
+                try:
+                    from .transcript_store import record_transcript_segment
+                except ImportError:
+                    return
+            try:
+                await asyncio.to_thread(
+                    record_transcript_segment,
+                    entry,
+                    room_name=room_name,
+                    mira_conversation_id=mira_conversation_id,
+                )
+            except Exception as exc:
+                logger.debug("[%s] transcript persistence task failed: %s", self.name, exc)
+
+        asyncio.create_task(_run())
 
     async def _record_agent_transcript(
         self, text: str, *, kind: str = "speech", publish_standard: bool = True
@@ -879,6 +949,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             f"{display_name} (identity {identity}). "
             "Address the correct speaker and distinguish participants. "
             f"Latest participant topics/requests: {ledger}."
+            f"{self._mcp_identifier_context(identity)}"
         )
         transcript_context = self._transcript_context()
         existing_prompt = str(getattr(event, "channel_prompt", "") or "").strip()
@@ -2711,52 +2782,51 @@ class LiveKitAdapter(BasePlatformAdapter):
             )
             return
 
-        if name not in HOST_MANAGED_REMOTE_TOOL_NAMES:
-            try:
-                from tools.registry import registry
-            except Exception as exc:
-                logger.error("[%s] tool registry unavailable: %s", self.name, exc)
-                await self._publish_typed(
-                    {"type": "agent:tool-registered", "name": name, "success": False, "reason": "registry-unavailable"},
-                    identity=identity,
-                )
-                return
+        try:
+            from tools.registry import registry
+        except Exception as exc:
+            logger.error("[%s] tool registry unavailable: %s", self.name, exc)
+            await self._publish_typed(
+                {"type": "agent:tool-registered", "name": name, "success": False, "reason": "registry-unavailable"},
+                identity=identity,
+            )
+            return
 
-            handler = self._build_tool_handler(identity, name)
-            # The registry's `schema` is the OpenAI function-envelope shape
-            # (`{name, description, parameters}`), not a bare JSON Schema. Wrap
-            # the client-supplied input_schema accordingly.
-            registry_schema = {
-                "name": name,
-                "description": description,
-                "parameters": input_schema,
-            }
-            try:
-                # override=True so a reconnecting client can re-register without
-                # an explicit unregister round-trip. Single-client v1 — collisions
-                # between distinct clients are undefined per design doc.
-                registry.register(
-                    name=name,
-                    toolset=TOOLSET_NAME,
-                    schema=registry_schema,
-                    handler=handler,
-                    is_async=True,
-                    description=description,
-                    override=True,
-                )
-            except Exception as exc:
-                logger.warning("[%s] tool register %r failed: %s", self.name, name, exc)
-                await self._publish_typed(
-                    {
-                        "type": "agent:tool-registered",
-                        "name": name,
-                        "success": False,
-                        "reason": "register-failed",
-                        "detail": str(exc),
-                    },
-                    identity=identity,
-                )
-                return
+        handler = self._build_tool_handler(identity, name)
+        # The registry's `schema` is the OpenAI function-envelope shape
+        # (`{name, description, parameters}`), not a bare JSON Schema. Wrap
+        # the client-supplied input_schema accordingly.
+        registry_schema = {
+            "name": name,
+            "description": description,
+            "parameters": input_schema,
+        }
+        try:
+            # override=True so a reconnecting client can re-register without
+            # an explicit unregister round-trip. Single-client v1 — collisions
+            # between distinct clients are undefined per design doc.
+            registry.register(
+                name=name,
+                toolset=TOOLSET_NAME,
+                schema=registry_schema,
+                handler=handler,
+                is_async=True,
+                description=description,
+                override=True,
+            )
+        except Exception as exc:
+            logger.warning("[%s] tool register %r failed: %s", self.name, name, exc)
+            await self._publish_typed(
+                {
+                    "type": "agent:tool-registered",
+                    "name": name,
+                    "success": False,
+                    "reason": "register-failed",
+                    "detail": str(exc),
+                },
+                identity=identity,
+            )
+            return
 
         self._client_tools.setdefault(identity, set()).add(name)
         self._tool_owners[name] = identity
@@ -2915,12 +2985,11 @@ class LiveKitAdapter(BasePlatformAdapter):
 
     def _deregister_tool(self, name: str, identity: str) -> None:
         """Remove a single tool from the hermes registry and our maps."""
-        if name not in HOST_MANAGED_REMOTE_TOOL_NAMES:
-            try:
-                from tools.registry import registry
-                registry.deregister(name)
-            except Exception as exc:
-                logger.debug("[%s] tool deregister %r failed: %s", self.name, name, exc)
+        try:
+            from tools.registry import registry
+            registry.deregister(name)
+        except Exception as exc:
+            logger.debug("[%s] tool deregister %r failed: %s", self.name, name, exc)
         self._tool_owners.pop(name, None)
         tools = self._client_tools.get(identity)
         if tools:
@@ -3273,13 +3342,13 @@ class LiveKitAdapter(BasePlatformAdapter):
         # function name untouched.
         text = _re.sub(
             r"(?ims)(?:^|[\r\n])\s*"
-            r"(?:find_local_recommendations|[A-Za-z_][A-Za-z0-9_]*)\s*\(.*?\)\s*"
+            r"[A-Za-z_][A-Za-z0-9_]*\s*\(.*?\)\s*"
             r"(?=$|[\r\n])",
             "\n",
             text,
         )
         if _re.fullmatch(
-            r"\s*(?:find_local_recommendations|[A-Za-z_][A-Za-z0-9_]*)\s*\(.*\)\s*",
+            r"\s*[A-Za-z_][A-Za-z0-9_]*\s*\(.*\)\s*",
             text,
             flags=_re.DOTALL,
         ):

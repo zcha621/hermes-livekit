@@ -16,7 +16,20 @@ param(
     [switch]$ConfigureAuxiliaryModel,
     [string]$AuxiliaryModel = "qwythos-9b-claude-mythos-5-1m",
     [string]$AuxiliaryBaseUrl = "http://127.0.0.1:1234/v1",
-    [string]$AuxiliaryApiKey = "lm-studio"
+    [string]$AuxiliaryApiKey = "lm-studio",
+    # hermes-mira-context MCP server (services/hermes-mcp) — itinerary,
+    # traveller location/local time, and meeting-transcript recall. Defaults
+    # to that service's own venv if one has already been created there
+    # (see services/hermes-mcp/README.md); pass -McpPythonExe "" explicitly
+    # to skip registering it. The DB parameters below are only written to
+    # .env when supplied — omit them to leave existing values untouched.
+    [string]$McpPythonExe,
+    [string]$MiraDatabaseUrl,
+    [string]$AwareDbHost,
+    [string]$AwareDbPort,
+    [string]$AwareDbName,
+    [string]$AwareDbUser,
+    [string]$AwareDbPassword
 )
 
 $ErrorActionPreference = "Stop"
@@ -203,6 +216,7 @@ if (-not (Test-Path -LiteralPath $HermesHome)) {
 }
 
 $sourcePlugin = (Resolve-Path -LiteralPath $PSScriptRoot).Path
+$repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
 $pluginsDir = Join-Path $HermesHome "plugins"
 $targetPlugin = Join-Path $pluginsDir "hermes-livekit"
 $envPath = Join-Path $HermesHome ".env"
@@ -243,7 +257,6 @@ $sourceEnv = @{}
 if ($PSBoundParameters.ContainsKey("LiveKitEnvFile")) {
     $candidatePaths = @($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LiveKitEnvFile))
 } else {
-    $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
     $candidatePaths = @(
         (Join-Path $repositoryRoot ".env"),
         (Join-Path $repositoryRoot "infrastructure\livekitserver-docker\.env")
@@ -266,6 +279,14 @@ foreach ($parameterName in @("LiveKitUrl", "LiveKitApiKey", "LiveKitApiSecret"))
         [string]::IsNullOrWhiteSpace((Get-Variable -Name $parameterName -ValueOnly)) -and
         -not [string]::IsNullOrWhiteSpace($sourceEnv[$environmentName])) {
         Set-Variable -Name $parameterName -Value $sourceEnv[$environmentName]
+    }
+}
+
+$resolvedMcpPythonExe = $McpPythonExe
+if (-not $PSBoundParameters.ContainsKey("McpPythonExe")) {
+    $defaultMcpPythonExe = Join-Path $repositoryRoot "services\hermes-mcp\.venv\Scripts\python.exe"
+    if (Test-Path -LiteralPath $defaultMcpPythonExe -PathType Leaf) {
+        $resolvedMcpPythonExe = $defaultMcpPythonExe
     }
 }
 
@@ -292,7 +313,7 @@ $pluginRollback = $null
 try {
     New-Item -ItemType Directory -Path $pluginsDir -Force | Out-Null
     if ($sourcePlugin -ne $targetPlugin) {
-        foreach ($runtimeFile in @("adapter.py", "__init__.py", "tools.py", "configure_yaml.py", "plugin.yaml", "LICENSE")) {
+        foreach ($runtimeFile in @("adapter.py", "__init__.py", "transcript_store.py", "configure_yaml.py", "plugin.yaml", "LICENSE")) {
             $runtimeSource = Join-Path $sourcePlugin $runtimeFile
             if (-not (Test-Path -LiteralPath $runtimeSource -PathType Leaf)) {
                 throw "Required plugin runtime file is missing: $runtimeSource"
@@ -312,7 +333,7 @@ try {
             Remove-Item -LiteralPath $targetPlugin -Recurse -Force
         }
         New-Item -ItemType Directory -Path $targetPlugin -Force | Out-Null
-        foreach ($runtimeFile in @("adapter.py", "__init__.py", "tools.py", "configure_yaml.py", "plugin.yaml", "LICENSE")) {
+        foreach ($runtimeFile in @("adapter.py", "__init__.py", "transcript_store.py", "configure_yaml.py", "plugin.yaml", "LICENSE")) {
             $runtimeSource = Join-Path $sourcePlugin $runtimeFile
             Copy-Item -LiteralPath $runtimeSource -Destination (Join-Path $targetPlugin $runtimeFile) -Force
         }
@@ -322,7 +343,9 @@ try {
     $soulChanged = Install-MiraSoul -SourcePath $soulSource -TargetPath $soulPath -Force:$ReplaceSoul
 
     Write-Host "Installing LiveKit and vision dependencies in the Hermes environment..."
-    & $pythonExe -m pip install "livekit==1.1.10" "livekit-api==1.1.0" "pillow>=10" "pyyaml>=6"
+    # sqlalchemy/pymysql back transcript_store.py's write path into the
+    # tourism-ai-backend's MySQL database (see that module's docstring).
+    & $pythonExe -m pip install "livekit==1.1.10" "livekit-api==1.1.0" "pillow>=10" "pyyaml>=6" "sqlalchemy>=2.0,<3" "pymysql>=1.1,<2"
     if ($LASTEXITCODE -ne 0) { throw "Python dependency installation failed." }
 
     if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
@@ -342,6 +365,19 @@ try {
     Set-DotEnvValue $envPath "LIVEKIT_ROOM" $Room
     Set-DotEnvValue $envPath "LIVEKIT_AGENT_NAME" $AgentName
     Set-DotEnvValue $envPath "LIVEKIT_ALLOW_ALL_USERS" $allowAllUsersValue
+    $dbEnvValueMap = @{
+        MiraDatabaseUrl = "MIRA_DATABASE_URL"
+        AwareDbHost     = "MIRA_AWARE_DATABASE_HOST"
+        AwareDbPort     = "MIRA_AWARE_DATABASE_PORT"
+        AwareDbName     = "MIRA_AWARE_DATABASE_NAME"
+        AwareDbUser     = "MIRA_AWARE_DATABASE_USER"
+        AwareDbPassword = "MIRA_AWARE_DATABASE_PASSWORD"
+    }
+    foreach ($parameterName in $dbEnvValueMap.Keys) {
+        if ($PSBoundParameters.ContainsKey($parameterName)) {
+            Set-DotEnvValue $envPath $dbEnvValueMap[$parameterName] (Get-Variable -Name $parameterName -ValueOnly)
+        }
+    }
     Remove-DotEnvValues $envPath @(
         "HERMES_LIVEKIT_AUTO_VISION",
         "HERMES_LIVEKIT_VIDEO_SAMPLE_SECONDS",
@@ -380,6 +416,9 @@ try {
             "--hermes-root",
             (Join-Path $HermesHome "hermes-agent")
         )
+        if ($resolvedMcpPythonExe) {
+            $yamlArguments += @("--mcp-python-exe", $resolvedMcpPythonExe)
+        }
         if ($ConfigureAuxiliaryModel) {
             $yamlArguments += @(
                 "--auxiliary-model",
@@ -456,6 +495,11 @@ Write-Host "Hermes LiveKit setup is complete."
 Write-Host "Plugin: $targetPlugin"
 Write-Host "Config: $configPath"
 Write-Host "Room:   $Room"
+if ($resolvedMcpPythonExe) {
+    Write-Host "MCP:    hermes-mira-context registered ($resolvedMcpPythonExe)"
+} else {
+    Write-Host "MCP:    hermes-mira-context NOT registered (no services\hermes-mcp\.venv found; pass -McpPythonExe or run 'python -m venv .venv' there first)"
+}
 if (-not $RestartGateway) {
     Write-Host "Restart the Hermes gateway to load the new plugin and YAML configuration."
 }
