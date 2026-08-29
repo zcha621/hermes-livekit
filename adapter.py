@@ -439,6 +439,13 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._invoked_turn_generation = 0
         self._participant_topics: Dict[str, str] = {}
         self._participant_call_ids: Dict[str, str] = {}
+        # Salts every Hermes chat_id this occupancy of the room produces
+        # (see _source_chat_id). Regenerated in _reset_room_context so a
+        # room that empties out and is rejoined later — even by the same
+        # portal participant, whose mira_conversation_id is otherwise a
+        # stable per-(user, room) id — starts a brand new Hermes session
+        # instead of resuming the previous occupancy's conversation.
+        self._session_epoch: str = uuid.uuid4().hex[:12]
         self._armed_participant_wakes: Dict[str, tuple[str, float]] = {}
         self._push_to_talk_sessions: Dict[str, str] = {}
         self._conversation_transcript: list[Dict[str, Any]] = []
@@ -578,6 +585,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         """Forget conversational state when the room session ends."""
         self._participant_topics.clear()
         self._participant_call_ids.clear()
+        self._session_epoch = uuid.uuid4().hex[:12]
         self._armed_participant_wakes.clear()
         self._push_to_talk_sessions.clear()
         self._conversation_transcript.clear()
@@ -612,17 +620,42 @@ class LiveKitAdapter(BasePlatformAdapter):
             if isinstance(key, str) and isinstance(value, str) and value.strip()
         }
 
+    def _can_bring_agent(self, identity: str) -> bool:
+        """Whether ``identity`` created this room and controls its agent.
+
+        Set by the web portal (apps/web-portal/src/pages/api/meeting/session.ts
+        and .../trips/connect.ts) from ``roomParticipationPolicy.canBringAgent``.
+        Everyone else can still be heard and addressed by the agent once it's
+        speaking, but cannot bring it into a conversation, barge in on its
+        speech, or otherwise directly command it — only the owner can.
+        Legacy connections with no such metadata are treated as owners so
+        older clients are not silently locked out.
+        """
+        metadata = self._participant_connection_metadata(identity)
+        if "can_bring_agent" not in metadata:
+            return True
+        return metadata.get("can_bring_agent", "").strip().lower() == "true"
+
     def _source_chat_id(self, identity: str) -> str:
-        """Scope Hermes history to the call/planning connection, not the room."""
+        """Scope Hermes history to this occupancy of the room, not the room name.
+
+        ``mira_conversation_id`` (from the web portal) is a stable id per
+        (user, room) — the *same* value every time that person joins that
+        room, on any day. Without ``_session_epoch`` mixed in, that would
+        make Hermes resume the exact same session/history across unrelated
+        visits days apart. The epoch is regenerated whenever the room empties
+        out (see ``_reset_room_context``), so each fresh occupancy — even by
+        the same participant in the same room — gets its own Hermes session.
+        """
         conversation_id = self._participant_connection_metadata(identity).get(
             "mira_conversation_id", ""
         )
         if CONVERSATION_ID_RE.fullmatch(conversation_id):
-            return f"{self._room_name}:conversation:{conversation_id}"
+            return f"{self._room_name}:{self._session_epoch}:conversation:{conversation_id}"
         call_id = self._participant_call_ids.setdefault(
             identity or "client", uuid.uuid4().hex
         )
-        return f"{self._room_name}:call:{call_id}"
+        return f"{self._room_name}:{self._session_epoch}:call:{call_id}"
 
     def source_connection_metadata(self, identity: str) -> Dict[str, str]:
         """Expose only bounded fields used by plugin lifecycle hooks."""
@@ -2029,13 +2062,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._latest_video_frames.pop(key, None)
 
     def _interrupt_playback(self, identity: str) -> bool:
-        # `_conversation_is_active()` tracks bookkeeping (`_invoked_turn_active`)
-        # that the text-delivery path (`send()`) can clear slightly ahead of
-        # `play_tts()` actually finishing its audio loop. Gating a barge-in on
-        # that flag as well as `_is_playing` let a real, in-progress TTS
-        # playback go un-interruptible whenever that race landed. Audio that
-        # is actually playing should always be interruptible.
-        if not self._is_playing:
+        if not self._is_playing or not self._conversation_is_active():
             return False
         logger.info("[%s] Barge-in detected from %s; stopping TTS", self.name, identity)
         self._playback_interrupt.set()
@@ -2106,14 +2133,20 @@ class LiveKitAdapter(BasePlatformAdapter):
                         # not cut the agent off on its own.
                         if identity not in self._speaking_participants:
                             self._speaking_participants.add(identity)
-                            # Deliberately does NOT publish "agent:listening-start" or
-                            # flip the agent state here: this branch fires for any mic
-                            # energy above the RMS floor, not just directed speech, and
-                            # a held @Agent button already reports "listening" itself
-                            # (_handle_push_to_talk_start). Surfacing "Listening to X"
-                            # for ambient/incidental audio makes the status banner lie
-                            # about what the agent is actually paying attention to; the
-                            # transcript is still captured below for wake-term matching.
+                            # Ambient conversation in the room — anyone's, including
+                            # the owner's — must not barge in on Hermes's speech on
+                            # its own; only a deliberate @Agent press or explicit
+                            # interrupt does that (both owner-only, see
+                            # _can_bring_agent). This also deliberately does NOT
+                            # publish "agent:listening-start" or flip the agent
+                            # state here: this branch fires for any mic energy
+                            # above the RMS floor, not just directed speech, and a
+                            # held @Agent button already reports "listening" itself
+                            # (_handle_push_to_talk_start). Surfacing "Listening to
+                            # X" for ambient/incidental audio makes the status
+                            # banner lie about what the agent is actually paying
+                            # attention to; the transcript is still captured below
+                            # for wake-term matching.
                         continue
 
                     # A held @Agent button defines the utterance boundary. Do
@@ -2541,6 +2574,17 @@ class LiveKitAdapter(BasePlatformAdapter):
     ) -> None:
         """Start one identity-bound explicit voice request."""
         request_id = str(msg.get("request_id") or uuid.uuid4().hex[:12])[:128]
+        if not self._can_bring_agent(identity):
+            await self._publish_agent_event(
+                "agent:push-to-talk-ignored",
+                {
+                    "identity": identity,
+                    "request_id": request_id,
+                    "reason": "not-authorized",
+                },
+            )
+            return
+
         active_request = self._push_to_talk_sessions.get(identity)
         if active_request:
             await self._publish_agent_event(
@@ -2553,18 +2597,26 @@ class LiveKitAdapter(BasePlatformAdapter):
             )
             return
 
+        # Pressing @Agent is a barge-in: if Hermes is mid-speech or still
+        # generating/running tools for a prior turn, drop that work immediately
+        # instead of making this request queue behind it. The playback flush
+        # is synchronous (audio cuts the instant the button is pressed); the
+        # backend /stop dispatch runs in the background so cancelling a
+        # prior turn never delays this press from starting to listen — see
+        # _dispatch_stop_command's docstring.
+        # `_conversation_is_active()` alone can go stale (see
+        # `_handle_client_interrupt`); `_is_playing` catches a real in-flight
+        # turn this flag hasn't caught up to yet.
+        if self._conversation_is_active() or self._is_playing:
+            self._interrupt_playback(identity)
+            self._finish_tool_acknowledgement_turn()
+            asyncio.create_task(self._dispatch_stop_command(identity, request_id))
+
         self._push_to_talk_sessions[identity] = request_id
         if identity in self._audio_buffers:
             self._audio_buffers[identity] = bytearray()
         self._last_audio_time.pop(identity, None)
         self._speaking_participants.discard(identity)
-
-        # Barge in on whatever Hermes was doing *before* announcing
-        # "listening", fully awaited, so the /stop dispatch it can trigger
-        # -- a real turn through the message pipeline -- has already
-        # settled and cannot land afterwards and flip the state back off
-        # "listening" out from under a fresh @Agent press.
-        await self._barge_in(identity, request_id)
 
         await self._set_listening_state(identity)
         await self._publish_agent_event(
@@ -2643,25 +2695,74 @@ class LiveKitAdapter(BasePlatformAdapter):
             )
         )
 
-    async def _barge_in(self, identity: str, request_id: str) -> bool:
-        """Stop current audio and make Hermes cancel its in-flight response.
-
-        Returns True if there was anything to cancel. Callers that go on to
-        set a new state (e.g. push-to-talk's "listening") must await this
-        first so the /stop dispatch it triggers -- which walks the full
-        message pipeline and can take a while -- can never complete *after*
-        and clobber a state set afterwards.
-        """
+    async def _handle_client_interrupt(
+        self, msg: Dict[str, Any], identity: str
+    ) -> None:
+        """Stop current audio and make Hermes cancel its in-flight response."""
+        if not self._can_bring_agent(identity):
+            await self._publish_agent_event(
+                "agent:interrupt-ignored",
+                {
+                    "identity": identity,
+                    "request_id": str(msg.get("request_id") or ""),
+                    "reason": "not-authorized",
+                },
+            )
+            return
         # `_conversation_is_active()` alone can be stale (see `_interrupt_playback`):
         # `_is_playing` is the ground truth for "there is audio to barge in on"
         # and must not be gated out by it, or a genuine mid-speech interrupt can
         # be silently dropped as `agent:interrupt-ignored`.
         if not self._conversation_is_active() and not self._is_playing:
-            return False
+            await self._publish_agent_event(
+                "agent:interrupt-ignored",
+                {
+                    "identity": identity,
+                    "request_id": str(msg.get("request_id") or ""),
+                    "reason": "no-active-response",
+                },
+            )
+            return
 
+        await self._cancel_active_response(
+            identity, str(msg.get("request_id") or "")
+        )
+        await self._publish_agent_event(
+            "agent:interrupted",
+            {
+                "identity": identity,
+                "request_id": str(msg.get("request_id") or ""),
+                "reason": "user-request",
+            },
+        )
+
+    async def _cancel_active_response(self, identity: str, request_id: str) -> None:
+        """Stop TTS playback and dispatch Hermes's priority ``/stop`` command.
+
+        Used by the explicit "Stop agent" control (`_handle_client_interrupt`),
+        where stopping is the whole point of the action so waiting for it to
+        fully complete is correct. `_handle_push_to_talk_start` does NOT use
+        this directly — see `_dispatch_stop_command`'s docstring for why.
+        Caller is responsible for checking ``_conversation_is_active()``
+        first if it needs to report a distinct "nothing to interrupt"
+        outcome.
+        """
         self._interrupt_playback(identity)
         self._finish_tool_acknowledgement_turn()
+        await self._dispatch_stop_command(identity, request_id)
 
+    async def _dispatch_stop_command(self, identity: str, request_id: str) -> None:
+        """Dispatch Hermes's priority ``/stop`` command as a gateway command.
+
+        Split out from `_cancel_active_response` so pressing @Agent can flush
+        audio synchronously (instant, see `_handle_push_to_talk_start`) and
+        fire this part in the background instead of awaiting it: base.py's
+        ``_dispatch_active_session_command`` deliberately runs the old turn's
+        cancellation to completion in order (it can take a real moment), and
+        no press should ever feel delayed behind a PRIOR turn's teardown —
+        the traveller is already being listened to by the time this
+        resolves.
+        """
         # Dispatch the canonical gateway command rather than conversational
         # text. /stop always cancels generation, tools, and child agents; it is
         # never demoted by a queue/steer busy-input policy.
@@ -2683,32 +2784,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             timestamp=datetime.now(tz=timezone.utc),
         )
         setattr(event, "_livekit_invocation_checked", True)
-        await self._publish_agent_event(
-            "agent:interrupted",
-            {
-                "identity": identity,
-                "request_id": request_id,
-                "reason": "user-request",
-            },
-        )
         await self.handle_message(event)
-        return True
-
-    async def _handle_client_interrupt(
-        self, msg: Dict[str, Any], identity: str
-    ) -> None:
-        """Stop current audio and make Hermes cancel its in-flight response."""
-        request_id = str(msg.get("request_id") or "")
-        interrupted = await self._barge_in(identity, request_id)
-        if not interrupted:
-            await self._publish_agent_event(
-                "agent:interrupt-ignored",
-                {
-                    "identity": identity,
-                    "request_id": request_id,
-                    "reason": "no-active-response",
-                },
-            )
 
     # -- Remote tools (client-registered) -----------------------------------
 
