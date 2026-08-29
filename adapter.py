@@ -914,7 +914,13 @@ class LiveKitAdapter(BasePlatformAdapter):
         if armed is not None and armed[1] >= time.monotonic():
             armed_keyterm = armed[0]
         effective_keyterm = matched_keyterm or armed_keyterm or invocation_keyterm
-        invoked = force_invoke or bool(effective_keyterm) or not self._invocation_enabled
+        # Only the room owner (`can_bring_agent`) may engage the agent at all —
+        # not just command it once engaged. Without this, anyone's wake-term
+        # or ambient (invocation-disabled) speech would still open a turn and
+        # make the agent "work for" a non-owner participant.
+        invoked = self._can_bring_agent(identity) and (
+            force_invoke or bool(effective_keyterm) or not self._invocation_enabled
+        )
         entry = self._append_transcript(
             role="user",
             identity=identity,

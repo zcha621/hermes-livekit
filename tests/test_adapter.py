@@ -1015,6 +1015,38 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.adapter._can_bring_agent("alice"))
         self.assertFalse(self.adapter._can_bring_agent("bob"))
 
+    async def test_wake_keyterm_from_a_non_owner_does_not_invoke_the_agent(self):
+        """A shared room's agent belongs to its owner only (`can_bring_agent`).
+
+        Even a correctly-spoken wake keyterm from someone else must not open a
+        turn — otherwise the agent ends up "working for" a guest instead of
+        the room's creator.
+        """
+        self.adapter._room = SimpleNamespace(
+            remote_participants={
+                "alice": SimpleNamespace(
+                    name="Alice", metadata=json.dumps({"can_bring_agent": "true"})
+                ),
+                "bob": SimpleNamespace(
+                    name="Bob", metadata=json.dumps({"can_bring_agent": "false"})
+                ),
+            },
+            local_participant=SimpleNamespace(set_attributes=AsyncMock()),
+        )
+        guest_wake = livekit_adapter.MessageEvent(
+            text="MiRA, plan my afternoon",
+            message_type=livekit_adapter.MessageType.VOICE,
+            source=self.adapter.build_source(
+                chat_id="test-room", chat_type="group", user_id="bob"
+            ),
+        )
+
+        with patch.object(self.adapter, "_publish_agent_event", AsyncMock()):
+            accepted = await self.adapter._prepare_invoked_event(guest_wake)
+
+        self.assertFalse(accepted)
+        self.assertNotEqual(self.adapter._active_speaker_identity, "bob")
+
     async def test_push_to_talk_start_rejected_for_a_participant_who_did_not_create_the_room(self):
         self.adapter._room = SimpleNamespace(
             remote_participants={
