@@ -434,6 +434,13 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._invoked_turn_generation = 0
         self._participant_topics: Dict[str, str] = {}
         self._participant_call_ids: Dict[str, str] = {}
+        # Salts every Hermes chat_id this occupancy of the room produces
+        # (see _source_chat_id). Regenerated in _reset_room_context so a
+        # room that empties out and is rejoined later — even by the same
+        # portal participant, whose mira_conversation_id is otherwise a
+        # stable per-(user, room) id — starts a brand new Hermes session
+        # instead of resuming the previous occupancy's conversation.
+        self._session_epoch: str = uuid.uuid4().hex[:12]
         self._armed_participant_wakes: Dict[str, tuple[str, float]] = {}
         self._push_to_talk_sessions: Dict[str, str] = {}
         self._conversation_transcript: list[Dict[str, Any]] = []
@@ -573,6 +580,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         """Forget conversational state when the room session ends."""
         self._participant_topics.clear()
         self._participant_call_ids.clear()
+        self._session_epoch = uuid.uuid4().hex[:12]
         self._armed_participant_wakes.clear()
         self._push_to_talk_sessions.clear()
         self._conversation_transcript.clear()
@@ -624,16 +632,25 @@ class LiveKitAdapter(BasePlatformAdapter):
         return metadata.get("can_bring_agent", "").strip().lower() == "true"
 
     def _source_chat_id(self, identity: str) -> str:
-        """Scope Hermes history to the call/planning connection, not the room."""
+        """Scope Hermes history to this occupancy of the room, not the room name.
+
+        ``mira_conversation_id`` (from the web portal) is a stable id per
+        (user, room) — the *same* value every time that person joins that
+        room, on any day. Without ``_session_epoch`` mixed in, that would
+        make Hermes resume the exact same session/history across unrelated
+        visits days apart. The epoch is regenerated whenever the room empties
+        out (see ``_reset_room_context``), so each fresh occupancy — even by
+        the same participant in the same room — gets its own Hermes session.
+        """
         conversation_id = self._participant_connection_metadata(identity).get(
             "mira_conversation_id", ""
         )
         if CONVERSATION_ID_RE.fullmatch(conversation_id):
-            return f"{self._room_name}:conversation:{conversation_id}"
+            return f"{self._room_name}:{self._session_epoch}:conversation:{conversation_id}"
         call_id = self._participant_call_ids.setdefault(
             identity or "client", uuid.uuid4().hex
         )
-        return f"{self._room_name}:call:{call_id}"
+        return f"{self._room_name}:{self._session_epoch}:call:{call_id}"
 
     def source_connection_metadata(self, identity: str) -> Dict[str, str]:
         """Expose only bounded fields used by plugin lifecycle hooks."""
@@ -2571,9 +2588,15 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         # Pressing @Agent is a barge-in: if Hermes is mid-speech or still
         # generating/running tools for a prior turn, drop that work immediately
-        # instead of making this request queue behind it.
+        # instead of making this request queue behind it. The playback flush
+        # is synchronous (audio cuts the instant the button is pressed); the
+        # backend /stop dispatch runs in the background so cancelling a
+        # prior turn never delays this press from starting to listen — see
+        # _dispatch_stop_command's docstring.
         if self._conversation_is_active():
-            await self._cancel_active_response(identity, request_id)
+            self._interrupt_playback(identity)
+            self._finish_tool_acknowledgement_turn()
+            asyncio.create_task(self._dispatch_stop_command(identity, request_id))
 
         self._push_to_talk_sessions[identity] = request_id
         if identity in self._audio_buffers:
@@ -2697,16 +2720,30 @@ class LiveKitAdapter(BasePlatformAdapter):
     async def _cancel_active_response(self, identity: str, request_id: str) -> None:
         """Stop TTS playback and dispatch Hermes's priority ``/stop`` command.
 
-        Shared by the explicit "Stop agent" control (`_handle_client_interrupt`)
-        and by push-to-talk-start (`_handle_push_to_talk_start`): pressing
-        @Agent while Hermes is speaking or still generating/running tools
-        must immediately barge in rather than queue behind it. Caller is
-        responsible for checking ``_conversation_is_active()`` first if it
-        needs to report a distinct "nothing to interrupt" outcome.
+        Used by the explicit "Stop agent" control (`_handle_client_interrupt`),
+        where stopping is the whole point of the action so waiting for it to
+        fully complete is correct. `_handle_push_to_talk_start` does NOT use
+        this directly — see `_dispatch_stop_command`'s docstring for why.
+        Caller is responsible for checking ``_conversation_is_active()``
+        first if it needs to report a distinct "nothing to interrupt"
+        outcome.
         """
         self._interrupt_playback(identity)
         self._finish_tool_acknowledgement_turn()
+        await self._dispatch_stop_command(identity, request_id)
 
+    async def _dispatch_stop_command(self, identity: str, request_id: str) -> None:
+        """Dispatch Hermes's priority ``/stop`` command as a gateway command.
+
+        Split out from `_cancel_active_response` so pressing @Agent can flush
+        audio synchronously (instant, see `_handle_push_to_talk_start`) and
+        fire this part in the background instead of awaiting it: base.py's
+        ``_dispatch_active_session_command`` deliberately runs the old turn's
+        cancellation to completion in order (it can take a real moment), and
+        no press should ever feel delayed behind a PRIOR turn's teardown —
+        the traveller is already being listened to by the time this
+        resolves.
+        """
         # Dispatch the canonical gateway command rather than conversational
         # text. /stop always cancels generation, tools, and child agents; it is
         # never demoted by a queue/steer busy-input policy.

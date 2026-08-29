@@ -158,7 +158,8 @@ class AdapterTests(unittest.TestCase):
 
         self.assertEqual(alice_first, alice_followup)
         self.assertNotEqual(alice_first, bob)
-        self.assertTrue(alice_first.startswith("test-room:call:"))
+        self.assertTrue(alice_first.startswith("test-room:"))
+        self.assertIn(":call:", alice_first)
         self.assertNotEqual(alice_first, "test-room")
 
         self.adapter._reset_room_context()
@@ -175,9 +176,26 @@ class AdapterTests(unittest.TestCase):
         ):
             result = self.adapter._source_chat_id("alice")
 
-        self.assertEqual(
-            result, "test-room:conversation:call-20260827-a"
-        )
+        self.assertTrue(result.startswith("test-room:"))
+        self.assertTrue(result.endswith(":conversation:call-20260827-a"))
+
+    def test_source_chat_id_changes_after_the_room_empties_and_is_rejoined(self):
+        """A portal participant's mira_conversation_id is stable per (user,
+        room) forever — the session_epoch reset on room-empty is what stops
+        a later, unrelated visit from resuming the earlier conversation."""
+        with patch.object(
+            self.adapter,
+            "_participant_connection_metadata",
+            return_value={"mira_conversation_id": "call-20260827-a"},
+        ):
+            first_visit = self.adapter._source_chat_id("alice")
+
+            self.adapter._reset_room_context()
+
+            second_visit = self.adapter._source_chat_id("alice")
+
+        self.assertNotEqual(first_visit, second_visit)
+        self.assertTrue(second_visit.endswith(":conversation:call-20260827-a"))
 
     def test_mcp_identifier_context_includes_room_account_and_device(self):
         with patch.object(
@@ -938,16 +956,24 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "alice",
             )
 
-        # The agent's speech is flushed immediately...
-        self.assertTrue(source.cleared)
-        self.assertTrue(self.adapter._playback_interrupt.is_set())
-        # ...and its in-flight backend work is dropped via the priority /stop.
+            # The agent's speech is flushed and the press itself starts a
+            # held @Agent turn immediately — neither waits on the backend
+            # /stop dispatch below, which is why this holds before the
+            # event loop even gets a chance to run that background task.
+            self.assertTrue(source.cleared)
+            self.assertTrue(self.adapter._playback_interrupt.is_set())
+            self.assertEqual(self.adapter._push_to_talk_sessions["alice"], "press-1")
+            dispatched.assert_not_awaited()
+
+            # The prior turn's backend work is still dropped via the
+            # priority /stop, just as a background task instead of
+            # blocking this press.
+            await asyncio.sleep(0)
+
         dispatched.assert_awaited_once()
         event = dispatched.await_args.args[0]
         self.assertEqual(event.text, "/stop")
         self.assertEqual(event.source.user_id, "alice")
-        # The press itself still starts a held @Agent turn as normal.
-        self.assertEqual(self.adapter._push_to_talk_sessions["alice"], "press-1")
 
     async def test_push_to_talk_start_skips_stop_dispatch_when_agent_is_idle(self):
         self.adapter._room = SimpleNamespace(
