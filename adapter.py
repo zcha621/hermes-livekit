@@ -340,11 +340,16 @@ class LiveKitAdapter(BasePlatformAdapter):
             invocation_config.get("standalone_followup_seconds"),
             DEFAULT_STANDALONE_WAKE_FOLLOWUP_SECONDS,
         )
+        # Anchored to the start of the utterance (plus an optional short
+        # greeting) rather than searched anywhere in it. A short, common
+        # keyterm like "Agent" otherwise matches incidental mentions
+        # mid-sentence -- "my travel agent said..." -- and silently
+        # auto-invokes on unrelated conversation.
         self._keyterm_patterns = tuple(
             (
                 keyterm,
                 re.compile(
-                    r"(?<!\w)"
+                    r"^\s*(?:(?:hey|hi|okay|ok)[\s,]+)?"
                     + r"\s+".join(re.escape(part) for part in keyterm.split())
                     + r"(?!\w)",
                     re.IGNORECASE,
@@ -535,7 +540,7 @@ class LiveKitAdapter(BasePlatformAdapter):
     def _match_keyterm(self, transcript: str) -> tuple[str, str]:
         """Return ``(matched keyterm, optionally stripped transcript)``."""
         for keyterm, pattern in self._keyterm_patterns:
-            match = pattern.search(transcript)
+            match = pattern.match(transcript)
             if match is None:
                 continue
             cleaned = transcript
@@ -2024,7 +2029,13 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._latest_video_frames.pop(key, None)
 
     def _interrupt_playback(self, identity: str) -> bool:
-        if not self._is_playing or not self._conversation_is_active():
+        # `_conversation_is_active()` tracks bookkeeping (`_invoked_turn_active`)
+        # that the text-delivery path (`send()`) can clear slightly ahead of
+        # `play_tts()` actually finishing its audio loop. Gating a barge-in on
+        # that flag as well as `_is_playing` let a real, in-progress TTS
+        # playback go un-interruptible whenever that race landed. Audio that
+        # is actually playing should always be interruptible.
+        if not self._is_playing:
             return False
         logger.info("[%s] Barge-in detected from %s; stopping TTS", self.name, identity)
         self._playback_interrupt.set()
@@ -2088,16 +2099,21 @@ class LiveKitAdapter(BasePlatformAdapter):
                     if rms > self._rms_silence_floor:
                         # Active speech — update timestamp
                         self._last_audio_time[identity] = time.monotonic()
-                        # Emit listening-start on first loud chunk of an utterance
+                        # Emit listening-start on first loud chunk of an utterance.
+                        # Deliberately does NOT call _interrupt_playback: barge-in is
+                        # opt-in via the explicit @Agent button (_handle_client_interrupt),
+                        # not ambient mic energy -- incidental talk near a live mic must
+                        # not cut the agent off on its own.
                         if identity not in self._speaking_participants:
                             self._speaking_participants.add(identity)
-                            self._interrupt_playback(identity)
-                            asyncio.create_task(
-                                self._publish_agent_event(
-                                    "agent:listening-start", {"identity": identity}
-                                )
-                            )
-                            asyncio.create_task(self._set_listening_state(identity))
+                            # Deliberately does NOT publish "agent:listening-start" or
+                            # flip the agent state here: this branch fires for any mic
+                            # energy above the RMS floor, not just directed speech, and
+                            # a held @Agent button already reports "listening" itself
+                            # (_handle_push_to_talk_start). Surfacing "Listening to X"
+                            # for ambient/incidental audio makes the status banner lie
+                            # about what the agent is actually paying attention to; the
+                            # transcript is still captured below for wake-term matching.
                         continue
 
                     # A held @Agent button defines the utterance boundary. Do
@@ -2542,6 +2558,14 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._audio_buffers[identity] = bytearray()
         self._last_audio_time.pop(identity, None)
         self._speaking_participants.discard(identity)
+
+        # Barge in on whatever Hermes was doing *before* announcing
+        # "listening", fully awaited, so the /stop dispatch it can trigger
+        # -- a real turn through the message pipeline -- has already
+        # settled and cannot land afterwards and flip the state back off
+        # "listening" out from under a fresh @Agent press.
+        await self._barge_in(identity, request_id)
+
         await self._set_listening_state(identity)
         await self._publish_agent_event(
             "agent:push-to-talk-started",
@@ -2619,20 +2643,21 @@ class LiveKitAdapter(BasePlatformAdapter):
             )
         )
 
-    async def _handle_client_interrupt(
-        self, msg: Dict[str, Any], identity: str
-    ) -> None:
-        """Stop current audio and make Hermes cancel its in-flight response."""
-        if not self._conversation_is_active():
-            await self._publish_agent_event(
-                "agent:interrupt-ignored",
-                {
-                    "identity": identity,
-                    "request_id": str(msg.get("request_id") or ""),
-                    "reason": "no-active-response",
-                },
-            )
-            return
+    async def _barge_in(self, identity: str, request_id: str) -> bool:
+        """Stop current audio and make Hermes cancel its in-flight response.
+
+        Returns True if there was anything to cancel. Callers that go on to
+        set a new state (e.g. push-to-talk's "listening") must await this
+        first so the /stop dispatch it triggers -- which walks the full
+        message pipeline and can take a while -- can never complete *after*
+        and clobber a state set afterwards.
+        """
+        # `_conversation_is_active()` alone can be stale (see `_interrupt_playback`):
+        # `_is_playing` is the ground truth for "there is audio to barge in on"
+        # and must not be gated out by it, or a genuine mid-speech interrupt can
+        # be silently dropped as `agent:interrupt-ignored`.
+        if not self._conversation_is_active() and not self._is_playing:
+            return False
 
         self._interrupt_playback(identity)
         self._finish_tool_acknowledgement_turn()
@@ -2652,7 +2677,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             text="/stop",
             message_type=MessageType.TEXT,
             source=source,
-            message_id=str(msg.get("request_id") or uuid.uuid4().hex[:12]),
+            message_id=request_id or uuid.uuid4().hex[:12],
             media_urls=[],
             media_types=[],
             timestamp=datetime.now(tz=timezone.utc),
@@ -2662,11 +2687,28 @@ class LiveKitAdapter(BasePlatformAdapter):
             "agent:interrupted",
             {
                 "identity": identity,
-                "request_id": str(msg.get("request_id") or ""),
+                "request_id": request_id,
                 "reason": "user-request",
             },
         )
         await self.handle_message(event)
+        return True
+
+    async def _handle_client_interrupt(
+        self, msg: Dict[str, Any], identity: str
+    ) -> None:
+        """Stop current audio and make Hermes cancel its in-flight response."""
+        request_id = str(msg.get("request_id") or "")
+        interrupted = await self._barge_in(identity, request_id)
+        if not interrupted:
+            await self._publish_agent_event(
+                "agent:interrupt-ignored",
+                {
+                    "identity": identity,
+                    "request_id": request_id,
+                    "reason": "no-active-response",
+                },
+            )
 
     # -- Remote tools (client-registered) -----------------------------------
 
@@ -3140,12 +3182,20 @@ class LiveKitAdapter(BasePlatformAdapter):
         # failed, because the room transcript is the source of future context.
         if not (metadata or {}).get("non_conversational"):
             if content != self._last_spoken_source:
+                # No play_tts call accompanied this content, so nothing else
+                # will close out the turn -- do it here as a fallback.
                 await self._record_agent_transcript(
                     content, kind="response", publish_standard=False
                 )
+                self._finish_invoked_turn()
+                await self._set_agent_state("idle", force=True)
+            # Else: play_tts already spoke this exact content and its own
+            # (generation-guarded) finally block owns finishing the turn.
+            # A multi-step response can call send() more than once before
+            # the turn is actually done; force-idling here unconditionally
+            # made the status banner flash "ready" mid-task and cleared
+            # _invoked_turn_active while Hermes was still working.
             self._last_spoken_source = ""
-            self._finish_invoked_turn()
-            await self._set_agent_state("idle", force=True)
 
         # Not a failure — voice is the primary channel.
         return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
