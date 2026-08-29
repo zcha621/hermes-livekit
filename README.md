@@ -207,7 +207,10 @@ auto-start, applies the LiveKit configuration, validates it, and restarts the
 gateway. It reuses credentials from the existing Hermes `.env` or from
 `infrastructure\livekitserver-docker\.env`; if neither contains a complete
 LiveKit configuration, it prompts for the three required values. The window
-stays open at the end so success or an actionable error is visible.
+stays open at the end so success or an actionable error is visible. It also
+creates and installs `services\hermes-mcp\.venv` when missing, discovers MiRA
+database credentials from `infrastructure\.env.remote`, registers the MCP,
+and opts this project into public Nominatim reverse geocoding.
 
 ## Scripted install or update
 
@@ -242,6 +245,10 @@ Use `-InstallHermes` for a new host, `-InstallFfmpeg` if FFmpeg is missing, and
 existing `LIVEKIT_*` values unless replacements are supplied. Use
 `-ReplaceSoul` only after reviewing a customized SOUL; setup saves the previous
 file as `SOUL.md.mira.bak`.
+
+For a private geocoder, run the PowerShell entry point with
+`-ReverseGeocoderUrl https://your-nominatim-host/reverse`. Omit that parameter
+to preserve an existing choice without enabling a provider on a new setup.
 
 ## Evidence routes
 

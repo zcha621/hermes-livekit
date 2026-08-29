@@ -5,6 +5,7 @@ param(
     [string]$LiveKitApiKey,
     [string]$LiveKitApiSecret,
     [string]$LiveKitEnvFile,
+    [string]$MiraEnvFile,
     [string]$Room = "hermes",
     [string]$AgentName = "Hermes",
     [switch]$AllowAllUsers,
@@ -21,15 +22,17 @@ param(
     # traveller location/local time, and meeting-transcript recall. Defaults
     # to that service's own venv if one has already been created there
     # (see services/hermes-mcp/README.md); pass -McpPythonExe "" explicitly
-    # to skip registering it. The DB parameters below are only written to
-    # .env when supplied — omit them to leave existing values untouched.
+    # to skip registering it. Existing values are preserved; on a fresh host,
+    # direct MIRA_* values or compose credentials are discovered from
+    # -MiraEnvFile / infrastructure\.env.remote when available.
     [string]$McpPythonExe,
     [string]$MiraDatabaseUrl,
     [string]$AwareDbHost,
     [string]$AwareDbPort,
     [string]$AwareDbName,
     [string]$AwareDbUser,
-    [string]$AwareDbPassword
+    [string]$AwareDbPassword,
+    [string]$ReverseGeocoderUrl
 )
 
 $ErrorActionPreference = "Stop"
@@ -244,6 +247,13 @@ $existingValueMap = @{
     LiveKitApiSecret = "LIVEKIT_API_SECRET"
     Room             = "LIVEKIT_ROOM"
     AgentName        = "LIVEKIT_AGENT_NAME"
+    MiraDatabaseUrl  = "MIRA_DATABASE_URL"
+    AwareDbHost      = "MIRA_AWARE_DATABASE_HOST"
+    AwareDbPort      = "MIRA_AWARE_DATABASE_PORT"
+    AwareDbName      = "MIRA_AWARE_DATABASE_NAME"
+    AwareDbUser      = "MIRA_AWARE_DATABASE_USER"
+    AwareDbPassword  = "MIRA_AWARE_DATABASE_PASSWORD"
+    ReverseGeocoderUrl = "MIRA_REVERSE_GEOCODER_URL"
 }
 foreach ($parameterName in $existingValueMap.Keys) {
     $environmentName = $existingValueMap[$parameterName]
@@ -282,10 +292,80 @@ foreach ($parameterName in @("LiveKitUrl", "LiveKitApiKey", "LiveKitApiSecret"))
     }
 }
 
+$miraSourceEnv = @{}
+if ($PSBoundParameters.ContainsKey("MiraEnvFile")) {
+    $miraCandidatePaths = @($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($MiraEnvFile))
+} else {
+    $miraCandidatePaths = @(
+        (Join-Path $repositoryRoot ".env"),
+        (Join-Path $repositoryRoot "infrastructure\.env.remote"),
+        (Join-Path $repositoryRoot "infrastructure\.env.edge")
+    )
+}
+foreach ($candidate in $miraCandidatePaths) {
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+    $candidateValues = Get-DotEnvValues $candidate
+    $hasDirectMiraDatabase = -not [string]::IsNullOrWhiteSpace($candidateValues["MIRA_DATABASE_URL"])
+    $hasComposableMiraDatabase = (
+        -not [string]::IsNullOrWhiteSpace($candidateValues["MIRA_DB_RUNTIME_USER"]) -and
+        -not [string]::IsNullOrWhiteSpace($candidateValues["MIRA_DB_RUNTIME_PASSWORD"]) -and
+        -not [string]::IsNullOrWhiteSpace($candidateValues["MIRA_DB_NAME"])
+    )
+    if ($hasDirectMiraDatabase -or $hasComposableMiraDatabase) {
+        $miraSourceEnv = $candidateValues
+        Write-Host "Reusing MiRA database configuration from '$candidate'."
+        break
+    }
+}
+
+$miraDirectValueMap = @{
+    MiraDatabaseUrl    = "MIRA_DATABASE_URL"
+    AwareDbHost        = "MIRA_AWARE_DATABASE_HOST"
+    AwareDbPort        = "MIRA_AWARE_DATABASE_PORT"
+    AwareDbName        = "MIRA_AWARE_DATABASE_NAME"
+    AwareDbUser        = "MIRA_AWARE_DATABASE_USER"
+    AwareDbPassword    = "MIRA_AWARE_DATABASE_PASSWORD"
+    ReverseGeocoderUrl = "MIRA_REVERSE_GEOCODER_URL"
+}
+foreach ($parameterName in $miraDirectValueMap.Keys) {
+    $environmentName = $miraDirectValueMap[$parameterName]
+    if (-not $PSBoundParameters.ContainsKey($parameterName) -and
+        [string]::IsNullOrWhiteSpace((Get-Variable -Name $parameterName -ValueOnly)) -and
+        -not [string]::IsNullOrWhiteSpace($miraSourceEnv[$environmentName])) {
+        Set-Variable -Name $parameterName -Value $miraSourceEnv[$environmentName]
+    }
+}
+
+$miraDbPort = $miraSourceEnv["MIRA_PORTAL_DB_PORT"]
+if ([string]::IsNullOrWhiteSpace($miraDbPort)) { $miraDbPort = "3306" }
+if ([string]::IsNullOrWhiteSpace($MiraDatabaseUrl) -and
+    -not [string]::IsNullOrWhiteSpace($miraSourceEnv["MIRA_DB_RUNTIME_USER"]) -and
+    -not [string]::IsNullOrWhiteSpace($miraSourceEnv["MIRA_DB_RUNTIME_PASSWORD"]) -and
+    -not [string]::IsNullOrWhiteSpace($miraSourceEnv["MIRA_DB_NAME"])) {
+    $encodedMiraUser = [uri]::EscapeDataString($miraSourceEnv["MIRA_DB_RUNTIME_USER"])
+    $encodedMiraPassword = [uri]::EscapeDataString($miraSourceEnv["MIRA_DB_RUNTIME_PASSWORD"])
+    $MiraDatabaseUrl = "mysql+pymysql://${encodedMiraUser}:${encodedMiraPassword}@127.0.0.1:${miraDbPort}/$($miraSourceEnv['MIRA_DB_NAME'])"
+}
+if ([string]::IsNullOrWhiteSpace($AwareDbHost)) { $AwareDbHost = "127.0.0.1" }
+if ([string]::IsNullOrWhiteSpace($AwareDbPort)) { $AwareDbPort = $miraDbPort }
+if ([string]::IsNullOrWhiteSpace($AwareDbName)) {
+    $AwareDbName = $miraSourceEnv["MIRA_ANDROID_SENSOR_DB_NAME"]
+    if ([string]::IsNullOrWhiteSpace($AwareDbName)) {
+        $AwareDbName = "mira_android_sensors"
+    }
+}
+if ([string]::IsNullOrWhiteSpace($AwareDbUser)) {
+    $AwareDbUser = $miraSourceEnv["MIRA_PORTAL_DB_USER"]
+}
+if ([string]::IsNullOrWhiteSpace($AwareDbPassword)) {
+    $AwareDbPassword = $miraSourceEnv["MIRA_PORTAL_DB_PASSWORD"]
+}
+
 $resolvedMcpPythonExe = $McpPythonExe
 if (-not $PSBoundParameters.ContainsKey("McpPythonExe")) {
+    $mcpServiceRoot = Join-Path $repositoryRoot "services\hermes-mcp"
     $defaultMcpPythonExe = Join-Path $repositoryRoot "services\hermes-mcp\.venv\Scripts\python.exe"
-    if (Test-Path -LiteralPath $defaultMcpPythonExe -PathType Leaf) {
+    if (Test-Path -LiteralPath (Join-Path $mcpServiceRoot "pyproject.toml") -PathType Leaf) {
         $resolvedMcpPythonExe = $defaultMcpPythonExe
     }
 }
@@ -311,9 +391,27 @@ if (Test-Path -LiteralPath $envPath) {
 
 $pluginRollback = $null
 try {
+    if ($resolvedMcpPythonExe) {
+        $mcpServiceRoot = Join-Path $repositoryRoot "services\hermes-mcp"
+        $defaultMcpPythonExe = Join-Path $mcpServiceRoot ".venv\Scripts\python.exe"
+        if (-not (Test-Path -LiteralPath $resolvedMcpPythonExe -PathType Leaf)) {
+            if ($resolvedMcpPythonExe -ne $defaultMcpPythonExe) {
+                throw "The requested MCP Python executable was not found: $resolvedMcpPythonExe"
+            }
+            Write-Host "Creating the hermes-mira-context virtual environment..."
+            & $pythonExe -m venv (Join-Path $mcpServiceRoot ".venv")
+            if ($LASTEXITCODE -ne 0) { throw "Could not create the hermes-mira-context virtual environment." }
+        }
+        if ($resolvedMcpPythonExe -eq $defaultMcpPythonExe) {
+            Write-Host "Installing hermes-mira-context in editable mode..."
+            & $resolvedMcpPythonExe -m pip install -e $mcpServiceRoot
+            if ($LASTEXITCODE -ne 0) { throw "hermes-mira-context installation failed." }
+        }
+    }
+
     New-Item -ItemType Directory -Path $pluginsDir -Force | Out-Null
     if ($sourcePlugin -ne $targetPlugin) {
-        foreach ($runtimeFile in @("adapter.py", "__init__.py", "transcript_store.py", "configure_yaml.py", "plugin.yaml", "LICENSE")) {
+        foreach ($runtimeFile in @("adapter.py", "__init__.py", "itinerary_tools.py", "transcript_store.py", "configure_yaml.py", "plugin.yaml", "LICENSE")) {
             $runtimeSource = Join-Path $sourcePlugin $runtimeFile
             if (-not (Test-Path -LiteralPath $runtimeSource -PathType Leaf)) {
                 throw "Required plugin runtime file is missing: $runtimeSource"
@@ -333,7 +431,7 @@ try {
             Remove-Item -LiteralPath $targetPlugin -Recurse -Force
         }
         New-Item -ItemType Directory -Path $targetPlugin -Force | Out-Null
-        foreach ($runtimeFile in @("adapter.py", "__init__.py", "transcript_store.py", "configure_yaml.py", "plugin.yaml", "LICENSE")) {
+        foreach ($runtimeFile in @("adapter.py", "__init__.py", "itinerary_tools.py", "transcript_store.py", "configure_yaml.py", "plugin.yaml", "LICENSE")) {
             $runtimeSource = Join-Path $sourcePlugin $runtimeFile
             Copy-Item -LiteralPath $runtimeSource -Destination (Join-Path $targetPlugin $runtimeFile) -Force
         }
@@ -365,17 +463,19 @@ try {
     Set-DotEnvValue $envPath "LIVEKIT_ROOM" $Room
     Set-DotEnvValue $envPath "LIVEKIT_AGENT_NAME" $AgentName
     Set-DotEnvValue $envPath "LIVEKIT_ALLOW_ALL_USERS" $allowAllUsersValue
-    $dbEnvValueMap = @{
+    $mcpEnvValueMap = @{
         MiraDatabaseUrl = "MIRA_DATABASE_URL"
         AwareDbHost     = "MIRA_AWARE_DATABASE_HOST"
         AwareDbPort     = "MIRA_AWARE_DATABASE_PORT"
         AwareDbName     = "MIRA_AWARE_DATABASE_NAME"
         AwareDbUser     = "MIRA_AWARE_DATABASE_USER"
         AwareDbPassword = "MIRA_AWARE_DATABASE_PASSWORD"
+        ReverseGeocoderUrl = "MIRA_REVERSE_GEOCODER_URL"
     }
-    foreach ($parameterName in $dbEnvValueMap.Keys) {
-        if ($PSBoundParameters.ContainsKey($parameterName)) {
-            Set-DotEnvValue $envPath $dbEnvValueMap[$parameterName] (Get-Variable -Name $parameterName -ValueOnly)
+    foreach ($parameterName in $mcpEnvValueMap.Keys) {
+        $parameterValue = Get-Variable -Name $parameterName -ValueOnly
+        if (-not [string]::IsNullOrWhiteSpace($parameterValue)) {
+            Set-DotEnvValue $envPath $mcpEnvValueMap[$parameterName] $parameterValue
         }
     }
     Remove-DotEnvValues $envPath @(
@@ -418,6 +518,9 @@ try {
         )
         if ($resolvedMcpPythonExe) {
             $yamlArguments += @("--mcp-python-exe", $resolvedMcpPythonExe)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($ReverseGeocoderUrl)) {
+            $yamlArguments += "--reverse-geocoder-env"
         }
         if ($ConfigureAuxiliaryModel) {
             $yamlArguments += @(

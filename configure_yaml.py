@@ -48,13 +48,18 @@ REMOTE_TOOL_OWNER_PREFIXES = [
     "simulated-agent-",
 ]
 MCP_SERVER_NAME = "hermes-mira-context"
-MCP_SERVER_ENV_VARS = (
+MCP_SERVER_REQUIRED_ENV_VARS = (
     "MIRA_DATABASE_URL",
     "MIRA_AWARE_DATABASE_HOST",
     "MIRA_AWARE_DATABASE_PORT",
     "MIRA_AWARE_DATABASE_NAME",
     "MIRA_AWARE_DATABASE_USER",
     "MIRA_AWARE_DATABASE_PASSWORD",
+)
+MCP_SERVER_OPTIONAL_ENV_VARS = (
+    "MIRA_REVERSE_GEOCODER_URL",
+    "MIRA_REVERSE_GEOCODER_USER_AGENT",
+    "MIRA_REVERSE_GEOCODER_TIMEOUT_SECONDS",
 )
 DEFAULT_NEW_ZEALAND_VOICE = "en-NZ-MollyNeural"
 STOCK_EDGE_VOICES = {"", "en-US-JennyNeural"}
@@ -127,6 +132,7 @@ def update_config(
     auxiliary_api_key: str = "",
     hermes_root: Path | None = None,
     mcp_python_exe: str = "",
+    reverse_geocoder_env: bool = False,
 ) -> None:
     if config_path.exists():
         with config_path.open("r", encoding="utf-8-sig") as stream:
@@ -183,10 +189,28 @@ def update_config(
         mcp_servers = config.setdefault("mcp_servers", {})
         if not isinstance(mcp_servers, dict):
             raise ValueError("Hermes mcp_servers config must be a YAML mapping")
+        existing_server = mcp_servers.get(MCP_SERVER_NAME)
+        existing_env = (
+            existing_server.get("env", {})
+            if isinstance(existing_server, dict)
+            else {}
+        )
+        if not isinstance(existing_env, dict):
+            existing_env = {}
+        server_env = {
+            name: f"${{{name}}}" for name in MCP_SERVER_REQUIRED_ENV_VARS
+        }
+        for name in MCP_SERVER_OPTIONAL_ENV_VARS:
+            if name in existing_env:
+                server_env[name] = existing_env[name]
+        if reverse_geocoder_env:
+            server_env["MIRA_REVERSE_GEOCODER_URL"] = (
+                "${MIRA_REVERSE_GEOCODER_URL}"
+            )
         mcp_servers[MCP_SERVER_NAME] = {
             "command": mcp_python_exe.strip(),
             "args": ["-m", "hermes_mcp.server"],
-            "env": {name: f"${{{name}}}" for name in MCP_SERVER_ENV_VARS},
+            "env": server_env,
             "enabled": True,
         }
 
@@ -302,6 +326,7 @@ def main() -> None:
     parser.add_argument("--auxiliary-api-key", default="")
     parser.add_argument("--hermes-root", type=Path)
     parser.add_argument("--mcp-python-exe", default="")
+    parser.add_argument("--reverse-geocoder-env", action="store_true")
     args = parser.parse_args()
     update_config(
         args.config,
@@ -310,6 +335,7 @@ def main() -> None:
         auxiliary_api_key=args.auxiliary_api_key,
         hermes_root=args.hermes_root,
         mcp_python_exe=args.mcp_python_exe,
+        reverse_geocoder_env=args.reverse_geocoder_env,
     )
     print(f"Updated Hermes LiveKit YAML behavior: {args.config}")
 
