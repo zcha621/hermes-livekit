@@ -56,6 +56,13 @@ MCP_SERVER_REQUIRED_ENV_VARS = (
     "MIRA_AWARE_DATABASE_USER",
     "MIRA_AWARE_DATABASE_PASSWORD",
 )
+# The MCP server signs python-context-worker tokens for the backend with these
+# (services/hermes-mcp/src/hermes_mcp/auth.py); an unset placeholder is
+# ignored there, so they are always mapped.
+MCP_SERVER_AUTH_ENV_VARS = (
+    "MIRA_AUTH_PRIVATE_KEY_PATH",
+    "MIRA_AUTH_KEY_ID",
+)
 MCP_SERVER_OPTIONAL_ENV_VARS = (
     "MIRA_REVERSE_GEOCODER_URL",
     "MIRA_REVERSE_GEOCODER_USER_AGENT",
@@ -198,7 +205,8 @@ def update_config(
         if not isinstance(existing_env, dict):
             existing_env = {}
         server_env = {
-            name: f"${{{name}}}" for name in MCP_SERVER_REQUIRED_ENV_VARS
+            name: f"${{{name}}}"
+            for name in (*MCP_SERVER_REQUIRED_ENV_VARS, *MCP_SERVER_AUTH_ENV_VARS)
         }
         for name in MCP_SERVER_OPTIONAL_ENV_VARS:
             if name in existing_env:

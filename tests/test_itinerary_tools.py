@@ -180,5 +180,45 @@ class RegisterToolsTests(unittest.TestCase):
         self.assertTrue(all(call.kwargs["is_async"] for call in ctx.register_tool.call_args_list))
 
 
+
+class BackendAuthorizationTests(unittest.TestCase):
+    def test_signs_a_python_context_worker_token_when_a_key_is_configured(self):
+        import tempfile
+
+        import jwt
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        key = Ed25519PrivateKey.generate()
+        pem = key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        with tempfile.NamedTemporaryFile(suffix=".pem") as handle:
+            handle.write(pem)
+            handle.flush()
+            env = {"MIRA_AUTH_PRIVATE_KEY_PATH": handle.name, "MIRA_AUTH_KEY_ID": "kid-1"}
+            with patch.dict("os.environ", env):
+                header = tools._worker_authorization_header()
+        token = header.removeprefix("Bearer ")
+        self.assertEqual(jwt.get_unverified_header(token)["kid"], "kid-1")
+        claims = jwt.decode(
+            token, key.public_key(), algorithms=["EdDSA"], audience="tourism-ai-backend"
+        )
+        self.assertEqual(claims["sub"], "python-context-worker")
+        self.assertEqual(claims["iss"], "https://mira.local/auth")
+        self.assertTrue({"accounts:read", "accounts:write"} <= set(claims["scope"].split()))
+
+    def test_no_header_when_unconfigured_or_left_as_a_hermes_placeholder(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertIsNone(tools._worker_authorization_header())
+        placeholders = {
+            "MIRA_AUTH_PRIVATE_KEY_PATH": "${MIRA_AUTH_PRIVATE_KEY_PATH}",
+            "MIRA_AUTH_KEY_ID": "${MIRA_AUTH_KEY_ID}",
+        }
+        with patch.dict("os.environ", placeholders, clear=True):
+            self.assertIsNone(tools._worker_authorization_header())
+
 if __name__ == "__main__":
     unittest.main()

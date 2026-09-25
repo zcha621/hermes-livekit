@@ -11,8 +11,10 @@ that write path gets the native tool's reliability instead.
 
 Talks to the same tourism-ai-backend endpoint
 (``POST /gateway/planning-workspace``) the hermes-mira-context MCP server
-uses, via stdlib ``urllib.request`` only — no extra dependency for the
-Hermes plugin environment.
+uses, via stdlib ``urllib.request``. Like that server it authenticates as
+the ``python-context-worker`` subject with a short-lived EdDSA token signed
+by MIRA_AUTH_PRIVATE_KEY_PATH / MIRA_AUTH_KEY_ID (PyJWT ships with Hermes);
+without them the backend must run with MIRA_AUTH_MODE=disabled.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -206,6 +209,51 @@ def _build_draft(*, title, summary, timezone, plan_date, plan_text, requirements
     }
 
 
+# Mirrors services/hermes-mcp/src/hermes_mcp/auth.py (and the portal's
+# issueWorkerAccessToken): the backend's gateway planning endpoint only
+# accepts this subject with accounts:read + accounts:write.
+_WORKER_SUBJECT = "python-context-worker"
+_WORKER_SCOPES = ("accounts:read", "accounts:write", "itinerary:read")
+
+
+def _configured(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    # Hermes leaves an unset ${VAR} placeholder in place; treat it as unset.
+    return "" if value.startswith("${") else value
+
+
+def _worker_authorization_header() -> str | None:
+    key_path = _configured("MIRA_AUTH_PRIVATE_KEY_PATH")
+    key_id = _configured("MIRA_AUTH_KEY_ID")
+    if not key_path or not key_id:
+        return None
+    import jwt
+
+    with open(key_path, "rb") as handle:
+        private_key = handle.read()
+    try:
+        ttl = int(_configured("MIRA_AUTH_TOKEN_TTL_SECONDS"))
+    except ValueError:
+        ttl = 300
+    now = int(time.time())
+    token = jwt.encode(
+        {
+            "iss": _configured("MIRA_AUTH_ISSUER") or "https://mira.local/auth",
+            "sub": _WORKER_SUBJECT,
+            "aud": _configured("MIRA_AUTH_AUDIENCE") or "tourism-ai-backend",
+            "iat": now,
+            "nbf": now,
+            "exp": now + ttl,
+            "jti": uuid.uuid4().hex,
+            "scope": " ".join(sorted(_WORKER_SCOPES)),
+        },
+        private_key,
+        algorithm="EdDSA",
+        headers={"typ": "at+jwt", "kid": key_id},
+    )
+    return f"Bearer {token}"
+
+
 def _backend_base_url() -> str:
     return os.getenv("MIRA_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 
@@ -213,9 +261,11 @@ def _backend_base_url() -> str:
 def _post_gateway_command(command: dict) -> dict:
     url = f"{_backend_base_url()}/api/v1/gateway/planning-workspace"
     body = json.dumps(command).encode("utf-8")
-    request = urllib.request.Request(
-        url, data=body, method="POST", headers={"Content-Type": "application/json", "Accept": "application/json"}
-    )
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    authorization = _worker_authorization_header()
+    if authorization:
+        headers["Authorization"] = authorization
+    request = urllib.request.Request(url, data=body, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             return json.loads(response.read().decode("utf-8"))
