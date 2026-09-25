@@ -28,6 +28,24 @@ gateway_config._Platform__bundled_plugin_names = (
 ) | {"livekit"}
 
 
+def authorize_unflagged_participants(adapter):
+    """Treat participants without portal metadata as authorized in tests.
+
+    Production denies a connection without ``can_bring_agent`` (the portal
+    always sets it). Most tests exercise turn-taking with bare participants,
+    so they keep the portal's verdict only where a test sets metadata.
+    """
+    real = adapter._can_bring_agent
+
+    def can_bring_agent(identity):
+        if "can_bring_agent" in adapter._participant_connection_metadata(identity):
+            return real(identity)
+        return True
+
+    adapter._can_bring_agent = can_bring_agent
+    return adapter
+
+
 def make_adapter(extra=None):
     settings = {
         "url": "ws://example.invalid",
@@ -47,7 +65,7 @@ def make_adapter(extra=None):
 
 class AdapterTests(unittest.TestCase):
     def setUp(self):
-        self.adapter = make_adapter()
+        self.adapter = authorize_unflagged_participants(make_adapter())
 
     def tearDown(self):
         livekit_adapter.LIVE_ADAPTERS.discard(self.adapter)
@@ -417,7 +435,7 @@ class AdapterTests(unittest.TestCase):
 
 class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.adapter = make_adapter()
+        self.adapter = authorize_unflagged_participants(make_adapter())
 
     def tearDown(self):
         livekit_adapter.LIVE_ADAPTERS.discard(self.adapter)
@@ -993,11 +1011,18 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         dispatched.assert_not_awaited()
         self.assertEqual(self.adapter._push_to_talk_sessions["alice"], "press-1")
 
-    def test_can_bring_agent_defaults_true_for_legacy_connections_without_metadata(self):
+    def test_connection_without_portal_authorization_is_an_observer(self):
         self.adapter._room = SimpleNamespace(
             remote_participants={"alice": SimpleNamespace(name="Alice", metadata="")}
         )
-        self.assertTrue(self.adapter._can_bring_agent("alice"))
+        self.assertFalse(
+            livekit_adapter.LiveKitAdapter._can_bring_agent(self.adapter, "alice")
+        )
+
+    def test_gateway_trusts_the_portal_authorization(self):
+        # Hermes's gateway skips LIVEKIT_ALLOWED_USERS for adapters that
+        # declare an authenticated upstream decides who may talk.
+        self.assertIs(livekit_adapter.LiveKitAdapter.authorization_is_upstream, True)
 
     def test_can_bring_agent_reads_room_owner_flag_from_participant_metadata(self):
         self.adapter._room = SimpleNamespace(

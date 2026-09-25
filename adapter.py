@@ -311,6 +311,14 @@ class LiveKitAdapter(BasePlatformAdapter):
     and sends TTS replies back to the room.
     """
 
+    # Who may talk to the agent is decided upstream by the MiRA web portal,
+    # which issues every LiveKit token and marks the room's agent owner and
+    # the accounts they shared it with as ``can_bring_agent``. Every path that
+    # dispatches to the gateway (voice, typed text, push-to-talk, interrupt,
+    # /stop) is gated on ``_can_bring_agent``, so the gateway honours that
+    # verdict instead of a separate LIVEKIT_ALLOWED_USERS list.
+    authorization_is_upstream = True
+
     def __init__(self, config: PlatformConfig):
         # Use Platform("livekit") instead of Platform.LIVEKIT — the plugin
         # registers the platform name dynamically and Platform._missing_
@@ -690,19 +698,17 @@ class LiveKitAdapter(BasePlatformAdapter):
         }
 
     def _can_bring_agent(self, identity: str) -> bool:
-        """Whether ``identity`` created this room and controls its agent.
+        """Whether ``identity`` may talk to and command this room's agent.
 
         Set by the web portal (apps/web-portal/src/pages/api/meeting/session.ts
-        and .../trips/connect.ts) from ``roomParticipationPolicy.canBringAgent``.
-        Everyone else can still be heard and addressed by the agent once it's
-        speaking, but cannot bring it into a conversation, barge in on its
-        speech, or otherwise directly command it — only the owner can.
-        Legacy connections with no such metadata are treated as owners so
-        older clients are not silently locked out.
+        and .../trips/connect.ts) from ``roomParticipationPolicy.canTalkToAgent``:
+        the room's agent owner plus accounts the owner shared the agent with.
+        Everyone else is an observer — transcribed as room context, never
+        answered. Because the gateway trusts this verdict
+        (``authorization_is_upstream``), a connection without the flag is
+        denied rather than treated as an owner.
         """
         metadata = self._participant_connection_metadata(identity)
-        if "can_bring_agent" not in metadata:
-            return True
         return metadata.get("can_bring_agent", "").strip().lower() == "true"
 
     def _source_chat_id(self, identity: str) -> str:
