@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, time as _time, timedelta
+from datetime import date as _date, datetime, time as _time, timedelta
 
 logger = logging.getLogger("gateway.platforms.livekit")
 
@@ -36,6 +36,42 @@ _LINE_RE = re.compile(
     rf"^\s*{_TIME_TOKEN}\s*(?:[-–—]\s*{_TIME_TOKEN})?\s*[-–—:]?\s*(.+?)\s*$"
 )
 _DEFAULT_ITEM_DURATION_MINUTES = 60
+
+# Day headings in multi-day plans: "Day 2", "Sun 27 Sept", "27 September",
+# "Sept 27th", "2026-09-27" (optionally combined, e.g. "Day 2 - Sun 27 Sept:").
+_MONTHS = {
+    name: number
+    for number, names in enumerate(
+        (
+            ("jan", "january"), ("feb", "february"), ("mar", "march"),
+            ("apr", "april"), ("may",), ("jun", "june"), ("jul", "july"),
+            ("aug", "august"), ("sep", "sept", "september"), ("oct", "october"),
+            ("nov", "november"), ("dec", "december"),
+        ),
+        start=1,
+    )
+    for name in names
+}
+_WEEKDAYS = {
+    name: number
+    for number, names in enumerate(
+        (
+            ("mon", "monday"), ("tue", "tues", "tuesday"), ("wed", "wednesday"),
+            ("thu", "thur", "thurs", "thursday"), ("fri", "friday"),
+            ("sat", "saturday"), ("sun", "sunday"),
+        )
+    )
+    for name in names
+}
+_MONTH_WORD = "|".join(sorted(_MONTHS, key=len, reverse=True))
+_WEEKDAY_WORD = "|".join(sorted(_WEEKDAYS, key=len, reverse=True))
+_ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_DAY_MONTH_RE = re.compile(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_WORD})\b\.?", re.I)
+_MONTH_DAY_RE = re.compile(rf"\b({_MONTH_WORD})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?\b", re.I)
+_DAY_NUMBER_RE = re.compile(r"\bday\s+(\d{1,2})\b", re.I)
+_WEEKDAY_RE = re.compile(rf"\b({_WEEKDAY_WORD})\b\.?", re.I)
+# A heading line carries nothing but date words once those are removed.
+_HEADING_LEFTOVER_RE = re.compile(r"^[\s,:;.\-–—()|/]*$")
 
 _SAVE_ITINERARY_DRAFT_SCHEMA = {
     "name": "save_itinerary_draft",
@@ -56,14 +92,17 @@ _SAVE_ITINERARY_DRAFT_SCHEMA = {
                 "type": "string",
                 "description": (
                     "The itinerary as plain text, one activity per line, "
-                    "each starting with its time, e.g. '9:00 - Coffee at "
-                    "Villa Martinique, Great North Rd'."
+                    "each starting with its 24-hour time, e.g. '09:00 - Coffee "
+                    "at Villa Martinique, Great North Rd' or '13:30 - Lunch'. "
+                    "For a multi-day plan put a heading line with the real "
+                    "date before each day's activities, e.g. 'Day 2 - "
+                    "2026-09-27', and list each day in time order."
                 ),
             },
             "plan_date": {
                 "type": "string",
                 "description": (
-                    "The actual calendar date the plan is for, as "
+                    "The actual calendar date of the plan's first day, as "
                     "YYYY-MM-DD (work out what \"this Saturday\" etc. "
                     "means and pass the real date)."
                 ),
@@ -129,27 +168,124 @@ def _to_time(hour, minute, ampm):
     return _time(hour=h, minute=m)
 
 
+def _date_in_year(day: int, month: int, base_date: _date):
+    try:
+        candidate = _date(base_date.year, month, day)
+    except ValueError:
+        return None
+    # "5 Jan" in a plan made in December means next January.
+    if (base_date - candidate).days > 180:
+        try:
+            candidate = _date(base_date.year + 1, month, day)
+        except ValueError:
+            return None
+    return candidate
+
+
+def _heading_date(line: str, base_date: _date):
+    """The calendar date a day-heading line names, or None if it is not one."""
+    remainder = line
+    found = None
+    match = _ISO_DATE_RE.search(line)
+    if match:
+        try:
+            found = _date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            return None
+        remainder = remainder.replace(match.group(0), " ")
+    for pattern, day_group, month_group in (
+        (_DAY_MONTH_RE, 1, 2),
+        (_MONTH_DAY_RE, 2, 1),
+    ):
+        match = pattern.search(remainder)
+        if match and found is None:
+            found = _date_in_year(
+                int(match.group(day_group)),
+                _MONTHS[match.group(month_group).lower()],
+                base_date,
+            )
+            if found is None:
+                return None
+            remainder = remainder.replace(match.group(0), " ")
+    day_number = _DAY_NUMBER_RE.search(remainder)
+    if day_number:
+        if found is None:
+            found = base_date + timedelta(days=max(int(day_number.group(1)) - 1, 0))
+        remainder = remainder.replace(day_number.group(0), " ")
+    weekday = _WEEKDAY_RE.search(remainder)
+    if weekday:
+        if found is None:
+            ahead = (_WEEKDAYS[weekday.group(1).lower()] - base_date.weekday()) % 7
+            found = base_date + timedelta(days=ahead)
+        remainder = remainder.replace(weekday.group(0), " ")
+    if found is None or not _HEADING_LEFTOVER_RE.match(remainder):
+        return None
+    return found
+
+
+def _infer_afternoon(
+    value: _time,
+    explicit_meridiem: bool,
+    previous: _time | None,
+    previous_written_24h: bool = False,
+) -> _time:
+    """Read a 12-hour clock time without am/pm the way a day plan means it.
+
+    Plans are written in order, so "11:00 ... 12:30 ... 1:00 lunch" means
+    1 pm, and a sightseeing plan never starts an activity at 1-6 am. After a
+    time written on the 24-hour clock ("14:00"), a smaller bare time is taken
+    literally: that writer is not using a 12-hour clock.
+    """
+    if explicit_meridiem or not 1 <= value.hour <= 11:
+        return value
+    if value.hour <= 6:
+        return value.replace(hour=value.hour + 12)
+    if previous is not None and value < previous and not previous_written_24h:
+        return value.replace(hour=value.hour + 12)
+    return value
+
+
 def _parse_itinerary_text(plan_text: str, plan_date: str):
     base_date = datetime.fromisoformat(plan_date).date()
+    current_date = base_date
+    previous_time = None
+    previous_written_24h = False
     parsed = []
     pending_header = ""
     for raw_line in (plan_text or "").splitlines():
-        line = raw_line.strip().lstrip("*-•").strip()
+        line = raw_line.replace("**", "").replace("__", "").strip().lstrip("*-•#").strip()
         if not line:
             continue
         match = _LINE_RE.match(line)
         if not match:
-            pending_header = f"{pending_header} {line}".strip()
+            heading = _heading_date(line, base_date)
+            if heading is not None:
+                current_date = heading
+                previous_time = None
+                previous_written_24h = False
+                pending_header = ""
+            else:
+                pending_header = f"{pending_header} {line}".strip()
             continue
         start_hour, start_minute, start_ampm, end_hour, end_minute, end_ampm, description = match.groups()
         start_time = _to_time(start_hour, start_minute, start_ampm)
         if start_time is None:
             pending_header = f"{pending_header} {line}".strip()
             continue
-        start_dt = datetime.combine(base_date, start_time)
+        written_24h = not start_ampm and start_time.hour >= 13
+        start_time = _infer_afternoon(
+            start_time, bool(start_ampm), previous_time, previous_written_24h
+        )
+        previous_time = start_time
+        previous_written_24h = written_24h
+        start_dt = datetime.combine(current_date, start_time)
         end_time = _to_time(end_hour, end_minute, end_ampm) if end_hour else None
+        if end_time is not None:
+            end_time = _infer_afternoon(
+                end_time, bool(end_ampm), start_time, written_24h
+            )
         end_dt = (
-            datetime.combine(base_date, end_time)
+            datetime.combine(current_date, end_time)
             if end_time is not None
             else start_dt + timedelta(minutes=_DEFAULT_ITEM_DURATION_MINUTES)
         )

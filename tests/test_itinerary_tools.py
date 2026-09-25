@@ -181,6 +181,62 @@ class RegisterToolsTests(unittest.TestCase):
 
 
 
+class MultiDayAndClockTests(unittest.TestCase):
+    PLAN = """**Day 1 – Sat 26 Sept**
+- 9:30 – Brunch at Hindmarsh Market
+- 12:00 – Walk along the River Torrens
+- 1:00 – Lunch on Rundle Mall
+- 5:30 – Dinner in the CBD
+**Day 2 – Sun 27 Sept**
+- 10:00 – Slow start, coffee in the CBD
+- 1:00 – Lunch
+- 2:30-4 – Art gallery second look"""
+
+    def test_day_headings_move_activities_to_their_own_date(self):
+        items = tools._parse_itinerary_text(self.PLAN, "2026-09-26")
+        self.assertEqual(
+            [(item["starts_at"], item["description"]) for item in items],
+            [
+                ("2026-09-26T09:30:00", "Brunch at Hindmarsh Market"),
+                ("2026-09-26T12:00:00", "Walk along the River Torrens"),
+                ("2026-09-26T13:00:00", "Lunch on Rundle Mall"),
+                ("2026-09-26T17:30:00", "Dinner in the CBD"),
+                ("2026-09-27T10:00:00", "Slow start, coffee in the CBD"),
+                ("2026-09-27T13:00:00", "Lunch"),
+                ("2026-09-27T14:30:00", "Art gallery second look"),
+            ],
+        )
+        self.assertEqual(items[-1]["ends_at"], "2026-09-27T16:00:00")
+
+    def test_heading_forms_resolve_to_dates(self):
+        base = tools.datetime.fromisoformat("2026-09-26").date()
+        self.assertEqual(str(tools._heading_date("Day 3", base)), "2026-09-28")
+        self.assertEqual(str(tools._heading_date("Day 2 - 2026-09-27", base)), "2026-09-27")
+        self.assertEqual(str(tools._heading_date("Sunday, Sept 27th:", base)), "2026-09-27")
+        self.assertEqual(str(tools._heading_date("Monday", base)), "2026-09-28")
+        self.assertIsNone(tools._heading_date("Sunday markets in the park", base))
+        self.assertIsNone(tools._heading_date("Bring a jacket", base))
+
+    def test_explicit_meridiem_and_24_hour_times_are_kept(self):
+        items = tools._parse_itinerary_text(
+            "6:00 am - Sunrise hike\n07:30 - Breakfast\n13:15 - Ferry\n8 pm - Dinner",
+            "2026-09-26",
+        )
+        self.assertEqual(
+            [item["starts_at"][11:16] for item in items],
+            ["06:00", "07:30", "13:15", "20:00"],
+        )
+
+    def test_evening_times_after_inferred_afternoon_stay_in_the_evening(self):
+        items = tools._parse_itinerary_text(
+            "11:00 - Museum\n1:00 - Lunch\n5:30 - Beach\n8:00 - Dinner", "2026-09-26"
+        )
+        self.assertEqual(
+            [item["starts_at"][11:16] for item in items],
+            ["11:00", "13:00", "17:30", "20:00"],
+        )
+
+
 class BackendAuthorizationTests(unittest.TestCase):
     def test_signs_a_python_context_worker_token_when_a_key_is_configured(self):
         import tempfile
