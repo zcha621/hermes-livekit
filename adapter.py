@@ -39,7 +39,7 @@ except ImportError:
 
 try:
     from livekit.api import AccessToken, VideoGrants, LiveKitAPI
-    from livekit.protocol.room import ListParticipantsRequest
+    from livekit.protocol.room import ListParticipantsRequest, ListRoomsRequest
     LIVEKIT_API_AVAILABLE = True
 except ImportError:
     LIVEKIT_API_AVAILABLE = False
@@ -47,6 +47,7 @@ except ImportError:
     VideoGrants = None  # type: ignore[assignment,misc]
     LiveKitAPI = None  # type: ignore[assignment,misc]
     ListParticipantsRequest = None  # type: ignore[assignment,misc]
+    ListRoomsRequest = None  # type: ignore[assignment,misc]
 
 # Pillow is used to JPEG-encode sampled video frames before handing them to
 # hermes's vision pipeline. The plugin still loads (and voice still works)
@@ -209,6 +210,68 @@ SIMULATED_AGENT_IDENTITY_PREFIX = "simulated-agent-"
 # user issues /new. Set membership is managed by __init__ / disconnect.
 LIVE_ADAPTERS: "set[LiveKitAdapter]" = set()
 
+# The MiRA web portal writes this marker into the LiveKit metadata of every
+# room whose creator brought the Hermes agent (apps/web-portal/src/lib/
+# hermesMeetingPolicy.ts HERMES_ROOM_RUNTIME). Besides its configured home
+# room, the adapter follows travellers into any room carrying it.
+HERMES_ROOM_RUNTIME = "hermes"
+NON_HUMAN_IDENTITY_PREFIXES = ("hermes-", "agent-", SIMULATED_AGENT_IDENTITY_PREFIX)
+# livekit.protocol ParticipantInfo.Kind: INGRESS=1, EGRESS=2, AGENT=4.
+NON_HUMAN_PARTICIPANT_KINDS = frozenset({1, 2, 4})
+
+
+def _is_human_participant(participant: Any) -> bool:
+    identity = str(getattr(participant, "identity", "") or "").strip().lower()
+    if identity.startswith(NON_HUMAN_IDENTITY_PREFIXES):
+        return False
+    try:
+        kind = int(getattr(participant, "kind", 0) or 0)
+    except (TypeError, ValueError):
+        kind = 0
+    return kind not in NON_HUMAN_PARTICIPANT_KINDS
+
+
+def _room_requests_hermes(metadata: Any) -> bool:
+    if not isinstance(metadata, str) or not metadata.strip():
+        return False
+    try:
+        decoded = json.loads(metadata)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(decoded, dict) and decoded.get("agent_runtime") == HERMES_ROOM_RUNTIME
+
+
+def select_target_room(
+    rooms: "list[Dict[str, Any]]",
+    home_room: str,
+    current_room: str = "",
+) -> Optional[str]:
+    """Pick the room Hermes should be in.
+
+    ``rooms`` holds candidate rooms (the home room plus rooms marked for
+    Hermes) as dicts with ``name``, ``creation_time``, ``humans`` and
+    ``participants`` counts. Hermes is a single LiveKit participant, so it
+    serves one room at a time:
+
+    * a room with travellers in it wins; Hermes stays in its current room
+      while that room still has travellers, otherwise it goes to the most
+      recently created occupied room (the one it was just brought into);
+    * with no travellers anywhere, it parks in the home room if anything
+      (e.g. the silent knowledge worker) is there — the legacy behaviour;
+    * otherwise it stays out of LiveKit.
+    """
+    occupied = [room for room in rooms if room.get("humans", 0) > 0]
+    if occupied:
+        for room in occupied:
+            if current_room and room.get("name") == current_room:
+                return current_room
+        occupied.sort(key=lambda room: room.get("creation_time", 0) or 0, reverse=True)
+        return occupied[0]["name"]
+    for room in rooms:
+        if room.get("name") == home_room and room.get("participants", 0) > 0:
+            return home_room
+    return None
+
 
 def check_livekit_requirements() -> bool:
     """Check if LiveKit dependencies are available and configured."""
@@ -259,6 +322,9 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._api_key: str = extra.get("api_key") or os.getenv("LIVEKIT_API_KEY", "")
         self._api_secret: str = extra.get("api_secret") or os.getenv("LIVEKIT_API_SECRET", "")
         self._room_name: str = extra.get("room") or os.getenv("LIVEKIT_ROOM", "hermes")
+        # The configured room is only Hermes's home; ``_room_name`` tracks the
+        # room it is currently serving (see ``select_target_room``).
+        self._home_room_name: str = self._room_name
         self._agent_name: str = extra.get("agent_name") or os.getenv("LIVEKIT_AGENT_NAME", "Hermes")
         self._agent_avatar: str = extra.get("agent_avatar") or os.getenv("LIVEKIT_AGENT_AVATAR", "") or self._find_default_avatar()
 
@@ -405,6 +471,9 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._connect_task: Optional[asyncio.Task] = None
         self._presence_task: Optional[asyncio.Task] = None
         self._graceful_leave: bool = False  # set while intentionally leaving
+        # Serializes leaving/joining so an empty-room leave and a presence-loop
+        # room move never tear down or open connections concurrently.
+        self._room_transition_lock = asyncio.Lock()
 
         # Per-participant audio buffers: identity -> (pcm bytearray, last_audio_time)
         self._audio_buffers: Dict[str, bytearray] = {}
@@ -1266,60 +1335,112 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         self._running = True
 
-        # Check if anyone is in the room already. If not, don't consume a
+        # Join a room only if someone is there. If not, don't consume a
         # participant slot — just watch.
-        count = await self._count_remote_participants()
-        if count > 0:
-            logger.info("[%s] %d participant(s) already in '%s', joining", self.name, count, self._room_name)
-            return await self._join_room()
-
-        logger.info("[%s] Room '%s' empty, watching for participants (poll %.1fs)", self.name, self._room_name, self._presence_poll_interval)
-        self._mark_connected()
+        target = await self._find_target_room()
+        if target:
+            self._room_name = target
+            logger.info("[%s] Participant(s) already in '%s', joining", self.name, target)
+            if not await self._join_room():
+                return False
+        else:
+            logger.info(
+                "[%s] No occupied room for Hermes (home '%s'), watching for participants (poll %.1fs)",
+                self.name, self._home_room_name, self._presence_poll_interval,
+            )
+            self._mark_connected()
         self._presence_task = asyncio.create_task(self._presence_watch_loop())
         return True
 
-    async def _count_remote_participants(self) -> int:
-        """Count non-local participants currently in the room via the Server API.
+    def _server_api_url(self) -> str:
+        # Server API expects http(s):// scheme; convert from ws(s)://.
+        http_url = self._url
+        if http_url.startswith("wss://"):
+            http_url = "https://" + http_url[6:]
+        elif http_url.startswith("ws://"):
+            http_url = "http://" + http_url[5:]
+        return http_url.rstrip("/")
 
-        Returns 0 on any error (room missing, network blip, etc.) — callers
-        treat that as "nobody here, keep polling".
+    async def _find_target_room(self) -> Optional[str]:
+        """Return the room Hermes should serve now, via the Server API.
+
+        Candidates are the home room plus every room the portal marked with
+        ``agent_runtime=hermes``. Returns None on any error (network blip,
+        etc.) — callers treat that as "nobody here, keep polling".
         """
         try:
-            # Server API expects http(s):// scheme; convert from ws(s)://.
-            http_url = self._url
-            if http_url.startswith("wss://"):
-                http_url = "https://" + http_url[6:]
-            elif http_url.startswith("ws://"):
-                http_url = "http://" + http_url[5:]
-            http_url = http_url.rstrip("/")
-
-            client = LiveKitAPI(url=http_url, api_key=self._api_key, api_secret=self._api_secret)
+            client = LiveKitAPI(
+                url=self._server_api_url(),
+                api_key=self._api_key,
+                api_secret=self._api_secret,
+            )
             try:
-                resp = await client.room.list_participants(
-                    ListParticipantsRequest(room=self._room_name)
-                )
-                return len(resp.participants)
+                listed = await client.room.list_rooms(ListRoomsRequest())
+                candidates = []
+                for room in listed.rooms:
+                    if room.name != self._home_room_name and not _room_requests_hermes(room.metadata):
+                        continue
+                    try:
+                        resp = await client.room.list_participants(
+                            ListParticipantsRequest(room=room.name)
+                        )
+                    except Exception as e:
+                        logger.debug("[%s] participant check for '%s' failed: %s", self.name, room.name, e)
+                        continue
+                    candidates.append({
+                        "name": room.name,
+                        "creation_time": int(getattr(room, "creation_time", 0) or 0),
+                        "humans": sum(1 for p in resp.participants if _is_human_participant(p)),
+                        "participants": len(resp.participants),
+                    })
             finally:
                 await client.aclose()
         except Exception as e:
             logger.debug("[%s] presence check failed: %s", self.name, e)
-            return 0
+            return None
+        current = self._room_name if self._room is not None else ""
+        return select_target_room(candidates, self._home_room_name, current)
+
+    def _current_room_has_humans(self) -> bool:
+        if self._room is None:
+            return False
+        return any(
+            _is_human_participant(participant)
+            for participant in getattr(self._room, "remote_participants", {}).values()
+        )
 
     async def _presence_watch_loop(self) -> None:
-        """Poll the room; join as soon as a remote participant appears."""
+        """Keep Hermes in the room its travellers are in.
+
+        While out of LiveKit, join as soon as a candidate room is occupied.
+        While in a room nobody (human) is using, move to another marked room
+        that travellers have brought Hermes into.
+        """
         try:
             while self._running:
                 await asyncio.sleep(self._presence_poll_interval)
                 if not self._running:
                     return
-                if self._room is not None:
-                    # Something else joined us (manual reconnect?); stop polling.
-                    return
-                count = await self._count_remote_participants()
-                if count > 0:
-                    logger.info("[%s] Participant detected in '%s', joining", self.name, self._room_name)
-                    if await self._join_room():
-                        return  # joined — done polling
+                if self._connect_task is not None and not self._connect_task.done():
+                    continue  # reconnect loop owns the connection right now
+                if self._room is not None and self._current_room_has_humans():
+                    continue
+                target = await self._find_target_room()
+                if not target or (self._room is not None and target == self._room_name):
+                    continue
+                async with self._room_transition_lock:
+                    if not self._running or self._current_room_has_humans():
+                        continue
+                    if self._room is not None:
+                        logger.info(
+                            "[%s] No travellers left in '%s'; moving to '%s'",
+                            self.name, self._room_name, target,
+                        )
+                        await self._leave_room()
+                    else:
+                        logger.info("[%s] Participant detected in '%s', joining", self.name, target)
+                    self._room_name = target
+                    await self._join_room()
         except asyncio.CancelledError:
             return
 
@@ -1396,7 +1517,16 @@ class LiveKitAdapter(BasePlatformAdapter):
 
             return True
         except Exception as e:
-            logger.error("[%s] Failed to connect: %s", self.name, e)
+            logger.error("[%s] Failed to connect to '%s': %s", self.name, self._room_name, e)
+            room, self._room = self._room, None
+            if room is not None:
+                self._graceful_leave = True
+                try:
+                    await room.disconnect()
+                except Exception:
+                    pass
+                finally:
+                    self._graceful_leave = False
             return False
 
     async def disconnect(self) -> None:
@@ -1668,6 +1798,13 @@ class LiveKitAdapter(BasePlatformAdapter):
 
     async def _leave_and_watch(self) -> None:
         """Tear down the room connection and resume presence polling."""
+        async with self._room_transition_lock:
+            await self._leave_room()
+        if self._running and (self._presence_task is None or self._presence_task.done()):
+            self._presence_task = asyncio.create_task(self._presence_watch_loop())
+
+    async def _leave_room(self) -> None:
+        """Tear down the current room connection, keeping the adapter running."""
         # Stop silence detection and audio streams, but keep self._running
         # so the presence loop can resume us later.
         if self._silence_task:
@@ -1716,9 +1853,6 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._room = None
         self._audio_source = None
         self._local_track = None
-
-        if self._running and (self._presence_task is None or self._presence_task.done()):
-            self._presence_task = asyncio.create_task(self._presence_watch_loop())
 
     def _on_disconnected(self, reason: str = ""):
         """Handle unexpected room disconnection — schedule reconnection.

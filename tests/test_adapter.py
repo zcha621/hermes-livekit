@@ -1311,5 +1311,51 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+
+class RoomFollowingTests(unittest.TestCase):
+    def test_travellers_pull_hermes_into_the_newest_marked_room(self):
+        rooms = [
+            {"name": "ECL", "creation_time": 100, "humans": 0, "participants": 1},
+            {"name": "trip-a", "creation_time": 200, "humans": 1, "participants": 1},
+            {"name": "trip-b", "creation_time": 300, "humans": 2, "participants": 2},
+        ]
+        self.assertEqual(livekit_adapter.select_target_room(rooms, "ECL"), "trip-b")
+
+    def test_hermes_stays_while_its_current_room_has_travellers(self):
+        rooms = [
+            {"name": "ECL", "creation_time": 100, "humans": 1, "participants": 2},
+            {"name": "trip-b", "creation_time": 300, "humans": 1, "participants": 1},
+        ]
+        self.assertEqual(
+            livekit_adapter.select_target_room(rooms, "ECL", current_room="ECL"),
+            "ECL",
+        )
+
+    def test_hermes_parks_in_home_room_only_when_nobody_needs_it(self):
+        worker_only = [
+            {"name": "ECL", "creation_time": 100, "humans": 0, "participants": 1},
+            {"name": "trip-a", "creation_time": 200, "humans": 0, "participants": 0},
+        ]
+        self.assertEqual(livekit_adapter.select_target_room(worker_only, "ECL"), "ECL")
+        empty = [{"name": "ECL", "creation_time": 100, "humans": 0, "participants": 0}]
+        self.assertIsNone(livekit_adapter.select_target_room(empty, "ECL"))
+
+    def test_agents_and_workers_are_not_travellers(self):
+        human = SimpleNamespace(identity="Zhuang", kind=0)
+        worker = SimpleNamespace(identity="agent-mira-knowledge-worker-1234", kind=0)
+        hermes = SimpleNamespace(identity="hermes-mira", kind=0)
+        agent_kind = SimpleNamespace(identity="someone", kind=4)
+        self.assertTrue(livekit_adapter._is_human_participant(human))
+        self.assertFalse(livekit_adapter._is_human_participant(worker))
+        self.assertFalse(livekit_adapter._is_human_participant(hermes))
+        self.assertFalse(livekit_adapter._is_human_participant(agent_kind))
+
+    def test_only_portal_marked_rooms_request_hermes(self):
+        self.assertTrue(livekit_adapter._room_requests_hermes('{"agent_runtime": "hermes"}'))
+        self.assertFalse(livekit_adapter._room_requests_hermes('{"agent_id": 2}'))
+        self.assertFalse(livekit_adapter._room_requests_hermes("not json"))
+        self.assertFalse(livekit_adapter._room_requests_hermes(""))
+
+
 if __name__ == "__main__":
     unittest.main()
