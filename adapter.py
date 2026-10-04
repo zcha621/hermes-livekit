@@ -1070,10 +1070,13 @@ class LiveKitAdapter(BasePlatformAdapter):
         ``_transcript_context``.
 
         Returns the rendered context string (possibly empty).
-        """
-        if not db_entries:
-            return ""
 
+        When the DB has no rows for this room yet (fresh room, no
+        ``MIRA_DATABASE_URL`` configured, or the session row hasn't been
+        written) there is nothing to merge — fall back to the in-memory
+        window so ambient speech from the current occupancy is still
+        available as context.
+        """
         in_memory_seqs = {
             int(item.get("sequence", 0)) for item in self._conversation_transcript
         }
@@ -1091,9 +1094,14 @@ class LiveKitAdapter(BasePlatformAdapter):
                 "keyterm": "",
                 "kind": "speech",
             }
-            for e in db_entries
+            for e in (db_entries or [])
             if int(e.get("sequence", 0)) not in in_memory_seqs
         ]
+
+        # Nothing new from the DB — render the in-memory window alone so we
+        # never lose the current occupancy's ambient speech.
+        if not prior_entries:
+            return self._transcript_context()
 
         # Combined window: prior-occupancy rows first (chronological), then
         # the in-memory rows (already chronological).

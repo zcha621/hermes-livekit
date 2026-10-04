@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Dict, Optional
 
@@ -183,7 +183,7 @@ def _resolve_participant_id(
                 role=role,
                 livekit_identity=identity,
                 account_id=None,
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
             )
         )
         return new_id
@@ -218,8 +218,10 @@ def record_transcript_segment(entry: Dict[str, Any], *, room_name: str, mira_con
 
     try:
         occurred_at = datetime.fromisoformat(str(entry.get("timestamp")))
+        if occurred_at.tzinfo is None:
+            occurred_at = occurred_at.replace(tzinfo=timezone.utc)
     except (TypeError, ValueError):
-        occurred_at = datetime.utcnow()
+        occurred_at = datetime.now(timezone.utc)
 
     sessions_table, participants_table, transcript_segments = _tables()
     role = str(entry.get("role") or "user")
@@ -251,7 +253,7 @@ def record_transcript_segment(entry: Dict[str, Any], *, room_name: str, mira_con
                 )
                 return
 
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             from sqlalchemy import insert
 
             connection.execute(
