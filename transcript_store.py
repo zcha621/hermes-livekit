@@ -89,14 +89,56 @@ def _tables():
 
 
 def _resolve_session_id(connection, sessions_table, room_name: str) -> Optional[str]:
-    from sqlalchemy import select
+    """Look up the ``mira_session`` row for ``room_name``, auto-provisioning
+    one if it does not exist.
+
+    The web portal creates the row when a trip session is started, but a
+    room can be entered directly (ad-hoc test room, portal token expired,
+    or the portal simply hasn't registered the session yet).  Without this
+    fallback every transcript write for such a room is silently skipped,
+    which is exactly the bug that made the agent lose its current-room
+    context.  Provisioning a lightweight row here is safe: the portal's own
+    session-creation path upserts on ``livekit_room_name``, so a later
+    portal write will update the row it finds.
+    """
+    from sqlalchemy import select, insert
 
     row = connection.execute(
         select(sessions_table.c.session_id).where(
             sessions_table.c.livekit_room_name == room_name
         )
     ).first()
-    return row.session_id if row is not None else None
+    if row is not None:
+        return row.session_id
+
+    # No session row yet — create one so the transcript can be written.
+    session_id = str(uuid.uuid4())
+    try:
+        connection.execute(
+            insert(sessions_table).values(
+                session_id=session_id,
+                livekit_room_name=room_name[:255],
+            )
+        )
+        logger.debug(
+            "auto-provisioned mira_session %s for room %r", session_id, room_name
+        )
+        return session_id
+    except Exception as exc:  # noqa: BLE001
+        # IntegrityError (race: another writer beat us to it) or transient
+        # DB error — re-read once.
+        connection.rollback()
+        row = connection.execute(
+            select(sessions_table.c.session_id).where(
+                sessions_table.c.livekit_room_name == room_name
+            )
+        ).first()
+        if row is not None:
+            return row.session_id
+        logger.debug(
+            "could not provision mira_session for room %r: %s", room_name, exc
+        )
+        return None
 
 
 def _resolve_participant_id(

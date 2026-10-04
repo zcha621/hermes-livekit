@@ -1382,5 +1382,98 @@ class RoomFollowingTests(unittest.TestCase):
         self.assertFalse(livekit_adapter._room_requests_hermes(""))
 
 
+class RoomTranscriptContextTests(unittest.TestCase):
+    """Tests for _fetch_room_transcript and _merge_db_transcript_into_context."""
+
+    def _adapter(self):
+        adapter = make_adapter()
+        adapter._room_name = "test-room"
+        adapter._conversation_transcript = []
+        adapter._transcript_prompt_max_entries = 12
+        adapter._transcript_prompt_max_chars = 3000
+        return adapter
+
+    def test_fetch_returns_empty_without_db_url(self):
+        adapter = self._adapter()
+        with patch.dict(os.environ, {}, clear=True):
+            # Remove MIRA_DATABASE_URL so the early-return path is exercised
+            os.environ.pop("MIRA_DATABASE_URL", None)
+            result = adapter._fetch_room_transcript()
+        self.assertEqual(result, [])
+
+    def test_fetch_returns_empty_without_room_name(self):
+        adapter = self._adapter()
+        adapter._room_name = ""
+        with patch.dict(os.environ, {"MIRA_DATABASE_URL": "mysql://x@y/z"}):
+            result = adapter._fetch_room_transcript()
+        self.assertEqual(result, [])
+
+    def test_merge_returns_empty_without_db_entries(self):
+        adapter = self._adapter()
+        result = adapter._merge_db_transcript_into_context([])
+        self.assertEqual(result, "")
+
+    def test_merge_renders_prior_entries_before_in_memory(self):
+        adapter = self._adapter()
+        adapter._conversation_transcript = [
+            {"sequence": 10, "name": "Alice", "role": "user",
+             "text": "Hi", "identity": "alice", "timestamp": "t10",
+             "final": True, "invoked": False, "keyterm": "", "kind": "speech"},
+        ]
+        db_entries = [
+            {"sequence": 5, "occurred_at": "t5", "speaker": "Bob",
+             "role": "user", "text": "Hello from prior occupancy"},
+        ]
+        result = adapter._merge_db_transcript_into_context(db_entries)
+        self.assertIn("Bob", result)
+        self.assertIn("Alice", result)
+        # Prior entry should appear before the in-memory one
+        self.assertLess(result.index("Bob"), result.index("Alice"))
+        # Both should be in the rendered output
+        self.assertIn("[5]", result)
+        self.assertIn("[10]", result)
+
+    def test_merge_deduplicates_by_sequence(self):
+        """DB rows already in the in-memory list are not duplicated."""
+        adapter = self._adapter()
+        adapter._conversation_transcript = [
+            {"sequence": 7, "name": "Alice", "role": "user",
+             "text": "I am already here", "identity": "alice", "timestamp": "t7",
+             "final": True, "invoked": False, "keyterm": "", "kind": "speech"},
+        ]
+        # DB has the same sequence 7 — it should NOT appear twice
+        db_entries = [
+            {"sequence": 7, "occurred_at": "t7", "speaker": "Alice",
+             "role": "user", "text": "I am already here"},
+            {"sequence": 3, "occurred_at": "t3", "speaker": "Carol",
+             "role": "user", "text": "From before"},
+        ]
+        result = adapter._merge_db_transcript_into_context(db_entries)
+        # "I am already here" should appear exactly once
+        self.assertEqual(result.count("I am already here"), 1)
+        # Carol (seq 3, prior) should be present
+        self.assertIn("Carol", result)
+        self.assertIn("[3]", result)
+
+    def test_merge_respects_char_budget(self):
+        adapter = self._adapter()
+        adapter._transcript_prompt_max_chars = 60
+        adapter._transcript_prompt_max_entries = 10
+        adapter._conversation_transcript = [
+            {"sequence": 1, "name": "A", "role": "user",
+             "text": "x" * 40, "identity": "a", "timestamp": "t1",
+             "final": True, "invoked": False, "keyterm": "", "kind": "speech"},
+        ]
+        db_entries = [
+            {"sequence": 0, "occurred_at": "t0", "speaker": "B",
+             "role": "user", "text": "y" * 40},
+        ]
+        result = adapter._merge_db_transcript_into_context(db_entries)
+        # Both entries are 40 chars + header; total exceeds 60 so the
+        # oldest (seq 0) should be trimmed, keeping only seq 1.
+        self.assertIn("[1]", result)
+        self.assertNotIn("[0]", result)
+
+
 if __name__ == "__main__":
     unittest.main()

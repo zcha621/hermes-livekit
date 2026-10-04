@@ -61,15 +61,43 @@ class TranscriptStoreTests(unittest.TestCase):
         entry.update(overrides)
         return entry
 
-    def test_skips_silently_without_matching_session(self):
+    def test_auto_provisions_session_when_room_has_none(self):
+        """A room with no mira_session row gets one created on first write."""
         transcript_store.record_transcript_segment(
-            self._entry(), room_name="no-such-room"
+            self._entry(), room_name="fresh-room"
         )
         from sqlalchemy import select
 
         with self.engine.connect() as connection:
+            sessions = connection.execute(
+                select(self._sessions).where(
+                    self._sessions.c.livekit_room_name == "fresh-room"
+                )
+            ).one()
             rows = connection.execute(select(self._transcript_segments)).all()
-        self.assertEqual(rows, [])
+        self.assertIsNotNone(sessions.session_id)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].session_id, sessions.session_id)
+
+    def test_reuses_existing_session_on_second_write(self):
+        """A second write to the same room reuses the auto-provisioned session."""
+        transcript_store.record_transcript_segment(
+            self._entry(sequence=1), room_name="reuse-room"
+        )
+        transcript_store.record_transcript_segment(
+            self._entry(sequence=2), room_name="reuse-room"
+        )
+        from sqlalchemy import select
+
+        with self.engine.connect() as connection:
+            sessions = connection.execute(
+                select(self._sessions).where(
+                    self._sessions.c.livekit_room_name == "reuse-room"
+                )
+            ).all()
+            rows = connection.execute(select(self._transcript_segments)).all()
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(len(rows), 2)
 
     def test_trusts_mira_conversation_id_as_participant_id(self):
         self._seed_session("room-1")
