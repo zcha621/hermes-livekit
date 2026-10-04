@@ -43,10 +43,36 @@ turn and then restore its previous state.
 The adapter keeps a bounded chronological transcript containing every
 participant and Hermes's own speech. It publishes finalized segments both as
 participant-labeled `agent:*transcript` data events and, for speech, through
-LiveKit's native transcription API. Ambient conversation is not discarded: the
-recent transcript is included as quoted context whenever a participant invokes
-MiRA, so the reply can understand references without answering uninvoked speech.
-A standalone keyterm does not create an empty model turn.
+LiveKit's native transcription API. Ambient conversation is not discarded: when
+a participant invokes MiRA, the adapter assembles a labeled transcript of the
+current room and injects it into the model's context, so the reply can
+understand references without answering uninvoked speech. A standalone keyterm
+does not create an empty model turn.
+
+That injected context is the **current room's** transcript, not the Hermes
+session history. The adapter merges two sources before the model turn
+(`_fetch_room_transcript` + `_merge_db_transcript_into_context` in
+`adapter.py`):
+
+1. the in-memory window for the current occupancy (`_conversation_transcript`,
+   the bounded transcript above), and
+2. the current room's rows persisted in the domain database by
+   `transcript_store.py`, which cover speech from *earlier* occupancies of the
+   same LiveKit room (the in-memory list is cleared when the room resets).
+
+The DB rows are deduplicated against the in-memory window by sequence number
+and the combined list is trimmed to the same `prompt_max_entries` /
+`prompt_max_chars` budget from the oldest end. When the database has no rows
+for the room yet — a fresh room, or `MIRA_DATABASE_URL` is not configured —
+the merge falls back to the in-memory window alone, so ambient speech from the
+current occupancy is still carried as context. The result is labeled as
+untrusted quoted speech, not instructions.
+
+This automatic fetch is what makes the agent context-aware: the model no
+longer has to call the `get_meeting_transcript` MCP tool (which the deployed
+model has a documented track record of not invoking reliably) to see what was
+just said. The MCP tool remains available for on-demand recall of more history
+or for callers that want the raw rows.
 
 Portal clients should set `mira_conversation_id`; Hermes then keeps history for
 that explicit conversation. A participant without that metadata receives a
@@ -54,12 +80,12 @@ fresh call-scoped ID for each connection instead of inheriting permanent room
 history. The bounded participant transcript above still supplies current
 multi-speaker context without allowing old calls to grow every new prompt.
 
-When location, local time, itinerary, or earlier meeting speech matters,
-Hermes can select one of the hermes-mira-context MCP server's tools (see
-[MiRA domain context via MCP](#mira-domain-context-via-mcp) below). No
-database snapshot is fetched or injected automatically. This keeps direct
-conversation on the same model path as the Hermes GUI while leaving current
-context available on demand.
+When location, local time, or itinerary matters, Hermes can select one of the
+hermes-mira-context MCP server's tools (see
+[MiRA domain context via MCP](#mira-domain-context-via-mcp) below). Meeting
+transcript, by contrast, is fetched and injected automatically as described
+above, while the `get_meeting_transcript` tool stays available for on-demand
+recall of additional history.
 
 This is application-level invocation policy built on LiveKit participant audio
 and Hermes STT. LiveKit itself supplies per-participant identity, synchronized
@@ -166,6 +192,9 @@ The server exposes four tools:
 - `get_meeting_transcript(room_name)` — earlier speech from the current
   LiveKit room, read from `mira_transcript_segment` (written by this
   plugin's `transcript_store.py` as the adapter finalizes each utterance).
+  The adapter also fetches and injects the current room's transcript into
+  each invoked turn automatically (see above); this tool is the on-demand
+  escape hatch for recalling more history or the raw rows.
 - `manage_trip_itinerary(action, platform, user_id, hermes_session_id, ...)` —
   load, link, revise, or confirm the traveller's account-wide itinerary,
   proxied to the tourism-ai-backend's `POST /gateway/planning-workspace`.
@@ -254,9 +283,13 @@ to preserve an existing choice without enabling a provider on a new setup.
 
 LiveKit sessions expose optional tourism evidence routes:
 
-- `get_confirmed_itinerary` / `get_traveller_location` / `get_meeting_transcript`
-  (hermes-mira-context MCP server) — saved itinerary, current location and
-  local time, and earlier meeting speech;
+- `get_confirmed_itinerary` / `get_traveller_location` (hermes-mira-context
+  MCP server) — saved itinerary, current location and local time;
+- the current room's transcript is injected into each invoked turn
+  automatically (see [Invocation keyterms and shared meeting
+  context](#invocation-keyterms-and-shared-meeting-context)); the
+  `get_meeting_transcript` MCP tool remains available for on-demand recall of
+  additional history;
 - `manage_trip_itinerary` (same MCP server) - account linking plus
   conversational draft revision and explicit confirmation. A draft is not a
   saved itinerary;
@@ -449,8 +482,12 @@ A useful call check is:
 
 - `adapter.py` — LiveKit transport, media, voice activity, hooks, and tools.
 - `__init__.py` — Hermes plugin registration and lifecycle hooks.
-- `transcript_store.py` — persists finalized meeting speech for the
-  hermes-mira-context MCP server's `get_meeting_transcript` tool.
+- `transcript_store.py` — persists finalized meeting speech into the domain
+  database (`mira_transcript_segment`) for both the adapter's automatic
+  current-room context and the hermes-mira-context MCP server's
+  `get_meeting_transcript` tool. It auto-provisions a `mira_session` row for a
+  room that has none, so a room entered directly (without a portal session)
+  still gets its transcript written.
 - `configure_yaml.py` — atomic non-secret behavior configuration, including
   registering the hermes-mira-context MCP server.
 - `assets/SOUL.md` — canonical MiRA conversational identity.
