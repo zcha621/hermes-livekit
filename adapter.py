@@ -435,6 +435,15 @@ class LiveKitAdapter(BasePlatformAdapter):
             )
             for keyterm in self._keyterms
         )
+        # Room-bound per-user profile: when the current room was created by
+        # bringing a specific user's agent (room metadata carries that row's
+        # agent_id), the single gateway shows *that* profile's display name and
+        # invocation keyterms for the whole room — not the global/base ones.
+        # Empty when the room has no such agent or the row can't be loaded;
+        # both then fall back to the configured defaults (see _effective_*).
+        self._room_agent_uuid: str = ""
+        self._room_agent_display_name: str = ""
+        self._room_agent_keyterms: tuple[str, ...] = ()
         self._transcript_max_entries = self._positive_int(
             transcript_config.get("history_max_entries"),
             DEFAULT_TRANSCRIPT_MAX_ENTRIES,
@@ -653,18 +662,32 @@ class LiveKitAdapter(BasePlatformAdapter):
             ),
         )
 
+    def _effective_keyterm_patterns(
+        self,
+    ) -> tuple[tuple[str, re.Pattern[str]], ...]:
+        """Wake-term patterns for this room: the room-bound profile's keyterms
+        when present, else the global base patterns (self._keyterm_patterns)."""
+        if not self._room_agent_keyterms:
+            return self._keyterm_patterns
+        return tuple(self._keyterm_pattern(term) for term in self._room_agent_keyterms)
+
     def _match_keyterm(
         self,
         transcript: str,
+        base_patterns: tuple[tuple[str, re.Pattern[str]], ...] | None = None,
         extra_patterns: tuple[tuple[str, re.Pattern[str]], ...] = (),
     ) -> tuple[str, str]:
         """Return ``(matched keyterm, optionally stripped transcript)``.
 
-        ``extra_patterns`` are per-speaker keyterm patterns (the speaker's own
-        personal wake terms) tried *after* the global terms, so a global
-        match wins and a personal term is additive rather than a replacement.
+        ``base_patterns`` are the room's wake terms (room-bound profile or
+        global base); when omitted it falls back to the global base patterns.
+        ``extra_patterns`` are the speaker's own personal wake terms tried
+        *after* the room's, so a room/global match wins and a personal term is
+        additive rather than a replacement.
         """
-        for keyterm, pattern in (*self._keyterm_patterns, *extra_patterns):
+        if base_patterns is None:
+            base_patterns = self._keyterm_patterns
+        for keyterm, pattern in (*base_patterns, *extra_patterns):
             match = pattern.match(transcript)
             if match is None:
                 continue
@@ -937,6 +960,127 @@ class LiveKitAdapter(BasePlatformAdapter):
             parts.append("- Persona (the speaker's authored identity):")
             parts.append("  " + persona.replace("\n", "\n  "))
         return "\n".join(parts) + "\n"
+
+    def _effective_agent_name(self) -> str:
+        """Display name for this room's agent: the room-bound per-user profile
+        when present, else the configured/global base name."""
+        return self._room_agent_display_name or self._agent_name
+
+    def _effective_keyterms(self) -> tuple[str, ...]:
+        """Wake terms for this room's agent: the room-bound per-user profile's
+        keyterms when present, else the global base keyterms. Drives both the
+        UI status hint and the room's wake gate."""
+        return self._room_agent_keyterms or self._keyterms
+
+    def _load_room_agent_profile(self, room_metadata: str) -> Optional[str]:
+        """Bind this room's agent profile (if the room was created with one).
+
+        Reads the portal's ``room_sessions`` row for the current room and, when
+        its metadata carries an ``agent_id`` (a per-user profile row brought
+        into the room), loads that row's ``agent_uuid``. Returns the uuid, or
+        ``None`` when the room has no such agent / the read fails. The
+        display-name and keyterm refresh happens in
+        :meth:`_refresh_room_agent_profile`.
+        """
+        self._room_agent_uuid = ""
+        self._room_agent_display_name = ""
+        self._room_agent_keyterms = ()
+        if not room_metadata or not self._room_name:
+            return None
+        try:
+            metadata = json.loads(room_metadata)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(metadata, dict):
+            return None
+        agent_id = metadata.get("agent_id")
+        try:
+            agent_id = int(agent_id)
+        except (TypeError, ValueError):
+            return None
+        if agent_id <= 0:
+            return None
+        try:
+            return self._fetch_room_agent_uuid(agent_id)
+        except Exception as exc:  # noqa: BLE001 — room binding is best-effort
+            logger.debug("[%s] room agent binding failed: %s", self.name, exc)
+            return None
+
+    def _fetch_room_agent_uuid(self, agent_id: int) -> Optional[str]:
+        """SELECT the agent row's uuid by primary key in the portal DB."""
+        database_url = os.getenv("MIRA_AGENT_DATABASE_URL", "").strip()
+        if not database_url:
+            return None
+        try:
+            from sqlalchemy import MetaData, Table, create_engine, select
+        except ImportError:
+            return None
+        engine = create_engine(database_url, pool_pre_ping=True, future=True)
+        try:
+            with engine.connect() as connection:
+                agents = Table("agents", MetaData(), autoload_with=engine)
+                row = connection.execute(
+                    select(agents.c.agent_uuid).where(agents.c.agent_id == agent_id)
+                ).first()
+        finally:
+            engine.dispose()
+        if row is None or not row.agent_uuid:
+            return None
+        return str(row.agent_uuid)
+
+    async def _refresh_room_agent_profile(self) -> bool:
+        """Load the room's agent profile and refresh the on-screen name and
+        wake terms to match it. Runs on join (room metadata is available at
+        that point). Returns True when a room-bound profile was applied, so the
+        caller can suppress the LLM name resolver (whose random name would
+        clobber the profile's display name). Never drops a turn: on any miss it
+        keeps the base name and keyterms, which is exactly the pre-feature
+        behaviour."""
+        try:
+            # LiveKit's Room exposes its own metadata as a plain attr — the
+            # JSON string the portal set on create/join (room_name, agent_id,
+            # agent_runtime, ...). Read it directly rather than round-tripping
+            # through the Server API.
+            raw_meta = getattr(self._room, "metadata", "") if self._room is not None else ""
+            uuid_value = await asyncio.to_thread(
+                self._load_room_agent_profile, raw_meta
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[%s] room agent profile refresh error: %s", self.name, exc)
+            return False
+        if not uuid_value:
+            return False
+        profile = await asyncio.to_thread(self._load_agent_profile, uuid_value)
+        if not profile or not profile.get("is_active"):
+            return False
+        display_name = str(profile.get("display_name") or "").strip()
+        keyterms = tuple(
+            t for t in profile.get("invocation_keyterms", []) if t
+        )
+        if not display_name and not keyterms:
+            return False
+        self._room_agent_uuid = uuid_value
+        if display_name:
+            self._room_agent_display_name = display_name
+        if keyterms:
+            self._room_agent_keyterms = keyterms
+        # Update the visible display name live (no reconnect) and refresh the
+        # status attributes so the UI immediately shows the right name + keyterms.
+        if self._room is not None:
+            if display_name:
+                try:
+                    await self._room.local_participant.set_name(display_name)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("[%s] set_name to room agent profile failed: %s", self.name, exc)
+            try:
+                await self._set_agent_state(self._agent_state, force=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[%s] status refresh after room profile bind failed: %s", self.name, exc)
+        logger.info(
+            "[%s] Bound room agent profile '%s' (name=%r keyterms=%r)",
+            self.name, uuid_value, display_name, keyterms,
+        )
+        return True
 
     def _append_transcript(
         self,
@@ -1337,8 +1481,13 @@ class LiveKitAdapter(BasePlatformAdapter):
             personal_keyterm_patterns = tuple(
                 self._keyterm_pattern(term) for term in personal_keyterms
             )
+        # The room's wake terms are the room-bound profile's keyterms when the
+        # room was created with one, else the global base. The speaker's own
+        # personal profile adds any extra keyterms on top, so a speaker always
+        # wakes the agent with their own name even when they aren't the
+        # room's brought-in agent.
         matched_keyterm, cleaned = self._match_keyterm(
-            original_text, personal_keyterm_patterns
+            original_text, self._effective_keyterm_patterns(), personal_keyterm_patterns
         )
         armed_keyterm = ""
         armed = self._armed_participant_wakes.pop(identity, None)
@@ -1376,7 +1525,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         if not invoked:
             await self._publish_agent_event(
                 "agent:invocation-required",
-                {"identity": identity, "keyterms": list(self._keyterms)},
+                {"identity": identity, "keyterms": list(self._effective_keyterms())},
             )
             await self._set_agent_state("idle", force=True)
             return False
@@ -1475,7 +1624,7 @@ class LiveKitAdapter(BasePlatformAdapter):
                 "name": self._active_speaker_name,
             },
             "topic": self._active_topic,
-            "keyterms": list(self._keyterms),
+            "keyterms": list(self._effective_keyterms()),
             "last_keyterm": self._last_keyterm,
             "updated_at": datetime.now(tz=timezone.utc).isoformat(),
         }
@@ -1502,7 +1651,7 @@ class LiveKitAdapter(BasePlatformAdapter):
                     "mira.agent.active_speaker": self._active_speaker_identity,
                     "mira.agent.active_speaker_name": self._active_speaker_name,
                     "mira.agent.topic": self._active_topic,
-                    "mira.agent.keyterms": json.dumps(self._keyterms),
+                    "mira.agent.keyterms": json.dumps(list(self._effective_keyterms())),
                 }
                 try:
                     await self._room.local_participant.set_attributes(attributes)
@@ -1899,8 +2048,19 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._mark_connected()
             logger.info("[%s] Connected to room '%s' at %s", self.name, self._room_name, self._url)
 
-            # If no explicit agent name was configured, ask the LLM and reconnect
-            if not os.getenv("LIVEKIT_AGENT_NAME") and not (self.config.extra or {}).get("agent_name"):
+            # Bind this room's per-user agent profile (if the room was created
+            # with one) so the on-screen name and wake terms reflect the
+            # speaker's own agent, not the global base. Best-effort: any miss
+            # keeps the base identity. Awaited (not fire-and-forget) so the
+            # name-resolver decision below sees the profile state, not a race.
+            room_profile_bound = await self._refresh_room_agent_profile()
+
+            # If no explicit agent name was configured AND no room-bound
+            # profile applied, ask the LLM for a name. Skipped when a
+            # room-bound profile exists — its display name wins and must not
+            # be clobbered by a random LLM-chosen name.
+            if not room_profile_bound and not os.getenv("LIVEKIT_AGENT_NAME") \
+                    and not (self.config.extra or {}).get("agent_name"):
                 asyncio.create_task(self._resolve_agent_name())
 
             return True
