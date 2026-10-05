@@ -125,6 +125,10 @@ DEFAULT_ACK_PHRASES = (
     "On it.",
 )
 DEFAULT_INVOCATION_KEYTERMS = ("Hermes", "MiRA")
+# How long a fetched per-user agent profile stays valid before a re-read.
+# Long enough to avoid a query per utterance; short enough that a user's
+# edits are visible on their next invoked turn.
+DEFAULT_AGENT_PROFILE_CACHE_TTL_SECONDS = 60.0
 PUSH_TO_TALK_KEYTERM = "@Agent"
 PUSH_TO_TALK_RELEASE_GRACE_SECONDS = 0.2
 DEFAULT_TRANSCRIPT_MAX_ENTRIES = 80
@@ -524,6 +528,17 @@ class LiveKitAdapter(BasePlatformAdapter):
         # instead of resuming the previous occupancy's conversation.
         self._session_epoch: str = uuid.uuid4().hex[:12]
         self._armed_participant_wakes: Dict[str, tuple[str, float]] = {}
+        # Per-user agent-profile cache for the single-gateway deployment.
+        # Keyed by the speaker's ``mira_agent_uuid`` (their own row's
+        # agent_uuid), value is (profile_dict_or_None, fetched_at_monotonic).
+        # A profile read is one bounded SELECT in the portal DB; the TTL keeps
+        # the hot path free of a per-utterance query while still picking up a
+        # user's edits on their next invoked turn.
+        self._agent_profile_cache: Dict[str, tuple[Optional[Dict[str, Any]], float]] = {}
+        self._agent_profile_cache_ttl_seconds: float = self._nonnegative_float(
+            extra.get("agent_profile_cache_ttl_seconds"),
+            DEFAULT_AGENT_PROFILE_CACHE_TTL_SECONDS,
+        )
         self._push_to_talk_sessions: Dict[str, str] = {}
         self._conversation_transcript: list[Dict[str, Any]] = []
         self._transcript_sequence = 0
@@ -621,9 +636,35 @@ class LiveKitAdapter(BasePlatformAdapter):
                 return name
         return identity or "Participant"
 
-    def _match_keyterm(self, transcript: str) -> tuple[str, str]:
-        """Return ``(matched keyterm, optionally stripped transcript)``."""
-        for keyterm, pattern in self._keyterm_patterns:
+    def _keyterm_pattern(self, keyterm: str):
+        """Build the same anchored wake pattern used for global keyterms.
+
+        A user's personal wake term must match with the same leading-word and
+        boundary discipline as the global terms, or "my travel agent said..."
+        would fire a personal term named "agent" mid-sentence.
+        """
+        return (
+            keyterm,
+            re.compile(
+                r"^\s*(?:(?:hey|hi|okay|ok)[\s,]+)?"
+                + r"\s+".join(re.escape(part) for part in keyterm.split())
+                + r"(?!\w)",
+                re.IGNORECASE,
+            ),
+        )
+
+    def _match_keyterm(
+        self,
+        transcript: str,
+        extra_patterns: tuple[tuple[str, re.Pattern[str]], ...] = (),
+    ) -> tuple[str, str]:
+        """Return ``(matched keyterm, optionally stripped transcript)``.
+
+        ``extra_patterns`` are per-speaker keyterm patterns (the speaker's own
+        personal wake terms) tried *after* the global terms, so a global
+        match wins and a personal term is additive rather than a replacement.
+        """
+        for keyterm, pattern in (*self._keyterm_patterns, *extra_patterns):
             match = pattern.match(transcript)
             if match is None:
                 continue
@@ -664,6 +705,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._participant_call_ids.clear()
         self._session_epoch = uuid.uuid4().hex[:12]
         self._armed_participant_wakes.clear()
+        self._agent_profile_cache.clear()
         self._push_to_talk_sessions.clear()
         self._conversation_transcript.clear()
         self._transcript_sequence = 0
@@ -775,6 +817,126 @@ class LiveKitAdapter(BasePlatformAdapter):
             " For the hermes-mira-context MCP tools (itinerary, location, "
             "meeting transcript), use: " + ", ".join(parts) + "."
         )
+
+    def _load_agent_profile(
+        self, mira_agent_uuid: str
+    ) -> Optional[Dict[str, Any]]:
+        """Read the speaker's own per-user agent profile (cached, bounded).
+
+        The speaker's ``mira_agent_uuid`` (their row's agent_uuid) comes from
+        trusted LiveKit participant metadata the web portal signed. The read
+        is a single SELECT in the *portal* DB (``MIRA_AGENT_DATABASE_URL``),
+        which is a different database than the domain DB the transcript
+        recall uses (``MIRA_DATABASE_URL``).
+
+        Fallback discipline (never drop a turn): if the portal DB is not
+        configured, the uuid is empty/invalid, the row is not provisioned, or
+        the query fails, this returns ``None`` — the caller then uses the
+        base/global profile exactly as before.
+        """
+        key = str(mira_agent_uuid or "").strip().lower()
+        if not key:
+            return None
+        now = time.monotonic()
+        cached = self._agent_profile_cache.get(key)
+        if cached is not None and (now - cached[1]) < self._agent_profile_cache_ttl_seconds:
+            return cached[0]
+        try:
+            profile = self._fetch_agent_profile_from_db(key)
+        except Exception as exc:  # noqa: BLE001 — profile is best-effort
+            logger.debug(
+                "[%s] per-user agent profile lookup failed for %s: %s",
+                self.name, key, exc,
+            )
+            profile = None
+        # Cache even a None miss so a not-yet-provisioned account doesn't
+        # hammer the DB every utterance for the TTL window.
+        self._agent_profile_cache[key] = (profile, now)
+        return profile
+
+    def _fetch_agent_profile_from_db(self, agent_uuid: str) -> Optional[Dict[str, Any]]:
+        """Blocking SELECT for the profile row; run via ``to_thread``."""
+        database_url = os.getenv("MIRA_AGENT_DATABASE_URL", "").strip()
+        if not database_url:
+            return None
+        try:
+            from sqlalchemy import MetaData, Table, create_engine, select
+        except ImportError:
+            return None
+        try:
+            engine = create_engine(database_url, pool_pre_ping=True, future=True)
+            with engine.connect() as connection:
+                agents = Table("agents", MetaData(), autoload_with=engine)
+                row = connection.execute(
+                    select(
+                        agents.c.display_name,
+                        agents.c.invocation_keyterms,
+                        agents.c.system_prompt,
+                        agents.c.is_active,
+                    ).where(
+                        agents.c.agent_uuid == agent_uuid,
+                        agents.c.owner_user_id.is_not(None),
+                    )
+                ).first()
+            if row is None:
+                return None
+            return {
+                "display_name": row.display_name or "",
+                "invocation_keyterms": self._parse_profile_keyterms(row.invocation_keyterms),
+                "system_prompt": row.system_prompt or "",
+                "is_active": bool(row.is_active),
+            }
+        except Exception:  # noqa: BLE001
+            raise
+
+    @staticmethod
+    def _parse_profile_keyterms(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            items = value
+        elif isinstance(value, (bytes, bytearray)):
+            try:
+                items = json.loads(value.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                items = value.decode("utf-8").split(",")
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            try:
+                items = json.loads(text)
+            except ValueError:
+                items = text.split(",")
+        else:
+            return []
+        seen: list[str] = []
+        for item in items:
+            cleaned = str(item).strip()
+            if cleaned and cleaned not in seen:
+                seen.append(cleaned)
+        return seen
+
+    def _personal_identity_block(self, profile: Dict[str, Any]) -> str:
+        """Build the per-turn identity block for a personal profile.
+
+        Returns an empty string when the profile has nothing to inject (no
+        name and no persona), so callers can append unconditionally. The block
+        is explicitly labeled as the speaker's *personal* profile, not system
+        instructions, so the model composes it over the shared base SOUL
+        rather than treating it as a platform directive.
+        """
+        name = str(profile.get("display_name") or "").strip()
+        persona = str(profile.get("system_prompt") or "").strip()
+        if not name and not persona:
+            return ""
+        parts = ["Agent identity for this turn (the speaker's personal profile, not base config):"]
+        if name:
+            parts.append(f"- Display name: {name}")
+        if persona:
+            parts.append("- Persona (the speaker's authored identity):")
+            parts.append("  " + persona.replace("\n", "\n  "))
+        return "\n".join(parts) + "\n"
 
     def _append_transcript(
         self,
@@ -1154,7 +1316,30 @@ class LiveKitAdapter(BasePlatformAdapter):
         identity = str(getattr(event.source, "user_id", "") or "client")
         display_name = self._participant_display_name(identity)
         original_text = str(event.text or "").strip()
-        matched_keyterm, cleaned = self._match_keyterm(original_text)
+        # Single-gateway per-user binding: resolve the speaker's own profile
+        # row (by the mira_agent_uuid the portal signed into their metadata).
+        # Its wake terms extend the global gate and its persona is prompt-
+        # injected below. A miss (None) degrades to the base profile — the
+        # turn is never dropped over an identity lookup.
+        speaker_agent_uuid = self._participant_connection_metadata(identity).get(
+            "mira_agent_uuid", ""
+        )
+        personal_profile = await asyncio.to_thread(
+            self._load_agent_profile, speaker_agent_uuid
+        )
+        personal_keyterm_patterns: tuple[tuple[str, re.Pattern[str]], ...] = ()
+        if personal_profile and personal_profile.get("is_active"):
+            personal_keyterms = [
+                t
+                for t in personal_profile.get("invocation_keyterms", [])
+                if t
+            ]
+            personal_keyterm_patterns = tuple(
+                self._keyterm_pattern(term) for term in personal_keyterms
+            )
+        matched_keyterm, cleaned = self._match_keyterm(
+            original_text, personal_keyterm_patterns
+        )
         armed_keyterm = ""
         armed = self._armed_participant_wakes.pop(identity, None)
         if armed is not None and armed[1] >= time.monotonic():
@@ -1234,12 +1419,22 @@ class LiveKitAdapter(BasePlatformAdapter):
             f"{self._participant_display_name(person)}: {topic}"
             for person, topic in self._participant_topics.items()
         )
+        # Prepend the speaker's personal identity block (their own agent name
+        # + persona) so the single shared model responds *as* this user's
+        # agent this turn. Empty string when they have no personal profile,
+        # in which case meeting_context is exactly what it was before.
+        personal_identity = (
+            self._personal_identity_block(personal_profile)
+            if personal_profile and personal_profile.get("is_active")
+            else ""
+        )
         meeting_context = (
-            "LiveKit meeting context: the current speaker is "
-            f"{display_name} (identity {identity}). "
+            personal_identity
+            + "LiveKit meeting context: the current speaker is "
+            + f"{display_name} (identity {identity}). "
             "Address the correct speaker and distinguish participants. "
-            f"Latest participant topics/requests: {ledger}."
-            f"{self._mcp_identifier_context(identity)}"
+            + f"Latest participant topics/requests: {ledger}."
+            + self._mcp_identifier_context(identity)
         )
         # Fetch the current room's persisted transcript rows directly from
         # the DB and merge them with the in-memory window.  This makes the

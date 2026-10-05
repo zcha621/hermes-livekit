@@ -27,6 +27,12 @@ param(
     # -MiraEnvFile / infrastructure\.env.remote when available.
     [string]$McpPythonExe,
     [string]$MiraDatabaseUrl,
+    # The web-portal database (holds the `agents` table with each user's own
+    # per-user agent profile row). Used by the adapter to prompt-inject the
+    # speaker's personal identity per turn, and by the MCP server's
+    # get_agent_profile tool. A different database than MIRA_DATABASE_URL
+    # (the tourism-ai-backend domain DB).
+    [string]$AgentDatabaseUrl,
     [string]$AwareDbHost,
     [string]$AwareDbPort,
     [string]$AwareDbName,
@@ -248,6 +254,7 @@ $existingValueMap = @{
     Room             = "LIVEKIT_ROOM"
     AgentName        = "LIVEKIT_AGENT_NAME"
     MiraDatabaseUrl  = "MIRA_DATABASE_URL"
+    AgentDatabaseUrl = "MIRA_AGENT_DATABASE_URL"
     AwareDbHost      = "MIRA_AWARE_DATABASE_HOST"
     AwareDbPort      = "MIRA_AWARE_DATABASE_PORT"
     AwareDbName      = "MIRA_AWARE_DATABASE_NAME"
@@ -320,6 +327,7 @@ foreach ($candidate in $miraCandidatePaths) {
 
 $miraDirectValueMap = @{
     MiraDatabaseUrl    = "MIRA_DATABASE_URL"
+    AgentDatabaseUrl   = "MIRA_AGENT_DATABASE_URL"
     AwareDbHost        = "MIRA_AWARE_DATABASE_HOST"
     AwareDbPort        = "MIRA_AWARE_DATABASE_PORT"
     AwareDbName        = "MIRA_AWARE_DATABASE_NAME"
@@ -465,6 +473,7 @@ try {
     Set-DotEnvValue $envPath "LIVEKIT_ALLOW_ALL_USERS" $allowAllUsersValue
     $mcpEnvValueMap = @{
         MiraDatabaseUrl = "MIRA_DATABASE_URL"
+        AgentDatabaseUrl = "MIRA_AGENT_DATABASE_URL"
         AwareDbHost     = "MIRA_AWARE_DATABASE_HOST"
         AwareDbPort     = "MIRA_AWARE_DATABASE_PORT"
         AwareDbName     = "MIRA_AWARE_DATABASE_NAME"

@@ -161,6 +161,72 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(keyterm, "MiRA")
         self.assertEqual(cleaned, "find walks near Rotorua")
 
+    def test_personal_keyterm_is_additive_after_global_terms(self):
+        # A speaker's own wake term (from their personal profile) extends the
+        # global gate; a global match still wins, a personal term is additive.
+        personal = self.adapter._keyterm_pattern("Comet")
+        keyterm, cleaned = self.adapter._match_keyterm(
+            "Hey Comet, where should we eat", extra_patterns=(personal,)
+        )
+        self.assertEqual(keyterm, "Comet")
+        self.assertEqual(cleaned, "where should we eat")
+
+        # Global term still takes precedence when both would match.
+        keyterm, _ = self.adapter._match_keyterm(
+            "Hey MiRA, hello", extra_patterns=(personal,)
+        )
+        self.assertEqual(keyterm, "MiRA")
+
+    def test_load_agent_profile_caches_hit_and_miss(self):
+        # A single DB hit should be served from the TTL cache afterwards.
+        calls = {"n": 0}
+
+        def fake_fetch(agent_uuid):
+            calls["n"] += 1
+            return {"display_name": "D", "invocation_keyterms": [], "system_prompt": "p", "is_active": True}
+
+        with patch.object(self.adapter, "_fetch_agent_profile_from_db", fake_fetch):
+            first = self.adapter._load_agent_profile("11111111-1111-1111-1111-111111111111")
+            second = self.adapter._load_agent_profile("11111111-1111-1111-1111-111111111111")
+
+        self.assertEqual(first, second)
+        self.assertEqual(calls["n"], 1)
+
+    def test_load_agent_profile_empty_uuid_returns_none_without_db(self):
+        with patch.object(self.adapter, "_fetch_agent_profile_from_db", lambda u: self.fail("no db hit for empty uuid")):
+            self.assertIsNone(self.adapter._load_agent_profile(""))
+            self.assertIsNone(self.adapter._load_agent_profile("   "))
+
+    def test_load_agent_profile_db_error_degrades_to_none(self):
+        def boom(agent_uuid):
+            raise RuntimeError("portal db unreachable")
+
+        with patch.object(self.adapter, "_fetch_agent_profile_from_db", boom):
+            self.assertIsNone(self.adapter._load_agent_profile("22222222-2222-2222-2222-222222222222"))
+        # A failed lookup is cached as a miss so the same speaker isn't
+        # hammered again within the TTL window.
+        self.assertIn(
+            "22222222-2222-2222-2222-222222222222",
+            self.adapter._agent_profile_cache,
+        )
+
+    def test_personal_identity_block_injects_name_and_persona(self):
+        block = self.adapter._personal_identity_block({
+            "display_name": "Comet",
+            "system_prompt": "You are a laid-back Kiwi tour guide.",
+            "is_active": True,
+        })
+        self.assertIn("Display name: Comet", block)
+        self.assertIn("laid-back Kiwi tour guide", block)
+
+    def test_personal_identity_block_empty_when_no_name_or_persona(self):
+        self.assertEqual(
+            self.adapter._personal_identity_block(
+                {"display_name": "", "system_prompt": "", "is_active": True}
+            ),
+            "",
+        )
+
     def test_short_followup_keeps_participant_topic(self):
         topic = self.adapter._topic_for_turn("yes please", "Rotorua family walks")
 

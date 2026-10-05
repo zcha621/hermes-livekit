@@ -50,6 +50,9 @@ REMOTE_TOOL_OWNER_PREFIXES = [
 MCP_SERVER_NAME = "hermes-mira-context"
 MCP_SERVER_REQUIRED_ENV_VARS = (
     "MIRA_DATABASE_URL",
+    # The web-portal DB (holds the per-user `agents` profile rows the
+    # get_agent_profile tool reads). A different database than MIRA_DATABASE_URL.
+    "MIRA_AGENT_DATABASE_URL",
     "MIRA_AWARE_DATABASE_HOST",
     "MIRA_AWARE_DATABASE_PORT",
     "MIRA_AWARE_DATABASE_NAME",
