@@ -1680,6 +1680,9 @@ class LiveKitAdapter(BasePlatformAdapter):
                     "mira.agent.active_speaker_name": self._active_speaker_name,
                     "mira.agent.topic": self._active_topic,
                     "mira.agent.keyterms": json.dumps(list(self._effective_keyterms())),
+                    # Debug aid: which step of the per-user room bind succeeded
+                    # or failed, surfaced directly in the meeting UI.
+                    "mira.agent.room_profile_bind": self._room_agent_diag,
                 }
                 try:
                     await self._room.local_participant.set_attributes(attributes)
