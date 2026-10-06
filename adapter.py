@@ -888,39 +888,43 @@ class LiveKitAdapter(BasePlatformAdapter):
         return profile
 
     def _fetch_agent_profile_from_db(self, agent_uuid: str) -> Optional[Dict[str, Any]]:
-        """Blocking SELECT for the profile row; run via ``to_thread``."""
+        """Blocking SELECT for the profile row; run via ``to_thread``.
+
+        Uses a raw SQL SELECT (``exec_driver_sql`` with the driver's native
+        placeholder) rather than an introspected ``Table``. Table reflection
+        (``autoload_with``) issues an extra schema query that a
+        SELECT-only grant on the portal DB can deny (error 1142), which
+        surfaced as a swallowed ``profile-missing`` even though the plain
+        SELECT works. The raw form matches the working room-uuid lookup and
+        only needs ``SELECT`` on the ``agents`` table.
+        """
         database_url = os.getenv("MIRA_AGENT_DATABASE_URL", "").strip()
         if not database_url:
             return None
         try:
-            from sqlalchemy import MetaData, Table, create_engine, select
+            from sqlalchemy import create_engine
         except ImportError:
             return None
+        engine = create_engine(database_url, pool_pre_ping=True, future=True)
         try:
-            engine = create_engine(database_url, pool_pre_ping=True, future=True)
             with engine.connect() as connection:
-                agents = Table("agents", MetaData(), autoload_with=engine)
-                row = connection.execute(
-                    select(
-                        agents.c.display_name,
-                        agents.c.invocation_keyterms,
-                        agents.c.system_prompt,
-                        agents.c.is_active,
-                    ).where(
-                        agents.c.agent_uuid == agent_uuid,
-                        agents.c.owner_user_id.is_not(None),
-                    )
+                result = connection.exec_driver_sql(
+                    "SELECT display_name, invocation_keyterms, system_prompt, is_active "
+                    "FROM agents "
+                    "WHERE agent_uuid = %s AND owner_user_id IS NOT NULL",
+                    (agent_uuid,),
                 ).first()
-            if row is None:
-                return None
-            return {
-                "display_name": row.display_name or "",
-                "invocation_keyterms": self._parse_profile_keyterms(row.invocation_keyterms),
-                "system_prompt": row.system_prompt or "",
-                "is_active": bool(row.is_active),
-            }
-        except Exception:  # noqa: BLE001
-            raise
+        finally:
+            engine.dispose()
+        if result is None:
+            return None
+        row = dict(result._mapping)
+        return {
+            "display_name": row.get("display_name") or "",
+            "invocation_keyterms": self._parse_profile_keyterms(row.get("invocation_keyterms")),
+            "system_prompt": row.get("system_prompt") or "",
+            "is_active": bool(row.get("is_active")),
+        }
 
     @staticmethod
     def _parse_profile_keyterms(value: Any) -> list[str]:

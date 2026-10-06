@@ -210,6 +210,84 @@ class AdapterTests(unittest.TestCase):
             self.adapter._agent_profile_cache,
         )
 
+    def test_fetch_agent_profile_uses_raw_sql_not_reflection(self):
+        # Regression: table reflection (autoload_with) issues an extra schema
+        # query a SELECT-only grant denies (error 1142), surfacing as a
+        # swallowed profile-missing. The fetch must use exec_driver_sql with a
+        # plain SELECT so only SELECT on the agents table is required.
+        captured = {}
+
+        class FakeResult:
+            _mapping = {
+                "display_name": "John01",
+                "invocation_keyterms": '["John"]',
+                "system_prompt": "you are John",
+                "is_active": 1,
+            }
+
+            def first(self):
+                return self
+
+        class FakeConnection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def exec_driver_sql(self, sql, params):
+                captured["sql"] = sql
+                captured["params"] = params
+                return FakeResult()
+
+        class FakeEngine:
+            def connect(self):
+                return FakeConnection()
+
+            def dispose(self):
+                captured["disposed"] = True
+
+        with patch.dict(os.environ, {"MIRA_AGENT_DATABASE_URL": "mysql+pymysql://u:p@h:3306/mira_agent_config"}), \
+             patch("sqlalchemy.create_engine", return_value=FakeEngine()):
+            profile = self.adapter._fetch_agent_profile_from_db(
+                "3ca50a82-2eb7-5c1c-bb4c-5b5b6bd932d5"
+            )
+
+        self.assertIn("FROM agents", captured["sql"])
+        self.assertIn("WHERE agent_uuid = %s AND owner_user_id IS NOT NULL", captured["sql"])
+        self.assertEqual(captured["params"], ("3ca50a82-2eb7-5c1c-bb4c-5b5b6bd932d5",))
+        self.assertTrue(captured.get("disposed"))
+        self.assertEqual(profile["display_name"], "John01")
+        self.assertEqual(profile["invocation_keyterms"], ["John"])
+        self.assertEqual(profile["system_prompt"], "you are John")
+        self.assertTrue(profile["is_active"])
+
+    def test_fetch_agent_profile_no_row_returns_none(self):
+        class FakeResult:
+            def first(self):
+                return None
+
+        class FakeConnection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def exec_driver_sql(self, sql, params):
+                return FakeResult()
+
+        class FakeEngine:
+            def connect(self):
+                return FakeConnection()
+
+            def dispose(self):
+                pass
+
+        with patch.dict(os.environ, {"MIRA_AGENT_DATABASE_URL": "mysql+pymysql://u:p@h:3306/mira_agent_config"}), \
+             patch("sqlalchemy.create_engine", return_value=FakeEngine()):
+            self.assertIsNone(self.adapter._fetch_agent_profile_from_db("no-such-uuid"))
+
     def test_personal_identity_block_injects_name_and_persona(self):
         block = self.adapter._personal_identity_block({
             "display_name": "Comet",
