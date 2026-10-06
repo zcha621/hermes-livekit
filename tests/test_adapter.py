@@ -1448,6 +1448,112 @@ class RoomFollowingTests(unittest.TestCase):
         self.assertFalse(livekit_adapter._room_requests_hermes(""))
 
 
+class RoomProfileSelfHealTests(unittest.TestCase):
+    """Tests for the per-user room-profile self-heal fallback path.
+
+    ``_fetch_room_agent_profile`` imports ``create_engine`` from the
+    sqlalchemy module at call time, so tests patch the sqlalchemy module
+    attribute (not the adapter's) to inject a fake engine.
+    """
+
+    def _adapter(self):
+        adapter = make_adapter()
+        adapter._room_name = "test-room"
+        return adapter
+
+    def _fake_engine_for(self, row):
+        import sqlalchemy
+        return patch.object(
+            sqlalchemy, "create_engine", side_effect=lambda url, **kw: _FakeEngine(row)
+        )
+
+    def test_db_diag_prefix_appends_database_name(self):
+        adapter = self._adapter()
+        with patch.dict("os.environ", {"MIRA_AGENT_DATABASE_URL": "mysql+pymysql://u:p@host:3306/mira_agent_config"}):
+            self.assertEqual(
+                adapter._db_diag_prefix("db-no-uuid(agent_id=21)"),
+                "db-no-uuid(agent_id=21)(db=mira_agent_config)",
+            )
+        saved = os.environ.pop("MIRA_AGENT_DATABASE_URL", None)
+        try:
+            self.assertEqual(adapter._db_diag_prefix("db-no-uuid(agent_id=21)"), "db-no-uuid(agent_id=21)")
+        finally:
+            if saved is not None:
+                os.environ["MIRA_AGENT_DATABASE_URL"] = saved
+
+    def test_fetch_room_agent_profile_returns_uuid_on_clean_hit(self):
+        adapter = self._adapter()
+        row = SimpleNamespace(_mapping={"agent_uuid": "abc-123", "display_name": "John01", "agent_name": "john01", "invocation_keyterms": '["John"]'})
+        with patch.dict("os.environ", {"MIRA_AGENT_DATABASE_URL": "mysql+pymysql://u:p@host/mira_agent_config"}):
+            with self._fake_engine_for(row):
+                self.assertEqual(adapter._fetch_room_agent_profile(21), "abc-123")
+
+    def test_fetch_room_agent_profile_returns_dict_when_uuid_missing(self):
+        adapter = self._adapter()
+        row = SimpleNamespace(_mapping={"agent_uuid": None, "display_name": "John01", "agent_name": "john01", "invocation_keyterms": '["John"]'})
+        with patch.dict("os.environ", {"MIRA_AGENT_DATABASE_URL": "mysql+pymysql://u:p@host/mira_agent_config"}):
+            with self._fake_engine_for(row):
+                result = adapter._fetch_room_agent_profile(21)
+        self.assertIsInstance(result, dict)
+        self.assertIsNone(result["agent_uuid"])
+        self.assertEqual(result["display_name"], "John01")
+
+    def test_load_room_agent_profile_self_heals_on_uuid_miss(self):
+        adapter = self._adapter()
+        meta = json.dumps({"agent_id": 21, "agent_runtime": "hermes"})
+        row = SimpleNamespace(_mapping={"agent_uuid": None, "display_name": "John01", "agent_name": "john01", "invocation_keyterms": '["John"]'})
+        with patch.dict("os.environ", {"MIRA_AGENT_DATABASE_URL": "mysql+pymysql://u:p@host/mira_agent_config"}):
+            with self._fake_engine_for(row):
+                result = adapter._load_room_agent_profile(meta)
+        self.assertIsNone(result)
+        self.assertEqual(adapter._room_agent_display_name, "John01")
+        self.assertEqual(adapter._room_agent_keyterms, ("John",))
+        self.assertIn("fallback", adapter._room_agent_diag)
+        self.assertIn("John01", adapter._room_agent_diag)
+
+    def test_load_room_agent_profile_returns_uuid_on_clean_hit(self):
+        adapter = self._adapter()
+        meta = json.dumps({"agent_id": 21, "agent_runtime": "hermes"})
+        row = SimpleNamespace(_mapping={"agent_uuid": "abc-123", "display_name": "John01", "agent_name": "john01", "invocation_keyterms": '["John"]'})
+        with patch.dict("os.environ", {"MIRA_AGENT_DATABASE_URL": "mysql+pymysql://u:p@host/mira_agent_config"}):
+            with self._fake_engine_for(row):
+                result = adapter._load_room_agent_profile(meta)
+        self.assertEqual(result, "abc-123")
+        self.assertIn("resolved", adapter._room_agent_diag)
+
+    def test_no_room_metadata_returns_none(self):
+        adapter = self._adapter()
+        self.assertIsNone(adapter._load_room_agent_profile(""))
+        self.assertEqual(adapter._room_agent_diag, "no-room-metadata")
+
+    def test_metadata_without_agent_id_returns_none(self):
+        adapter = self._adapter()
+        self.assertIsNone(adapter._load_room_agent_profile('{"agent_runtime": "hermes"}'))
+        self.assertIn("no-agent-id", adapter._room_agent_diag)
+
+
+class _FakeConnection:
+    """Minimal SQLAlchemy connection double (exec_driver_sql path)."""
+    def __init__(self, row):
+        self._row = row
+    def exec_driver_sql(self, *a, **kw):
+        return SimpleNamespace(first=lambda: self._row)
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeEngine:
+    """Minimal SQLAlchemy engine double for _fetch_room_agent_profile tests."""
+    def __init__(self, row):
+        self._conn = _FakeConnection(row)
+    def connect(self):
+        return self._conn
+    def dispose(self):
+        pass
+
+
 class RoomTranscriptContextTests(unittest.TestCase):
     """Tests for _fetch_room_transcript and _merge_db_transcript_into_context."""
 

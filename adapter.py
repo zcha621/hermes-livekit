@@ -1088,35 +1088,41 @@ class LiveKitAdapter(BasePlatformAdapter):
         Returns the uuid as a plain string on a clean hit, or a dict with the
         row's ``agent_uuid``, ``display_name``, ``agent_name`` and
         ``invocation_keyterms`` when the uuid is empty/missing so the caller
-        can self-heal. Returns ``None`` when the URL is unset or the read
-        fails (the caller logs the exception and sets its own diag).
+        can self-heal. Returns ``None`` when the URL is unset, no row exists,
+        or the read fails (the caller logs the exception and sets its own
+        diag).
+
+        Uses a raw SQL SELECT (``exec_driver_sql`` with the driver's native
+        placeholder) rather than an introspected ``Table``, so it works even
+        when schema introspection is unavailable and only selects columns that
+        exist on the deployed schema.
         """
         database_url = os.getenv("MIRA_AGENT_DATABASE_URL", "").strip()
         if not database_url:
             self._room_agent_diag = "no-agent-db-url"
             return None
         try:
-            from sqlalchemy import MetaData, Table, create_engine, select
+            from sqlalchemy import create_engine
         except ImportError:
             self._room_agent_diag = "no-sqlalchemy"
             return None
         engine = create_engine(database_url, pool_pre_ping=True, future=True)
         try:
             with engine.connect() as connection:
-                agents = Table("agents", MetaData(), autoload_with=engine)
-                cols = [agents.c.agent_uuid]
-                for name in ("display_name", "agent_name", "invocation_keyterms"):
-                    col = getattr(agents.c, name, None)
-                    if col is not None:
-                        cols.append(col)
-                result = connection.execute(
-                    select(*cols).where(agents.c.agent_id == agent_id)
+                # Native driver placeholder: pymysql/MySQL uses %s. The query
+                # only requests columns that exist on the current portal
+                # schema; if the DB is older and lacks one, the error is
+                # caught by the caller and the diag reflects it.
+                result = connection.exec_driver_sql(
+                    "SELECT agent_uuid, agent_name, display_name, invocation_keyterms "
+                    "FROM agents WHERE agent_id = %s",
+                    (agent_id,),
                 ).first()
         finally:
             engine.dispose()
         if result is None:
             return None
-        row = {c: result._mapping.get(c) for c in result._mapping}
+        row = dict(result._mapping)
         uuid_value = row.get("agent_uuid")
         if uuid_value:
             return str(uuid_value)
