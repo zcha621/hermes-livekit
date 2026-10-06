@@ -129,6 +129,11 @@ DEFAULT_INVOCATION_KEYTERMS = ("Hermes", "MiRA")
 # Long enough to avoid a query per utterance; short enough that a user's
 # edits are visible on their next invoked turn.
 DEFAULT_AGENT_PROFILE_CACHE_TTL_SECONDS = 60.0
+# Build marker surfaced in the room-bind diagnostic so the meeting UI can tell
+# which adapter commit is actually running on the host. Bump on every change
+# that affects the room-profile bind path; a mismatch with the expected value
+# means the gateway is running stale code (the deploy did not reach it).
+ROOM_PROFILE_BIND_BUILD = "raw-sql-v1"
 PUSH_TO_TALK_KEYTERM = "@Agent"
 PUSH_TO_TALK_RELEASE_GRACE_SECONDS = 0.2
 DEFAULT_TRANSCRIPT_MAX_ENTRIES = 80
@@ -1043,18 +1048,24 @@ class LiveKitAdapter(BasePlatformAdapter):
         return None
 
     def _db_diag_prefix(self, diag: str) -> str:
-        """Enrich a DB-miss diagnostic with the database name the
-        ``MIRA_AGENT_DATABASE_URL`` points at, so a wrong-DB misconfiguration
-        is visible without host access."""
+        """Enrich a DB-miss diagnostic with the build marker, the database
+        name the ``MIRA_AGENT_DATABASE_URL`` points at, and the DB user — so a
+        wrong-DB / wrong-credential misconfiguration is visible in the meeting
+        status bar without host access. The build marker also proves which
+        adapter commit is running: if the expected marker is absent, the
+        gateway is still on pre-raw-SQL code (the deploy did not reach it)."""
         database_url = os.getenv("MIRA_AGENT_DATABASE_URL", "").strip()
-        if not database_url:
-            return diag
+        # Three URL shapes: scheme://user[:pass]@host[:port]/db,
+        # scheme://host[:port]/db, or scheme://host/db. The user group is
+        # optional so a host-only URL still surfaces the database name.
         match = re.match(
-            r"^[a-zA-Z][a-zA-Z0-9+.-]*://(?:[^@/]+@)?[^:/?]+(?::\d+)?/([^?#]*)",
+            r"^[a-zA-Z][a-zA-Z0-9+.-]*://(?:([^@/]+?)(?::[^@/]*)?@)?[^:/?]+(?::\d+)?/([^?#]*)",
             database_url,
         )
-        database = match.group(1) if match else "?"
-        return f"{diag}(db={database})"
+        if match:
+            user = match.group(1) or "?"
+            return f"{diag}(build={ROOM_PROFILE_BIND_BUILD},db={match.group(2) or '?'},user={user})"
+        return f"{diag}(build={ROOM_PROFILE_BIND_BUILD},db=unparsed)"
 
     def _apply_room_agent_fallback(self, row: Optional[dict]) -> None:
         """Apply a name/keyterms fallback from a partially-read agents row.
@@ -1191,7 +1202,10 @@ class LiveKitAdapter(BasePlatformAdapter):
         if keyterms:
             self._room_agent_keyterms = keyterms
         await self._apply_room_agent_fields()
-        self._room_agent_diag = f"ok(name={display_name!r},keyterms={list(keyterms)})"
+        self._room_agent_diag = (
+            f"ok(build={ROOM_PROFILE_BIND_BUILD},name={display_name!r},"
+            f"keyterms={list(keyterms)})"
+        )
         logger.info(
             "[%s] Bound room agent profile '%s' (name=%r keyterms=%r)",
             self.name, uuid_value, display_name, keyterms,

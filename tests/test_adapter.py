@@ -1467,16 +1467,30 @@ class RoomProfileSelfHealTests(unittest.TestCase):
             sqlalchemy, "create_engine", side_effect=lambda url, **kw: _FakeEngine(row)
         )
 
-    def test_db_diag_prefix_appends_database_name(self):
+    def test_db_diag_prefix_appends_build_db_user(self):
         adapter = self._adapter()
-        with patch.dict("os.environ", {"MIRA_AGENT_DATABASE_URL": "mysql+pymysql://u:p@host:3306/mira_agent_config"}):
+        build = livekit_adapter.ROOM_PROFILE_BIND_BUILD
+        with patch.dict("os.environ", {"MIRA_AGENT_DATABASE_URL": "mysql+pymysql://mira_user:secret@dbhost:3306/mira_agent_config"}):
             self.assertEqual(
                 adapter._db_diag_prefix("db-no-uuid(agent_id=21)"),
-                "db-no-uuid(agent_id=21)(db=mira_agent_config)",
+                f"db-no-uuid(agent_id=21)(build={build},db=mira_agent_config,user=mira_user)",
             )
+        # No user in the URL still parses the database name (user is unknown).
+        with patch.dict("os.environ", {"MIRA_AGENT_DATABASE_URL": "mysql+pymysql://dbhost:3306/mira_agent_config"}):
+            self.assertEqual(
+                adapter._db_diag_prefix("db-no-uuid(agent_id=21)"),
+                f"db-no-uuid(agent_id=21)(build={build},db=mira_agent_config,user=?)",
+            )
+
+    def test_db_diag_prefix_without_url_keeps_build_marker(self):
+        adapter = self._adapter()
+        build = livekit_adapter.ROOM_PROFILE_BIND_BUILD
         saved = os.environ.pop("MIRA_AGENT_DATABASE_URL", None)
         try:
-            self.assertEqual(adapter._db_diag_prefix("db-no-uuid(agent_id=21)"), "db-no-uuid(agent_id=21)")
+            self.assertEqual(
+                adapter._db_diag_prefix("db-no-uuid(agent_id=21)"),
+                f"db-no-uuid(agent_id=21)(build={build},db=unparsed)",
+            )
         finally:
             if saved is not None:
                 os.environ["MIRA_AGENT_DATABASE_URL"] = saved
