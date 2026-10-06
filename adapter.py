@@ -444,6 +444,11 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._room_agent_uuid: str = ""
         self._room_agent_display_name: str = ""
         self._room_agent_keyterms: tuple[str, ...] = ()
+        # Diagnostic for the room-profile bind: a short reason string (e.g.
+        # "ok", "no-agent-id", "db:agent_id-123-no-row") published into the
+        # status payload so a failed bind is visible instead of silently
+        # falling back to the base name.
+        self._room_agent_diag: str = "pending"
         self._transcript_max_entries = self._positive_int(
             transcript_config.get("history_max_entries"),
             DEFAULT_TRANSCRIPT_MAX_ENTRIES,
@@ -986,34 +991,47 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._room_agent_display_name = ""
         self._room_agent_keyterms = ()
         if not room_metadata or not self._room_name:
+            self._room_agent_diag = "no-room-metadata"
             return None
         try:
             metadata = json.loads(room_metadata)
         except (TypeError, ValueError):
+            self._room_agent_diag = "metadata-not-json"
             return None
         if not isinstance(metadata, dict):
+            self._room_agent_diag = "metadata-not-object"
             return None
         agent_id = metadata.get("agent_id")
         try:
             agent_id = int(agent_id)
         except (TypeError, ValueError):
+            self._room_agent_diag = f"no-agent-id(meta={room_metadata[:120]!r})"
             return None
         if agent_id <= 0:
+            self._room_agent_diag = f"agent-id-nonpositive({agent_id})"
             return None
         try:
-            return self._fetch_room_agent_uuid(agent_id)
+            result = self._fetch_room_agent_uuid(agent_id)
         except Exception as exc:  # noqa: BLE001 — room binding is best-effort
             logger.debug("[%s] room agent binding failed: %s", self.name, exc)
+            self._room_agent_diag = f"db-error(agent_id={agent_id},{type(exc).__name__})"
             return None
+        if not result:
+            self._room_agent_diag = f"db-no-uuid(agent_id={agent_id})"
+            return None
+        self._room_agent_diag = f"resolved(agent_id={agent_id})"
+        return result
 
     def _fetch_room_agent_uuid(self, agent_id: int) -> Optional[str]:
         """SELECT the agent row's uuid by primary key in the portal DB."""
         database_url = os.getenv("MIRA_AGENT_DATABASE_URL", "").strip()
         if not database_url:
+            self._room_agent_diag = "no-agent-db-url"
             return None
         try:
             from sqlalchemy import MetaData, Table, create_engine, select
         except ImportError:
+            self._room_agent_diag = "no-sqlalchemy"
             return None
         engine = create_engine(database_url, pool_pre_ping=True, future=True)
         try:
@@ -1047,17 +1065,25 @@ class LiveKitAdapter(BasePlatformAdapter):
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("[%s] room agent profile refresh error: %s", self.name, exc)
+            self._room_agent_diag = f"refresh-error({type(exc).__name__})"
             return False
         if not uuid_value:
+            # diag already set by _load_room_agent_profile
+            logger.info("[%s] room agent profile not bound: %s", self.name, self._room_agent_diag)
             return False
         profile = await asyncio.to_thread(self._load_agent_profile, uuid_value)
-        if not profile or not profile.get("is_active"):
+        if not profile:
+            self._room_agent_diag = f"profile-missing(uuid={uuid_value})"
+            return False
+        if not profile.get("is_active"):
+            self._room_agent_diag = f"profile-inactive(uuid={uuid_value})"
             return False
         display_name = str(profile.get("display_name") or "").strip()
         keyterms = tuple(
             t for t in profile.get("invocation_keyterms", []) if t
         )
         if not display_name and not keyterms:
+            self._room_agent_diag = f"profile-empty(uuid={uuid_value})"
             return False
         self._room_agent_uuid = uuid_value
         if display_name:
@@ -1076,6 +1102,7 @@ class LiveKitAdapter(BasePlatformAdapter):
                 await self._set_agent_state(self._agent_state, force=True)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("[%s] status refresh after room profile bind failed: %s", self.name, exc)
+        self._room_agent_diag = f"ok(name={display_name!r},keyterms={list(keyterms)})"
         logger.info(
             "[%s] Bound room agent profile '%s' (name=%r keyterms=%r)",
             self.name, uuid_value, display_name, keyterms,
@@ -1626,6 +1653,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             "topic": self._active_topic,
             "keyterms": list(self._effective_keyterms()),
             "last_keyterm": self._last_keyterm,
+            "room_profile_bind": self._room_agent_diag,
             "updated_at": datetime.now(tz=timezone.utc).isoformat(),
         }
 
