@@ -28,7 +28,7 @@ import time
 import uuid
 import wave
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 try:
     from livekit import rtc
@@ -980,12 +980,19 @@ class LiveKitAdapter(BasePlatformAdapter):
     def _load_room_agent_profile(self, room_metadata: str) -> Optional[str]:
         """Bind this room's agent profile (if the room was created with one).
 
-        Reads the portal's ``room_sessions`` row for the current room and, when
-        its metadata carries an ``agent_id`` (a per-user profile row brought
-        into the room), loads that row's ``agent_uuid``. Returns the uuid, or
-        ``None`` when the room has no such agent / the read fails. The
-        display-name and keyterm refresh happens in
+        Reads the LiveKit room's metadata for an ``agent_id`` (a per-user
+        profile row brought into the room) and resolves it in the portal DB.
+        Returns the agent uuid, or ``None`` when the room has no such agent /
+        the read fails. The display-name and keyterm refresh happens in
         :meth:`_refresh_room_agent_profile`.
+
+        Self-healing: if the uuid lookup misses or errors (most often the
+        gateway's ``MIRA_AGENT_DATABASE_URL`` pointing at a database that lacks
+        the row), we fall back to binding the display name / keyterms directly
+        from the row we *did* read, so the created room still shows the
+        brought-in agent's identity rather than silently reverting to the base
+        profile. The diagnostic is enriched with the URL's database name so a
+        misconfiguration is visible in the meeting status bar.
         """
         self._room_agent_uuid = ""
         self._room_agent_display_name = ""
@@ -1011,19 +1018,79 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._room_agent_diag = f"agent-id-nonpositive({agent_id})"
             return None
         try:
-            result = self._fetch_room_agent_uuid(agent_id)
+            result = self._fetch_room_agent_profile(agent_id)
         except Exception as exc:  # noqa: BLE001 — room binding is best-effort
             logger.debug("[%s] room agent binding failed: %s", self.name, exc)
-            self._room_agent_diag = f"db-error(agent_id={agent_id},{type(exc).__name__})"
+            self._room_agent_diag = self._db_diag_prefix(
+                f"db-error(agent_id={agent_id},{type(exc).__name__})"
+            )
             return None
         if not result:
-            self._room_agent_diag = f"db-no-uuid(agent_id={agent_id})"
+            self._room_agent_diag = self._db_diag_prefix(
+                f"db-no-uuid(agent_id={agent_id})"
+            )
             return None
-        self._room_agent_diag = f"resolved(agent_id={agent_id})"
-        return result
+        row_uuid = result.get("agent_uuid") if isinstance(result, dict) else result
+        if row_uuid:
+            self._room_agent_diag = self._db_diag_prefix(f"resolved(agent_id={agent_id})")
+            return str(row_uuid)
+        # uuid came back empty but the row read gave us name/keyterms — bind
+        # those directly so the identity is still correct (self-heal).
+        self._apply_room_agent_fallback(result)
+        self._room_agent_diag = self._db_diag_prefix(
+            f"fallback(name={self._room_agent_display_name!r})"
+        )
+        return None
 
-    def _fetch_room_agent_uuid(self, agent_id: int) -> Optional[str]:
-        """SELECT the agent row's uuid by primary key in the portal DB."""
+    def _db_diag_prefix(self, diag: str) -> str:
+        """Enrich a DB-miss diagnostic with the database name the
+        ``MIRA_AGENT_DATABASE_URL`` points at, so a wrong-DB misconfiguration
+        is visible without host access."""
+        database_url = os.getenv("MIRA_AGENT_DATABASE_URL", "").strip()
+        if not database_url:
+            return diag
+        match = re.match(
+            r"^[a-zA-Z][a-zA-Z0-9+.-]*://(?:[^@/]+@)?[^:/?]+(?::\d+)?/([^?#]*)",
+            database_url,
+        )
+        database = match.group(1) if match else "?"
+        return f"{diag}(db={database})"
+
+    def _apply_room_agent_fallback(self, row: Optional[dict]) -> None:
+        """Apply a name/keyterms fallback from a partially-read agents row.
+
+        Used when the uuid is missing but the row still gave us a display name
+        or keyterms — enough to show the correct identity even though the
+        system-prompt persona (fetched by uuid) is unavailable.
+        """
+        if not isinstance(row, dict):
+            return
+        display_name = str(row.get("display_name") or row.get("agent_name") or "").strip()
+        if display_name:
+            self._room_agent_display_name = display_name
+        keyterms_raw = row.get("invocation_keyterms")
+        keyterms = []
+        if isinstance(keyterms_raw, (list, tuple)):
+            keyterms = [t for t in keyterms_raw if t]
+        elif isinstance(keyterms_raw, str) and keyterms_raw.strip():
+            try:
+                parsed = json.loads(keyterms_raw)
+                if isinstance(parsed, list):
+                    keyterms = [t for t in parsed if t]
+            except (TypeError, ValueError):
+                keyterms = [t.strip() for t in keyterms_raw.split(",") if t.strip()]
+        if keyterms:
+            self._room_agent_keyterms = tuple(keyterms)
+
+    def _fetch_room_agent_profile(self, agent_id: int) -> Optional[Union[str, dict]]:
+        """SELECT the agent row (uuid + identity fields) by primary key.
+
+        Returns the uuid as a plain string on a clean hit, or a dict with the
+        row's ``agent_uuid``, ``display_name``, ``agent_name`` and
+        ``invocation_keyterms`` when the uuid is empty/missing so the caller
+        can self-heal. Returns ``None`` when the URL is unset or the read
+        fails (the caller logs the exception and sets its own diag).
+        """
         database_url = os.getenv("MIRA_AGENT_DATABASE_URL", "").strip()
         if not database_url:
             self._room_agent_diag = "no-agent-db-url"
@@ -1037,14 +1104,30 @@ class LiveKitAdapter(BasePlatformAdapter):
         try:
             with engine.connect() as connection:
                 agents = Table("agents", MetaData(), autoload_with=engine)
-                row = connection.execute(
-                    select(agents.c.agent_uuid).where(agents.c.agent_id == agent_id)
+                cols = [agents.c.agent_uuid]
+                for name in ("display_name", "agent_name", "invocation_keyterms"):
+                    col = getattr(agents.c, name, None)
+                    if col is not None:
+                        cols.append(col)
+                result = connection.execute(
+                    select(*cols).where(agents.c.agent_id == agent_id)
                 ).first()
         finally:
             engine.dispose()
-        if row is None or not row.agent_uuid:
+        if result is None:
             return None
-        return str(row.agent_uuid)
+        row = {c: result._mapping.get(c) for c in result._mapping}
+        uuid_value = row.get("agent_uuid")
+        if uuid_value:
+            return str(uuid_value)
+        # Row exists but has no uuid — return the row so the caller can fall
+        # back to its name/keyterms rather than reverting to the base profile.
+        return {
+            "agent_uuid": None,
+            "display_name": row.get("display_name"),
+            "agent_name": row.get("agent_name"),
+            "invocation_keyterms": row.get("invocation_keyterms"),
+        }
 
     async def _refresh_room_agent_profile(self) -> bool:
         """Load the room's agent profile and refresh the on-screen name and
@@ -1068,6 +1151,17 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._room_agent_diag = f"refresh-error({type(exc).__name__})"
             return False
         if not uuid_value:
+            # Self-heal path: the uuid lookup missed but we already bound a
+            # fallback display name / keyterms directly from the agents row.
+            # Apply them to the room so the created room shows the brought-in
+            # agent's identity instead of silently reverting to the base.
+            if self._room_agent_display_name or self._room_agent_keyterms:
+                await self._apply_room_agent_fields()
+                logger.info(
+                    "[%s] Room agent profile bound via fallback (name=%r keyterms=%r)",
+                    self.name, self._room_agent_display_name, self._room_agent_keyterms,
+                )
+                return True
             # diag already set by _load_room_agent_profile
             logger.info("[%s] room agent profile not bound: %s", self.name, self._room_agent_diag)
             return False
@@ -1090,24 +1184,29 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._room_agent_display_name = display_name
         if keyterms:
             self._room_agent_keyterms = keyterms
-        # Update the visible display name live (no reconnect) and refresh the
-        # status attributes so the UI immediately shows the right name + keyterms.
-        if self._room is not None:
-            if display_name:
-                try:
-                    await self._room.local_participant.set_name(display_name)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("[%s] set_name to room agent profile failed: %s", self.name, exc)
-            try:
-                await self._set_agent_state(self._agent_state, force=True)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("[%s] status refresh after room profile bind failed: %s", self.name, exc)
+        await self._apply_room_agent_fields()
         self._room_agent_diag = f"ok(name={display_name!r},keyterms={list(keyterms)})"
         logger.info(
             "[%s] Bound room agent profile '%s' (name=%r keyterms=%r)",
             self.name, uuid_value, display_name, keyterms,
         )
         return True
+
+    async def _apply_room_agent_fields(self) -> None:
+        """Push the room-bound display name / keyterms to the LiveKit room:
+        update the participant's visible name and refresh the status
+        attributes so the UI shows the right name + keyterms immediately."""
+        if self._room is None:
+            return
+        if self._room_agent_display_name:
+            try:
+                await self._room.local_participant.set_name(self._room_agent_display_name)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[%s] set_name to room agent profile failed: %s", self.name, exc)
+        try:
+            await self._set_agent_state(self._agent_state, force=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[%s] status refresh after room profile bind failed: %s", self.name, exc)
 
     def _append_transcript(
         self,
