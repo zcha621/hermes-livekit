@@ -311,8 +311,21 @@ class AdapterTests(unittest.TestCase):
             "system_prompt": "You are a laid-back Kiwi tour guide.",
             "is_active": True,
         })
-        self.assertIn("Display name: Comet", block)
+        self.assertIn("Comet", block)
         self.assertIn("laid-back Kiwi tour guide", block)
+
+    def test_personal_identity_block_overrides_base_soul(self):
+        # The block must tell the model the persona SUPERSEDES the base SOUL.md
+        # identity (the "says MiRA instead of the user's agent" bug), and must
+        # forbid reading SOUL.md off disk to answer identity questions.
+        block = self.adapter._personal_identity_block({
+            "display_name": "John01",
+            "system_prompt": "You are John, exploring Australia.",
+            "is_active": True,
+        })
+        self.assertIn("SUPERSEDES", block)
+        self.assertIn("SOUL.md", block)
+        self.assertIn("John01", block)
 
     def test_personal_identity_block_empty_when_no_name_or_persona(self):
         self.assertEqual(

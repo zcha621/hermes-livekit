@@ -58,6 +58,20 @@ class SetupAssetTests(unittest.TestCase):
         self.assertIn("## One-click setup on Windows", readme)
         self.assertIn("Setup-HermesLiveKit.cmd", readme)
 
+    def test_base_soul_defers_to_the_speakers_personal_profile(self):
+        # The base SOUL.md is auto-injected by Hermes into the system prompt.
+        # Without an explicit override the model anchors on it (e.g. "MiRA")
+        # when asked who it is, and — because the livekit surface may expose
+        # file/terminal tools — it may even read SOUL.md off disk and recite
+        # the base identity. The repo source of truth must therefore carry an
+        # explicit deferral to the per-turn personal profile.
+        soul = (PLUGIN_ROOT / "assets" / "SOUL.md").read_text(encoding="utf-8")
+
+        self.assertIn("MiRA", soul)
+        self.assertIn("Identity override", soul)
+        self.assertIn("SOUL.md", soul)
+        self.assertIn("supersedes", soul)
+
     def test_setup_installs_identity_skill_and_task_capable_tool_surface(self):
         setup = (PLUGIN_ROOT / "Setup-HermesLiveKit.ps1").read_text(
             encoding="utf-8-sig"

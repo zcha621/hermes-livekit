@@ -1024,21 +1024,44 @@ class LiveKitAdapter(BasePlatformAdapter):
         """Build the per-turn identity block for a personal profile.
 
         Returns an empty string when the profile has nothing to inject (no
-        name and no persona), so callers can append unconditionally. The block
-        is explicitly labeled as the speaker's *personal* profile, not system
-        instructions, so the model composes it over the shared base SOUL
-        rather than treating it as a platform directive.
+        name and no persona), so callers can append unconditionally.
+
+        The block is written to *override* the shared base SOUL.md, which Hermes
+        auto-injects into the system prompt. Without explicit override language
+        the model anchors on the base identity (e.g. "MiRA") when asked who it
+        is — and, because the livekit toolset includes ``terminal``/``file``
+        tools, it may even read ``SOUL.md`` off disk and recite the base file.
+        The wording here tells the model the persona below IS its identity for
+        this turn, that it supersedes any base/persona instructions elsewhere,
+        and that it must answer identity questions only from this text (never by
+        opening a file).
         """
         name = str(profile.get("display_name") or "").strip()
         persona = str(profile.get("system_prompt") or "").strip()
         if not name and not persona:
             return ""
-        parts = ["Agent identity for this turn (the speaker's personal profile, not base config):"]
+        parts = [
+            "PERSONAL IDENTITY OVERRIDE for this turn — read carefully:",
+            "This speaker has a personal agent profile. For THIS conversation "
+            "your identity, name, and persona are exactly the profile below. "
+            "It SUPERSEDES any base identity, default persona, or SOUL.md "
+            "instructions that appear elsewhere in your context (e.g. a generic "
+            "'MiRA' or platform-wide system persona). Do not blend them; when "
+            "they conflict, the profile below wins.",
+        ]
         if name:
-            parts.append(f"- Display name: {name}")
+            parts.append(f"- Your name for this conversation: {name}")
         if persona:
-            parts.append("- Persona (the speaker's authored identity):")
+            parts.append("- Your persona / identity (the speaker's authored self):")
             parts.append("  " + persona.replace("\n", "\n  "))
+        parts.append(
+            "If the speaker asks who you are, what your soul/identity/persona "
+            "is, or to report your configuration, answer ONLY from the profile "
+            "above (and your name). Do not read, cat, grep, or open any file "
+            "such as SOUL.md to find your identity — your identity for this "
+            "turn is exactly the text in this block, and it may differ from the "
+            "base configuration on disk."
+        )
         return "\n".join(parts) + "\n"
 
     def _effective_agent_name(self) -> str:

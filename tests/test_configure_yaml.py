@@ -132,6 +132,44 @@ class ConfigureYamlTests(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
+    def test_update_excludes_file_and_terminal_from_livekit_only(self):
+        # file/terminal let a LiveKit agent read SOUL.md off disk and recite
+        # the base MiRA identity instead of the speaker's per-turn profile.
+        # They must be stripped from the livekit surface but stay on cli and
+        # discord, where file/shell work is a normal part of the task.
+        workspace_temp = Path(__file__).resolve().parents[3] / ".tmp"
+        workspace_temp.mkdir(exist_ok=True)
+        path = workspace_temp / "hermes-livekit-livekit-excluded-tools.yaml"
+        try:
+            path.write_text(
+                yaml.safe_dump(
+                    {
+                        "platform_toolsets": {
+                            "cli": ["browser", "file", "terminal", "web"],
+                            "discord": ["browser", "file", "terminal", "web"],
+                        }
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+
+            update_config(path)
+
+            config = yaml.safe_load(path.read_text(encoding="utf-8"))
+            for surface in ("cli", "discord"):
+                self.assertIn("file", config["platform_toolsets"][surface])
+                self.assertIn("terminal", config["platform_toolsets"][surface])
+            livekit = config["platform_toolsets"]["livekit"]
+            self.assertNotIn("file", livekit)
+            self.assertNotIn("terminal", livekit)
+            # The rest of the conversation toolset is retained on livekit.
+            self.assertIn("browser", livekit)
+            self.assertIn("web", livekit)
+            self.assertIn("hermes-livekit", livekit)
+        finally:
+            path.unlink(missing_ok=True)
+
     def test_update_exposes_mira_toolset_on_configured_gateways(self):
         workspace_temp = Path(__file__).resolve().parents[3] / ".tmp"
         workspace_temp.mkdir(exist_ok=True)
