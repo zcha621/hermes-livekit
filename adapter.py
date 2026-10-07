@@ -454,6 +454,13 @@ class LiveKitAdapter(BasePlatformAdapter):
         # status payload so a failed bind is visible instead of silently
         # falling back to the base name.
         self._room_agent_diag: str = "pending"
+        # Same idea, one level down: why the *current speaker's* per-user
+        # profile was or wasn't prompt-injected this turn. The room bind only
+        # proves the room-level row; a user can still silently run on the base
+        # soul (env unset / row missing / inactive) without the room diag ever
+        # changing. Surfaced as a LiveKit attribute + logged once per uuid.
+        self._speaker_profile_diag: str = "pending"
+        self._speaker_profile_diag_logged: set[str] = set()
         self._transcript_max_entries = self._positive_int(
             transcript_config.get("history_max_entries"),
             DEFAULT_TRANSCRIPT_MAX_ENTRIES,
@@ -865,29 +872,76 @@ class LiveKitAdapter(BasePlatformAdapter):
         Fallback discipline (never drop a turn): if the portal DB is not
         configured, the uuid is empty/invalid, the row is not provisioned, or
         the query fails, this returns ``None`` — the caller then uses the
-        base/global profile exactly as before.
+        base/global profile exactly as before. Every such miss records a
+        decisive reason in :attr:`_speaker_profile_diag` (and logs it once per
+        uuid) so "name and keyterms saved but the soul never changed" is
+        visible in the meeting status bar instead of silent.
         """
         key = str(mira_agent_uuid or "").strip().lower()
         if not key:
+            # No uuid in the participant metadata at all — the portal never
+            # stamped mira_agent_uuid, so personalization can't happen. This
+            # is a distinct, fixable condition (old portal / missing row), not
+            # a DB error.
+            self._speaker_profile_diag = "no-uuid-in-metadata"
             return None
         now = time.monotonic()
         cached = self._agent_profile_cache.get(key)
         if cached is not None and (now - cached[1]) < self._agent_profile_cache_ttl_seconds:
-            return cached[0]
+            profile, cached_diag = cached[0], cached[2]
+            self._speaker_profile_diag = cached_diag
+            return profile
         try:
-            profile = self._fetch_agent_profile_from_db(key)
+            profile, fetch_diag = self._fetch_agent_profile_from_db(key)
         except Exception as exc:  # noqa: BLE001 — profile is best-effort
-            logger.debug(
-                "[%s] per-user agent profile lookup failed for %s: %s",
-                self.name, key, exc,
-            )
+            fetch_diag = f"db-error({type(exc).__name__})"
             profile = None
-        # Cache even a None miss so a not-yet-provisioned account doesn't
-        # hammer the DB every utterance for the TTL window.
-        self._agent_profile_cache[key] = (profile, now)
+        if profile is not None:
+            # A row exists; the caller still decides on is_active / emptiness,
+            # but the lookup itself succeeded — say so.
+            fetch_diag = f"found(uuid={key})"
+        # A miss caused by an environment error (env unset, no sqlalchemy, or a
+        # SQL failure) is NOT cached: those are transient, and a 60s
+        # error-cached None would mask a just-fixed DB for a full minute.
+        # Genuine row-not-found misses ARE cached so a not-yet-provisioned
+        # account doesn't hammer the DB every utterance.
+        if profile is not None or not self._diag_is_env_error(fetch_diag):
+            self._agent_profile_cache[key] = (profile, now, fetch_diag)
+        self._speaker_profile_diag = self._db_diag_prefix(fetch_diag)
+        self._log_speaker_profile_diag(key, fetch_diag)
         return profile
 
-    def _fetch_agent_profile_from_db(self, agent_uuid: str) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _diag_is_env_error(diag: str) -> bool:
+        """True for the transient, environment-level miss reasons that should
+        not be cached (see :meth:`_load_agent_profile`)."""
+        return diag in ("no-agent-db-url", "no-sqlalchemy") or diag.startswith("db-error")
+
+    def _log_speaker_profile_diag(self, key: str, diag: str) -> None:
+        """Log a speaker-profile miss once per uuid per process.
+
+        A successful bind (``found(...)``) is already logged by the caller at
+        invocation; the value here is the *failure* reasons — especially
+        ``no-agent-db-url``, the classic "soul silently not applied" case that
+        used to be invisible. Once-per-uuid keeps a hot room from flooding
+        logs while still guaranteeing the reason appears.
+        """
+        if diag.startswith("found"):
+            return
+        log_key = f"{key}:{diag}"
+        if log_key in self._speaker_profile_diag_logged:
+            return
+        self._speaker_profile_diag_logged.add(log_key)
+        logger.warning(
+            "[%s] speaker per-user profile NOT applied for %s: %s "
+            "(falling back to base profile). This is why a user's saved "
+            "name/keyterms/soul may appear unchanged.",
+            self.name, key, diag,
+        )
+
+    def _fetch_agent_profile_from_db(
+        self, agent_uuid: str
+    ) -> tuple[Optional[Dict[str, Any]], str]:
         """Blocking SELECT for the profile row; run via ``to_thread``.
 
         Uses a raw SQL SELECT (``exec_driver_sql`` with the driver's native
@@ -897,14 +951,22 @@ class LiveKitAdapter(BasePlatformAdapter):
         surfaced as a swallowed ``profile-missing`` even though the plain
         SELECT works. The raw form matches the working room-uuid lookup and
         only needs ``SELECT`` on the ``agents`` table.
+
+        Returns ``(profile_or_None, diag)``: the profile, and a decisive
+        reason string for the caller's diagnostics — ``no-agent-db-url`` /
+        ``no-sqlalchemy`` / ``db-error(...)`` / ``row-missing`` /
+        ``row-inactive`` / a filled profile. SQL exceptions propagate to
+        :meth:`_load_agent_profile`, which maps them to ``db-error`` and does
+        not cache them; the diags returned here are for the non-exception
+        branches only.
         """
         database_url = os.getenv("MIRA_AGENT_DATABASE_URL", "").strip()
         if not database_url:
-            return None
+            return None, "no-agent-db-url"
         try:
             from sqlalchemy import create_engine
         except ImportError:
-            return None
+            return None, "no-sqlalchemy"
         engine = create_engine(database_url, pool_pre_ping=True, future=True)
         try:
             with engine.connect() as connection:
@@ -917,14 +979,18 @@ class LiveKitAdapter(BasePlatformAdapter):
         finally:
             engine.dispose()
         if result is None:
-            return None
+            return None, "row-missing"
         row = dict(result._mapping)
-        return {
+        profile = {
             "display_name": row.get("display_name") or "",
             "invocation_keyterms": self._parse_profile_keyterms(row.get("invocation_keyterms")),
             "system_prompt": row.get("system_prompt") or "",
             "is_active": bool(row.get("is_active")),
         }
+        # Row exists but is soft-disabled: the caller won't inject it. Say so
+        # explicitly so it isn't mistaken for "the soul is being applied."
+        diag = "row-inactive" if not profile["is_active"] else "found"
+        return profile, diag
 
     @staticmethod
     def _parse_profile_keyterms(value: Any) -> list[str]:
@@ -1621,6 +1687,11 @@ class LiveKitAdapter(BasePlatformAdapter):
         personal_profile = await asyncio.to_thread(
             self._load_agent_profile, speaker_agent_uuid
         )
+        # _load_agent_profile already recorded *why* the lookup succeeded or
+        # missed (env unset / db-error / row-missing / row-inactive). We only
+        # refine it here for the "row exists and active but injects nothing"
+        # case the load can't see without the empty-block rule below.
+        speaker_profile_diag = self._speaker_profile_diag
         personal_keyterm_patterns: tuple[tuple[str, re.Pattern[str]], ...] = ()
         if personal_profile and personal_profile.get("is_active"):
             personal_keyterms = [
@@ -1727,6 +1798,17 @@ class LiveKitAdapter(BasePlatformAdapter):
             if personal_profile and personal_profile.get("is_active")
             else ""
         )
+        if personal_identity:
+            # The block that actually got prepended is non-empty — the
+            # speaker's personal name/persona is what the model responds as.
+            self._speaker_profile_diag = "applied"
+        elif personal_profile and personal_profile.get("is_active"):
+            # Active row exists but has nothing to inject (no name and no
+            # persona). The user "saved" a profile that the adapter can't
+            # express — worth surfacing instead of silently using the base.
+            self._speaker_profile_diag = "applied-empty"
+        # Otherwise the load-time diag already names the reason (no-uuid /
+        # no-agent-db-url / db-error / row-missing / row-inactive).
         meeting_context = (
             personal_identity
             + "LiveKit meeting context: the current speaker is "
@@ -1777,6 +1859,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             "keyterms": list(self._effective_keyterms()),
             "last_keyterm": self._last_keyterm,
             "room_profile_bind": self._room_agent_diag,
+            "speaker_profile_bind": self._speaker_profile_diag,
             "updated_at": datetime.now(tz=timezone.utc).isoformat(),
         }
 
@@ -1806,6 +1889,9 @@ class LiveKitAdapter(BasePlatformAdapter):
                     # Debug aid: which step of the per-user room bind succeeded
                     # or failed, surfaced directly in the meeting UI.
                     "mira.agent.room_profile_bind": self._room_agent_diag,
+                    # Same, for the current speaker's own profile — why their
+                    # personal name/persona was or wasn't injected this turn.
+                    "mira.agent.speaker_profile_bind": self._speaker_profile_diag,
                 }
                 try:
                     await self._room.local_participant.set_attributes(attributes)

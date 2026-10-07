@@ -183,7 +183,7 @@ class AdapterTests(unittest.TestCase):
 
         def fake_fetch(agent_uuid):
             calls["n"] += 1
-            return {"display_name": "D", "invocation_keyterms": [], "system_prompt": "p", "is_active": True}
+            return ({"display_name": "D", "invocation_keyterms": [], "system_prompt": "p", "is_active": True}, "found")
 
         with patch.object(self.adapter, "_fetch_agent_profile_from_db", fake_fetch):
             first = self.adapter._load_agent_profile("11111111-1111-1111-1111-111111111111")
@@ -196,19 +196,29 @@ class AdapterTests(unittest.TestCase):
         with patch.object(self.adapter, "_fetch_agent_profile_from_db", lambda u: self.fail("no db hit for empty uuid")):
             self.assertIsNone(self.adapter._load_agent_profile(""))
             self.assertIsNone(self.adapter._load_agent_profile("   "))
+        # The decisive reason for this miss is "no uuid in the metadata",
+        # not a DB error — it must be recorded so the meeting UI shows it.
+        self.assertEqual(self.adapter._speaker_profile_diag, "no-uuid-in-metadata")
 
-    def test_load_agent_profile_db_error_degrades_to_none(self):
+    def test_load_agent_profile_db_error_degrades_to_none_and_is_not_cached(self):
         def boom(agent_uuid):
             raise RuntimeError("portal db unreachable")
 
+        calls = {"n": 0}
         with patch.object(self.adapter, "_fetch_agent_profile_from_db", boom):
+            # The exception is caught and mapped to a db-error diag.
             self.assertIsNone(self.adapter._load_agent_profile("22222222-2222-2222-2222-222222222222"))
-        # A failed lookup is cached as a miss so the same speaker isn't
-        # hammered again within the TTL window.
-        self.assertIn(
+            calls["n"] += 1
+            # A second call for the same speaker re-hits the DB: an env-caused
+            # miss (db-error) is deliberately NOT cached, so a just-fixed DB
+            # is picked up immediately instead of being masked for a TTL
+            # window.
+            self.assertIsNone(self.adapter._load_agent_profile("22222222-2222-2222-2222-222222222222"))
+        self.assertNotIn(
             "22222222-2222-2222-2222-222222222222",
             self.adapter._agent_profile_cache,
         )
+        self.assertIn("db-error", self.adapter._speaker_profile_diag)
 
     def test_fetch_agent_profile_uses_raw_sql_not_reflection(self):
         # Regression: table reflection (autoload_with) issues an extra schema
@@ -249,7 +259,7 @@ class AdapterTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"MIRA_AGENT_DATABASE_URL": "mysql+pymysql://u:p@h:3306/mira_agent_config"}), \
              patch("sqlalchemy.create_engine", return_value=FakeEngine()):
-            profile = self.adapter._fetch_agent_profile_from_db(
+            profile, diag = self.adapter._fetch_agent_profile_from_db(
                 "3ca50a82-2eb7-5c1c-bb4c-5b5b6bd932d5"
             )
 
@@ -261,6 +271,8 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(profile["invocation_keyterms"], ["John"])
         self.assertEqual(profile["system_prompt"], "you are John")
         self.assertTrue(profile["is_active"])
+        # Active row with content: the decisive reason is a plain find.
+        self.assertEqual(diag, "found")
 
     def test_fetch_agent_profile_no_row_returns_none(self):
         class FakeResult:
@@ -286,7 +298,12 @@ class AdapterTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"MIRA_AGENT_DATABASE_URL": "mysql+pymysql://u:p@h:3306/mira_agent_config"}), \
              patch("sqlalchemy.create_engine", return_value=FakeEngine()):
-            self.assertIsNone(self.adapter._fetch_agent_profile_from_db("no-such-uuid"))
+            profile, diag = self.adapter._fetch_agent_profile_from_db("no-such-uuid")
+
+        self.assertIsNone(profile)
+        # A clean SELECT that returns no row is a *genuine* miss (cached by
+        # the caller), and the reason is row-missing — not a db-error.
+        self.assertEqual(diag, "row-missing")
 
     def test_personal_identity_block_injects_name_and_persona(self):
         block = self.adapter._personal_identity_block({
