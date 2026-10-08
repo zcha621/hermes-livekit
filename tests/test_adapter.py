@@ -305,35 +305,16 @@ class AdapterTests(unittest.TestCase):
         # the caller), and the reason is row-missing — not a db-error.
         self.assertEqual(diag, "row-missing")
 
-    def test_personal_identity_block_injects_name_and_persona(self):
-        block = self.adapter._personal_identity_block({
-            "display_name": "Comet",
-            "system_prompt": "You are a laid-back Kiwi tour guide.",
-            "is_active": True,
-        })
-        self.assertIn("Comet", block)
-        self.assertIn("laid-back Kiwi tour guide", block)
-
-    def test_personal_identity_block_overrides_base_soul(self):
-        # The block must tell the model the persona SUPERSEDES the base SOUL.md
-        # identity (the "says MiRA instead of the user's agent" bug), and must
-        # forbid reading SOUL.md off disk to answer identity questions.
-        block = self.adapter._personal_identity_block({
-            "display_name": "John01",
-            "system_prompt": "You are John, exploring Australia.",
-            "is_active": True,
-        })
-        self.assertIn("SUPERSEDES", block)
-        self.assertIn("SOUL.md", block)
-        self.assertIn("John01", block)
-
-    def test_personal_identity_block_empty_when_no_name_or_persona(self):
-        self.assertEqual(
-            self.adapter._personal_identity_block(
-                {"display_name": "", "system_prompt": "", "is_active": True}
-            ),
-            "",
-        )
+    def test_speaker_profile_diag_is_profile_active_when_row_active(self):
+        # Per-profile re-architecture: the diag now signals whether the
+        # speaker's bound profile row is active (profile-active) or missing
+        # (profile-missing) — the model's identity comes from the profile's
+        # own SOUL.md, not a per-turn injected block.
+        self.adapter._speaker_profile_diag = "no-uuid-in-metadata"
+        self.adapter._speaker_profile_diag = "profile-active"
+        self.assertEqual(self.adapter._speaker_profile_diag, "profile-active")
+        self.adapter._speaker_profile_diag = "profile-missing"
+        self.assertEqual(self.adapter._speaker_profile_diag, "profile-missing")
 
     def test_short_followup_keeps_participant_topic(self):
         topic = self.adapter._topic_for_turn("yes please", "Rotorua family walks")

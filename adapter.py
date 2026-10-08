@@ -1020,50 +1020,6 @@ class LiveKitAdapter(BasePlatformAdapter):
                 seen.append(cleaned)
         return seen
 
-    def _personal_identity_block(self, profile: Dict[str, Any]) -> str:
-        """Build the per-turn identity block for a personal profile.
-
-        Returns an empty string when the profile has nothing to inject (no
-        name and no persona), so callers can append unconditionally.
-
-        The block is written to *override* the shared base SOUL.md, which Hermes
-        auto-injects into the system prompt. Without explicit override language
-        the model anchors on the base identity (e.g. "MiRA") when asked who it
-        is — and, because the livekit toolset includes ``terminal``/``file``
-        tools, it may even read ``SOUL.md`` off disk and recite the base file.
-        The wording here tells the model the persona below IS its identity for
-        this turn, that it supersedes any base/persona instructions elsewhere,
-        and that it must answer identity questions only from this text (never by
-        opening a file).
-        """
-        name = str(profile.get("display_name") or "").strip()
-        persona = str(profile.get("system_prompt") or "").strip()
-        if not name and not persona:
-            return ""
-        parts = [
-            "PERSONAL IDENTITY OVERRIDE for this turn — read carefully:",
-            "This speaker has a personal agent profile. For THIS conversation "
-            "your identity, name, and persona are exactly the profile below. "
-            "It SUPERSEDES any base identity, default persona, or SOUL.md "
-            "instructions that appear elsewhere in your context (e.g. a generic "
-            "'MiRA' or platform-wide system persona). Do not blend them; when "
-            "they conflict, the profile below wins.",
-        ]
-        if name:
-            parts.append(f"- Your name for this conversation: {name}")
-        if persona:
-            parts.append("- Your persona / identity (the speaker's authored self):")
-            parts.append("  " + persona.replace("\n", "\n  "))
-        parts.append(
-            "If the speaker asks who you are, what your soul/identity/persona "
-            "is, or to report your configuration, answer ONLY from the profile "
-            "above (and your name). Do not read, cat, grep, or open any file "
-            "such as SOUL.md to find your identity — your identity for this "
-            "turn is exactly the text in this block, and it may differ from the "
-            "base configuration on disk."
-        )
-        return "\n".join(parts) + "\n"
-
     def _effective_agent_name(self) -> str:
         """Display name for this room's agent: the room-bound per-user profile
         when present, else the configured/global base name."""
@@ -1699,11 +1655,20 @@ class LiveKitAdapter(BasePlatformAdapter):
         identity = str(getattr(event.source, "user_id", "") or "client")
         display_name = self._participant_display_name(identity)
         original_text = str(event.text or "").strip()
-        # Single-gateway per-user binding: resolve the speaker's own profile
-        # row (by the mira_agent_uuid the portal signed into their metadata).
-        # Its wake terms extend the global gate and its persona is prompt-
-        # injected below. A miss (None) degrades to the base profile — the
-        # turn is never dropped over an identity lookup.
+        # Per-profile re-architecture: resolve the speaker's own profile row
+        # (by the mira_agent_uuid the portal signed into their metadata). Its
+        # wake terms extend the global gate and its display name is used for
+        # the status bar. A miss (None) degrades to the base profile's keyterms
+        # and name — the turn is never dropped over an identity lookup.
+        #
+        # D8 invariant — owner-only USER.md: the profile's ``memories/USER.md``
+        # belongs to the *owner* of the agent. Friends who join the owner's
+        # room talk to the owner's agent, but they must not overwrite the
+        # owner's USER.md. This is enforced structurally: only the owner's own
+        # room binds this profile (the reconciler starts the per-profile
+        # gateway only for the owner's ``hermes_active_room``), so a friend's
+        # turns never reach this profile's memory tool. The adapter itself
+        # never writes memories — it only reads the row for gating/display.
         speaker_agent_uuid = self._participant_connection_metadata(identity).get(
             "mira_agent_uuid", ""
         )
@@ -1711,9 +1676,9 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._load_agent_profile, speaker_agent_uuid
         )
         # _load_agent_profile already recorded *why* the lookup succeeded or
-        # missed (env unset / db-error / row-missing / row-inactive). We only
-        # refine it here for the "row exists and active but injects nothing"
-        # case the load can't see without the empty-block rule below.
+        # missed (env unset / db-error / row-missing / row-inactive) in
+        # _room_agent_diag; the per-turn profile-active/profile-missing diag is
+        # set further down when the meeting context is assembled.
         speaker_profile_diag = self._speaker_profile_diag
         personal_keyterm_patterns: tuple[tuple[str, re.Pattern[str]], ...] = ()
         if personal_profile and personal_profile.get("is_active"):
@@ -1812,29 +1777,23 @@ class LiveKitAdapter(BasePlatformAdapter):
             f"{self._participant_display_name(person)}: {topic}"
             for person, topic in self._participant_topics.items()
         )
-        # Prepend the speaker's personal identity block (their own agent name
-        # + persona) so the single shared model responds *as* this user's
-        # agent this turn. Empty string when they have no personal profile,
-        # in which case meeting_context is exactly what it was before.
-        personal_identity = (
-            self._personal_identity_block(personal_profile)
-            if personal_profile and personal_profile.get("is_active")
-            else ""
-        )
-        if personal_identity:
-            # The block that actually got prepended is non-empty — the
-            # speaker's personal name/persona is what the model responds as.
-            self._speaker_profile_diag = "applied"
-        elif personal_profile and personal_profile.get("is_active"):
-            # Active row exists but has nothing to inject (no name and no
-            # persona). The user "saved" a profile that the adapter can't
-            # express — worth surfacing instead of silently using the base.
-            self._speaker_profile_diag = "applied-empty"
-        # Otherwise the load-time diag already names the reason (no-uuid /
-        # no-agent-db-url / db-error / row-missing / row-inactive).
+        # Per-profile re-architecture: this room's agent *is* a Hermes profile
+        # (its own SOUL.md, memories/USER.md, state.db) running in its own
+        # gateway process. The adapter no longer injects a per-turn identity
+        # block — the model's identity comes from the profile it was launched
+        # as. ``personal_profile`` is still loaded for wake-gating (keyterms)
+        # and the display name, and is surfaced via the diag below so the
+        # meeting status bar can show whether the bound profile row is active.
+        if personal_profile and personal_profile.get("is_active"):
+            self._speaker_profile_diag = "profile-active"
+        else:
+            self._speaker_profile_diag = "profile-missing"
+        # The load-time diag (_room_agent_diag) names *why* the row was or was
+        # not bound (no-uuid / no-agent-db-url / db-error / row-missing /
+        # row-inactive); this diag is the per-turn "is this speaker's profile
+        # live right now" signal.
         meeting_context = (
-            personal_identity
-            + "LiveKit meeting context: the current speaker is "
+            "LiveKit meeting context: the current speaker is "
             + f"{display_name} (identity {identity}). "
             "Address the correct speaker and distinguish participants. "
             + f"Latest participant topics/requests: {ledger}."

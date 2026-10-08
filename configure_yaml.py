@@ -47,13 +47,11 @@ REMOTE_TOOL_OWNER_PREFIXES = [
     # compatibility prefix.
     "simulated-agent-",
 ]
-# Tools deliberately kept off the LiveKit voice surface. A live conversation
-# has no keyboard, and the ``terminal``/``file`` tools let the agent read
-# ``SOUL.md`` off disk and recite the *base* MiRA identity instead of the
-# speaker's per-turn personal profile (the "reports MiRA instead of John01"
-# bug). They stay available on the CLI/Discord surfaces where file/shell work
-# is a normal part of the task.
-LIVEKIT_EXCLUDED_TOOLSETS = ("file", "terminal")
+# The LiveKit voice surface keeps the full conversation toolset. (The old
+# file/terminal strip — a workaround for the base-SOUL recitation bug — is
+# retired by the per-profile re-architecture: each profile's own ``SOUL.md``
+# *is* its identity, so blocking file/terminal to hide the base soul is no
+# longer needed.)
 MCP_SERVER_NAME = "hermes-mira-context"
 MCP_SERVER_REQUIRED_ENV_VARS = (
     "MIRA_DATABASE_URL",
@@ -253,13 +251,10 @@ def update_config(
         # Persist any resolver-added GUI toolsets so parity is explicit and
         # stable across future Hermes versions and setup reruns.
         platform_toolsets["cli"] = list(conversation_toolsets)
-    # The LiveKit voice surface drops file/terminal (see LIVEKIT_EXCLUDED_
-    # TOOLSETS) while every other conversation surface keeps the full set.
-    platform_toolsets["livekit"] = [
-        name
-        for name in conversation_toolsets
-        if name not in LIVEKIT_EXCLUDED_TOOLSETS
-    ]
+    # Every conversation surface — including the LiveKit voice surface — keeps
+    # the full toolset. See the LIVEKIT_EXCLUDED_TOOLSETS note above for why
+    # the voice surface no longer drops file/terminal.
+    platform_toolsets["livekit"] = list(conversation_toolsets)
     discord_configured = isinstance(platform_toolsets.get("discord"), list)
     raw_discord = platforms.get("discord")
     if isinstance(raw_discord, dict) and raw_discord.get("enabled") is True:
