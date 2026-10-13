@@ -4314,56 +4314,60 @@ class LiveKitAdapter(BasePlatformAdapter):
                 # The room may have been torn down while the LLM reply was
                 # being synthesized (the presence watch leaves when the last
                 # participant goes away). Rejoin so this in-flight playback
-                # still lands on an open audio track.
-                await self._ensure_connected_for_playback()
-                if not self._room or not self._audio_source:
-                    return SendResult(
-                        success=False,
-                        error="Not connected to room at playback time",
-                    )
-
-                spoken_text = str(caption or self._prepared_tts_text or "").strip()
-                if spoken_text:
-                    kind = (
-                        "acknowledgement"
-                        if (metadata or {}).get("tool_acknowledgement")
-                        else "speech"
-                    )
-                    await self._record_agent_transcript(spoken_text, kind=kind)
-                    if not (metadata or {}).get("non_conversational"):
-                        self._last_spoken_source = self._prepared_tts_source
-                self._prepared_tts_source = ""
-                self._prepared_tts_text = ""
-
-                samples_per_frame = SAMPLE_RATE // 50  # 20ms frames
-                bytes_per_frame = samples_per_frame * NUM_CHANNELS * 2
-                speaking_generation = await self._set_agent_state("speaking", force=True)
-                await self._publish_agent_event("agent:speaking-start")
-
-                offset = 0
-                while offset < len(pcm_data):
-                    if self._playback_interrupt.is_set():
-                        try:
-                            self._audio_source.clear_queue()
-                        except Exception:
-                            pass
-                        await self._publish_agent_event(
-                            "agent:speech-interrupted", {"reason": "user-barge-in"}
+                # still lands on an open audio track. The rejoin happens
+                # under the room-transition lock so the presence loop cannot
+                # tear down the room again mid-playback, which used to leave
+                # _audio_source None under the frame-push loop.
+                async with self._room_transition_lock:
+                    await self._ensure_connected_for_playback()
+                    if not self._room or not self._audio_source:
+                        return SendResult(
+                            success=False,
+                            error="Not connected to room at playback time",
                         )
-                        break
-                    chunk = pcm_data[offset:offset + bytes_per_frame]
-                    if len(chunk) < bytes_per_frame:
-                        chunk += b"\x00" * (bytes_per_frame - len(chunk))
-                    frame = rtc.AudioFrame(
-                        data=chunk,
-                        sample_rate=SAMPLE_RATE,
-                        num_channels=NUM_CHANNELS,
-                        samples_per_channel=samples_per_frame,
-                    )
-                    await self._audio_source.capture_frame(frame)
-                    offset += bytes_per_frame
 
-                return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+                    spoken_text = str(caption or self._prepared_tts_text or "").strip()
+                    if spoken_text:
+                        kind = (
+                            "acknowledgement"
+                            if (metadata or {}).get("tool_acknowledgement")
+                            else "speech"
+                        )
+                        await self._record_agent_transcript(spoken_text, kind=kind)
+                        if not (metadata or {}).get("non_conversational"):
+                            self._last_spoken_source = self._prepared_tts_source
+                    self._prepared_tts_source = ""
+                    self._prepared_tts_text = ""
+
+                    samples_per_frame = SAMPLE_RATE // 50  # 20ms frames
+                    bytes_per_frame = samples_per_frame * NUM_CHANNELS * 2
+                    speaking_generation = await self._set_agent_state("speaking", force=True)
+                    await self._publish_agent_event("agent:speaking-start")
+
+                    offset = 0
+                    while offset < len(pcm_data):
+                        if self._playback_interrupt.is_set():
+                            try:
+                                self._audio_source.clear_queue()
+                            except Exception:
+                                pass
+                            await self._publish_agent_event(
+                                "agent:speech-interrupted", {"reason": "user-barge-in"}
+                            )
+                            break
+                        chunk = pcm_data[offset:offset + bytes_per_frame]
+                        if len(chunk) < bytes_per_frame:
+                            chunk += b"\x00" * (bytes_per_frame - len(chunk))
+                        frame = rtc.AudioFrame(
+                            data=chunk,
+                            sample_rate=SAMPLE_RATE,
+                            num_channels=NUM_CHANNELS,
+                            samples_per_channel=samples_per_frame,
+                        )
+                        await self._audio_source.capture_frame(frame)
+                        offset += bytes_per_frame
+
+                    return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
             except Exception as e:
                 logger.error("[%s] TTS playback error: %s", self.name, e)
                 return SendResult(success=False, error=str(e))
