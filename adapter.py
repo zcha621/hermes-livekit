@@ -4166,6 +4166,12 @@ class LiveKitAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send text via data channel (best-effort for connected web clients)."""
+        # Re-check the room connection here, not only at the top: between the
+        # caller's last touch and this send the room can be torn down (the
+        # presence watch drops the connection when the last participant leaves),
+        # and the audio track is unpublished in that same teardown. Returning
+        # here — before the transcript fallback below — is what lets the
+        # gateway's delivery ledger retry the response into the next room.
         if not self._room:
             return SendResult(success=False, error="Not connected to room")
 
@@ -4231,6 +4237,17 @@ class LiveKitAdapter(BasePlatformAdapter):
                 )
                 if not pcm_data:
                     return SendResult(success=False, error="Failed to decode audio")
+
+                # The room may have been torn down while the LLM reply was
+                # being synthesized (the presence watch leaves when the last
+                # participant goes away). Rejoin so this in-flight playback
+                # still lands on an open audio track.
+                await self._ensure_connected_for_playback()
+                if not self._room or not self._audio_source:
+                    return SendResult(
+                        success=False,
+                        error="Not connected to room at playback time",
+                    )
 
                 spoken_text = str(caption or self._prepared_tts_text or "").strip()
                 if spoken_text:
@@ -4309,6 +4326,28 @@ class LiveKitAdapter(BasePlatformAdapter):
             metadata=metadata,
             caption=caption,
         )
+
+    async def _ensure_connected_for_playback(self) -> None:
+        """Join the room if the teardown-then-rejoin race left us out.
+
+        Auto-TTS can win the race: synthesis takes seconds, and while it runs
+        the presence watch can drop the connection (last participant left —
+        e.g. the user opened a second client or briefly left). Playback would
+        then run against a room we already left (empty queue, or no track at
+        all), and the user hears nothing even though the LLM reply is ready.
+        Joining back here means ``play_tts`` still reaches an open audio
+        track; if nobody is in the room the join itself is a no-op that
+        returns immediately.
+        """
+        if self._room is not None:
+            return
+        if not self._running:
+            return
+        if await self._join_room():
+            logger.info(
+                "[%s] Rejoined '%s' for in-flight TTS playback",
+                self.name, self._room_name,
+            )
 
     @staticmethod
     def _decode_audio_to_pcm(audio_path: str) -> Optional[bytes]:

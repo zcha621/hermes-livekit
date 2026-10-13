@@ -843,6 +843,9 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.adapter._audio_source = SimpleNamespace(
             capture_frame=AsyncMock(), clear_queue=lambda: None
         )
+        # play_tts re-checks the running flag before a mid-playback rejoin;
+        # the fixture room is synthetic, so mark the adapter as connected.
+        self.adapter._running = True
         response = "The earlier group discussion points to Waimangu."
         self.adapter._activate_invoked_turn("MiRA")
         self.assertEqual(self.adapter.prepare_tts_text(response), response)
