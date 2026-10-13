@@ -1657,6 +1657,113 @@ class _FakeEngine:
         pass
 
 
+class PersonalIdentityBlockTests(unittest.IsolatedAsyncioTestCase):
+    """Per-turn identity injection for the single default-scoped gateway."""
+
+    def _adapter(self):
+        adapter = make_adapter()
+        adapter._room_name = "test-room"
+        adapter._room = SimpleNamespace(
+            remote_participants={},
+            local_participant=SimpleNamespace(set_attributes=AsyncMock()),
+        )
+        return adapter
+
+    def test_personal_identity_block_injects_name_and_persona(self):
+        adapter = self._adapter()
+        block = adapter._personal_identity_block(
+            {"display_name": "John", "system_prompt": "You are John, a Rotorua guide."}
+        )
+        self.assertIn("John", block)
+        self.assertIn("You are John, a Rotorua guide.", block)
+        self.assertIn("SUPERSEDES", block)
+        self.assertIn("PERSONAL IDENTITY OVERRIDE", block)
+
+    def test_personal_identity_block_overrides_base_soul(self):
+        adapter = self._adapter()
+        block = adapter._personal_identity_block(
+            {"display_name": "John", "system_prompt": ""}
+        )
+        # The wording must make the injected name win over a base "MiRA"
+        # identity the model might otherwise anchor on.
+        self.assertIn("SUPERSEDES", block)
+        self.assertIn("MiRA", block)
+        self.assertIn("SOUL.md", block)
+
+    def test_personal_identity_block_empty_when_no_name_or_persona(self):
+        adapter = self._adapter()
+        self.assertEqual(
+            adapter._personal_identity_block({"display_name": "", "system_prompt": ""}),
+            "",
+        )
+        self.assertEqual(adapter._personal_identity_block({}), "")
+
+    async def test_prepended_identity_block_applied_diag(self):
+        """When the speaker's row is active with name+persona, the block is
+        prepended to the turn's meeting context and the diag says applied."""
+        adapter = self._adapter()
+        profile = {
+            "display_name": "John",
+            "invocation_keyterms": ("John",),
+            "system_prompt": "You are John, a Rotorua guide.",
+            "is_active": True,
+        }
+        event = livekit_adapter.MessageEvent(
+            text="John, hello",
+            message_type=livekit_adapter.MessageType.TEXT,
+            source=SimpleNamespace(user_id="speaker-1", user_name=None, chat_type="group"),
+        )
+        with (
+            patch.object(
+                adapter, "_participant_connection_metadata",
+                return_value={"mira_agent_uuid": "u-1", "can_bring_agent": "true"},
+            ),
+            patch.object(adapter, "_load_agent_profile", return_value=profile),
+            patch.object(adapter, "_participant_display_name", return_value="Zhuang"),
+            patch.object(adapter, "_match_keyterm", return_value=("John", "hello")),
+            patch.object(adapter, "_append_transcript", return_value=None),
+            patch.object(adapter, "_publish_transcript_entry", AsyncMock()),
+            patch.object(adapter, "_publish_agent_event", AsyncMock()),
+            patch.object(adapter, "_set_agent_state", AsyncMock(return_value=1)),
+            patch.object(adapter, "_fetch_room_transcript", return_value=()),
+            patch.object(adapter, "_merge_db_transcript_into_context", return_value=""),
+            patch.object(adapter, "_mcp_identifier_context", return_value=""),
+        ):
+            ok = await adapter._prepare_invoked_event(event)
+        self.assertTrue(ok)
+        self.assertEqual(adapter._speaker_profile_diag, "applied")
+        self.assertIn("PERSONAL IDENTITY OVERRIDE", event.channel_prompt or "")
+        self.assertIn("Your name for this conversation: John", event.channel_prompt or "")
+
+    async def test_no_identity_block_when_row_missing(self):
+        """Miss (no personal row) → no block, meeting context unchanged shape."""
+        adapter = self._adapter()
+        event = livekit_adapter.MessageEvent(
+            text="John, hello",
+            message_type=livekit_adapter.MessageType.TEXT,
+            source=SimpleNamespace(user_id="speaker-1", user_name=None, chat_type="group"),
+        )
+        with (
+            patch.object(
+                adapter, "_participant_connection_metadata",
+                return_value={"mira_agent_uuid": "", "can_bring_agent": "true"},
+            ),
+            patch.object(adapter, "_load_agent_profile", return_value=None),
+            patch.object(adapter, "_participant_display_name", return_value="Zhuang"),
+            patch.object(adapter, "_match_keyterm", return_value=("John", "hello")),
+            patch.object(adapter, "_append_transcript", return_value=None),
+            patch.object(adapter, "_publish_transcript_entry", AsyncMock()),
+            patch.object(adapter, "_publish_agent_event", AsyncMock()),
+            patch.object(adapter, "_set_agent_state", AsyncMock(return_value=1)),
+            patch.object(adapter, "_fetch_room_transcript", return_value=()),
+            patch.object(adapter, "_merge_db_transcript_into_context", return_value=""),
+            patch.object(adapter, "_mcp_identifier_context", return_value=""),
+        ):
+            ok = await adapter._prepare_invoked_event(event)
+        self.assertTrue(ok)
+        self.assertNotIn("PERSONAL IDENTITY OVERRIDE", event.channel_prompt or "")
+
+
 class RoomProfileSlugTests(unittest.IsolatedAsyncioTestCase):
     """Tests for reading hermes_profile_slug and stamping event.source.profile."""
 
