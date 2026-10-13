@@ -132,15 +132,15 @@ class ConfigureYamlTests(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
-    def test_update_keeps_full_toolset_on_livekit(self):
-        # The per-profile re-architecture removed the old file/terminal strip
-        # (a workaround for the base-SOUL recitation bug). Each profile's own
-        # SOUL.md is now its identity, so the LiveKit voice surface keeps the
-        # full conversation toolset — file/terminal included — exactly like
-        # cli and discord.
+    def test_update_excludes_file_and_terminal_from_livekit_only(self):
+        # The single shared gateway answers every room from the default
+        # profile scope, so the meeting model's persona is prompt-injected
+        # per turn. file/terminal tools invite it to read SOUL.md off disk
+        # and recite the base identity instead — hence the voice surface
+        # strips them while cli and discord keep the full toolset.
         workspace_temp = Path(__file__).resolve().parents[3] / ".tmp"
         workspace_temp.mkdir(exist_ok=True)
-        path = workspace_temp / "hermes-livekit-livekit-full-toolset.yaml"
+        path = workspace_temp / "hermes-livekit-livekit-toolstrip.yaml"
         try:
             path.write_text(
                 yaml.safe_dump(
@@ -158,11 +158,12 @@ class ConfigureYamlTests(unittest.TestCase):
             update_config(path)
 
             config = yaml.safe_load(path.read_text(encoding="utf-8"))
-            for surface in ("cli", "discord", "livekit"):
+            for surface in ("cli", "discord"):
                 self.assertIn("file", config["platform_toolsets"][surface])
                 self.assertIn("terminal", config["platform_toolsets"][surface])
             livekit = config["platform_toolsets"]["livekit"]
-            # The full conversation toolset is retained on livekit.
+            self.assertNotIn("file", livekit)
+            self.assertNotIn("terminal", livekit)
             self.assertIn("browser", livekit)
             self.assertIn("web", livekit)
             self.assertIn("hermes-livekit", livekit)

@@ -33,6 +33,11 @@ DEFAULT_HERMES_CONVERSATION_TOOLSETS = [
     "vision",
     "web",
 ]
+# Toolsets removed from the LiveKit voice surface only. The meeting model's
+# per-turn persona is prompt-injected (adapter._personal_identity_block);
+# with file/terminal available it tends to open SOUL.md off disk and answer
+# identity questions from the base profile instead of the injected block.
+LIVEKIT_EXCLUDED_TOOLSETS = ("file", "terminal")
 # No tool names are host-managed by default any more — MiRA's itinerary,
 # location, and meeting-transcript context is served by the
 # hermes-mira-context MCP server (see MCP_SERVER_NAME below) instead of
@@ -251,10 +256,17 @@ def update_config(
         # Persist any resolver-added GUI toolsets so parity is explicit and
         # stable across future Hermes versions and setup reruns.
         platform_toolsets["cli"] = list(conversation_toolsets)
-    # Every conversation surface — including the LiveKit voice surface — keeps
-    # the full toolset. See the LIVEKIT_EXCLUDED_TOOLSETS note above for why
-    # the voice surface no longer drops file/terminal.
-    platform_toolsets["livekit"] = list(conversation_toolsets)
+    # The LiveKit voice surface drops ``file``/``terminal`` from the
+    # conversation toolset: the meeting model reads its per-turn persona from
+    # the injected identity block (see _personal_identity_block in
+    # adapter.py), and file/terminal tools invite it to instead open
+    # SOUL.md off disk and recite the base identity. Every other conversation
+    # surface keeps the full toolset.
+    platform_toolsets["livekit"] = [
+        name
+        for name in conversation_toolsets
+        if name not in LIVEKIT_EXCLUDED_TOOLSETS
+    ]
     discord_configured = isinstance(platform_toolsets.get("discord"), list)
     raw_discord = platforms.get("discord")
     if isinstance(raw_discord, dict) and raw_discord.get("enabled") is True:

@@ -450,9 +450,11 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._room_agent_display_name: str = ""
         self._room_agent_keyterms: tuple[str, ...] = ()
         # Hermes profile slug (e.g. "zhuang-john") for the room's agent.
-        # Stamped onto event.source.profile so the multiplexer scopes the
-        # turn to the agent's own profile home (SOUL.md, skills, memories).
-        # Empty when the room has no agent or the slug hasn't been synced yet.
+        # Stamped onto event.source.profile: the Hermes multiplexer re-scopes
+        # SOUL.md/skills/memories per turn when it honours that field (newer
+        # gateway builds); on builds that don't, the stamp is inert and the
+        # per-turn identity block below carries the persona instead. Empty
+        # when the room has no agent or the slug hasn't been synced yet.
         self._room_agent_profile_slug: str = ""
         # Diagnostic for the room-profile bind: a short reason string (e.g.
         # "ok", "no-agent-id", "db:agent_id-123-no-row") published into the
@@ -1026,6 +1028,50 @@ class LiveKitAdapter(BasePlatformAdapter):
             if cleaned and cleaned not in seen:
                 seen.append(cleaned)
         return seen
+
+    def _personal_identity_block(self, profile: Dict[str, Any]) -> str:
+        """Build the per-turn identity block for a personal profile.
+
+        Returns an empty string when the profile has nothing to inject (no
+        name and no persona), so callers can append unconditionally.
+
+        The block is written to *override* the shared base SOUL.md, which Hermes
+        auto-injects into the system prompt. Without explicit override language
+        the model anchors on the base identity (e.g. "MiRA") when asked who it
+        is — and, because the livekit toolset includes ``terminal``/``file``
+        tools, it may even read ``SOUL.md`` off disk and recite the base file.
+        The wording here tells the model the persona below IS its identity for
+        this turn, that it supersedes any base/persona instructions elsewhere,
+        and that it must answer identity questions only from this text (never by
+        opening a file).
+        """
+        name = str(profile.get("display_name") or "").strip()
+        persona = str(profile.get("system_prompt") or "").strip()
+        if not name and not persona:
+            return ""
+        parts = [
+            "PERSONAL IDENTITY OVERRIDE for this turn — read carefully:",
+            "This speaker has a personal agent profile. For THIS conversation "
+            "your identity, name, and persona are exactly the profile below. "
+            "It SUPERSEDES any base identity, default persona, or SOUL.md "
+            "instructions that appear elsewhere in your context (e.g. a generic "
+            "'MiRA' or platform-wide system persona). Do not blend them; when "
+            "they conflict, the profile below wins.",
+        ]
+        if name:
+            parts.append(f"- Your name for this conversation: {name}")
+        if persona:
+            parts.append("- Your persona / identity (the speaker's authored self):")
+            parts.append("  " + persona.replace("\n", "\n  "))
+        parts.append(
+            "If the speaker asks who you are, what your soul/identity/persona "
+            "is, or to report your configuration, answer ONLY from the profile "
+            "above (and your name). Do not read, cat, grep, or open any file "
+            "such as SOUL.md to find your identity — your identity for this "
+            "turn is exactly the text in this block, and it may differ from the "
+            "base configuration on disk."
+        )
+        return "\n".join(parts) + "\n"
 
     def _effective_agent_name(self) -> str:
         """Display name for this room's agent: the room-bound per-user profile
@@ -1740,7 +1786,14 @@ class LiveKitAdapter(BasePlatformAdapter):
             # transcription publication through explicit event metadata.
             publish_standard=(
                 event.message_type == MessageType.VOICE
-                or bool((event.metadata or {}).get("livekit_spoken_transcript"))
+                # getattr, not attribute access: the installed gateway's
+                # MessageEvent has no ``metadata`` field (older builds); the
+                # spoken-transcript flag is only ever present on newer ones.
+                or bool(
+                    getattr(event, "metadata", None)
+                    and getattr(event, "metadata", {})
+                    .get("livekit_spoken_transcript")
+                )
             ),
         )
 
@@ -1790,23 +1843,34 @@ class LiveKitAdapter(BasePlatformAdapter):
             f"{self._participant_display_name(person)}: {topic}"
             for person, topic in self._participant_topics.items()
         )
-        # Per-profile re-architecture: this room's agent *is* a Hermes profile
-        # (its own SOUL.md, memories/USER.md, state.db) running in its own
-        # gateway process. The adapter no longer injects a per-turn identity
-        # block — the model's identity comes from the profile it was launched
-        # as. ``personal_profile`` is still loaded for wake-gating (keyterms)
-        # and the display name, and is surfaced via the diag below so the
-        # meeting status bar can show whether the bound profile row is active.
-        if personal_profile and personal_profile.get("is_active"):
-            self._speaker_profile_diag = "profile-active"
-        else:
-            self._speaker_profile_diag = "profile-missing"
-        # The load-time diag (_room_agent_diag) names *why* the row was or was
-        # not bound (no-uuid / no-agent-db-url / db-error / row-missing /
-        # row-inactive); this diag is the per-turn "is this speaker's profile
-        # live right now" signal.
+        # Prepend the speaker's personal identity block (their own agent name
+        # + persona) so the single shared model responds *as* this user's
+        # agent this turn. The gateway serves one default-profile scope for
+        # every room (the Hermes multiplexer in the installed version does not
+        # re-scope SOUL.md per turn), so this prompt-level override is what
+        # actually makes the model answer as John rather than base MiRA.
+        # ``personal_profile`` is still loaded for wake-gating (keyterms) and
+        # the display name. Empty string when they have no personal profile,
+        # in which case meeting_context is exactly what it was before.
+        personal_identity = (
+            self._personal_identity_block(personal_profile)
+            if personal_profile and personal_profile.get("is_active")
+            else ""
+        )
+        if personal_identity:
+            # The block that actually got prepended is non-empty — the
+            # speaker's personal name/persona is what the model responds as.
+            self._speaker_profile_diag = "applied"
+        elif personal_profile and personal_profile.get("is_active"):
+            # Active row exists but has nothing to inject (no name and no
+            # persona). The user "saved" a profile that the adapter can't
+            # express — worth surfacing instead of silently using the base.
+            self._speaker_profile_diag = "applied-empty"
+        # Otherwise the load-time diag already names the reason (no-uuid /
+        # no-agent-db-url / db-error / row-missing / row-inactive).
         meeting_context = (
-            "LiveKit meeting context: the current speaker is "
+            personal_identity
+            + "LiveKit meeting context: the current speaker is "
             + f"{display_name} (identity {identity}). "
             "Address the correct speaker and distinguish participants. "
             + f"Latest participant topics/requests: {ledger}."
@@ -3208,7 +3272,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         if self._auto_vision and self._should_attach_video(transcript):
             self._queue_video_for_text(transcript, identity)
         media_urls, media_types = self._drain_pending_captures()
-        return MessageEvent(
+        event = MessageEvent(
             text=transcript,
             message_type=MessageType.TEXT,
             source=self.build_source(
@@ -3221,12 +3285,21 @@ class LiveKitAdapter(BasePlatformAdapter):
             message_id=message_id or uuid.uuid4().hex[:12],
             media_urls=media_urls,
             media_types=media_types,
-            metadata={
-                "livekit_spoken_transcript": True,
-                "media_already_transcribed": True,
-            },
             timestamp=datetime.now(tz=timezone.utc),
         )
+        # Newer gateways accept a ``metadata`` kwarg on MessageEvent and use
+        # it for spoken-transcript publication; older ones (the installed
+        # 0.16.0) do not have the field. Set it post-construction so the
+        # adapter runs on both: on old builds the attribute simply sits
+        # unused (reads use getattr with a default).
+        try:
+            event.metadata = {
+                "livekit_spoken_transcript": True,
+                "media_already_transcribed": True,
+            }
+        except (AttributeError, TypeError):
+            pass
+        return event
 
     # -- Inbound data channel + frame capture -------------------------------
 
