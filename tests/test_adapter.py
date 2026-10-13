@@ -1657,6 +1657,132 @@ class _FakeEngine:
         pass
 
 
+class RoomProfileSlugTests(unittest.IsolatedAsyncioTestCase):
+    """Tests for reading hermes_profile_slug and stamping event.source.profile."""
+
+    def _adapter(self):
+        adapter = make_adapter()
+        adapter._room_name = "test-room"
+        return adapter
+
+    def _fake_engine_for(self, row):
+        import sqlalchemy
+        return patch.object(
+            sqlalchemy, "create_engine", side_effect=lambda url, **kw: _FakeEngine(row)
+        )
+
+    def test_fetch_room_agent_profile_returns_slug_in_dict_fallback(self):
+        adapter = self._adapter()
+        row = SimpleNamespace(_mapping={
+            "agent_uuid": None, "display_name": "John", "agent_name": "john",
+            "invocation_keyterms": '["John"]', "hermes_profile_slug": "zhuang-john",
+        })
+        with patch.dict("os.environ", {"MIRA_AGENT_DATABASE_URL": "mysql+pymysql://u:p@host/mira_agent_config"}):
+            with self._fake_engine_for(row):
+                result = adapter._fetch_room_agent_profile(21)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["hermes_profile_slug"], "zhuang-john")
+
+    def test_fetch_room_agent_profile_slug_is_none_when_column_missing(self):
+        """Pre-migration rows: hermes_profile_slug key absent → None, no crash."""
+        adapter = self._adapter()
+        row = SimpleNamespace(_mapping={
+            "agent_uuid": None, "display_name": "John", "agent_name": "john",
+            "invocation_keyterms": '["John"]',
+        })
+        with patch.dict("os.environ", {"MIRA_AGENT_DATABASE_URL": "mysql+pymysql://u:p@host/mira_agent_config"}):
+            with self._fake_engine_for(row):
+                result = adapter._fetch_room_agent_profile(21)
+        self.assertIsInstance(result, dict)
+        self.assertIsNone(result.get("hermes_profile_slug"))
+
+    async def test_refresh_stores_slug_into_room_agent_profile_slug(self):
+        """_refresh_room_agent_profile stores the slug from the agent profile row."""
+        adapter = self._adapter()
+        profile = {
+            "display_name": "John",
+            "invocation_keyterms": ("John",),
+            "system_prompt": "You are John.",
+            "is_active": True,
+            "hermes_profile_slug": "zhuang-john",
+        }
+        with (
+            patch.object(adapter, "_load_room_agent_profile", return_value="abc-123"),
+            patch.object(adapter, "_load_agent_profile", return_value=profile),
+            patch.object(adapter, "_apply_room_agent_fields", AsyncMock()),
+        ):
+            ok = await adapter._refresh_room_agent_profile()
+        self.assertTrue(ok)
+        self.assertEqual(adapter._room_agent_profile_slug, "zhuang-john")
+        self.assertIn("slug='zhuang-john'", adapter._room_agent_diag)
+
+    async def test_refresh_stores_empty_slug_when_none(self):
+        adapter = self._adapter()
+        profile = {
+            "display_name": "John",
+            "invocation_keyterms": ("John",),
+            "system_prompt": "You are John.",
+            "is_active": True,
+            "hermes_profile_slug": None,
+        }
+        with (
+            patch.object(adapter, "_load_room_agent_profile", return_value="abc-123"),
+            patch.object(adapter, "_load_agent_profile", return_value=profile),
+            patch.object(adapter, "_apply_room_agent_fields", AsyncMock()),
+        ):
+            ok = await adapter._refresh_room_agent_profile()
+        self.assertTrue(ok)
+        self.assertEqual(adapter._room_agent_profile_slug, "")
+
+    async def test_handle_message_stamps_event_source_profile_when_slug_set(self):
+        """When _room_agent_profile_slug is set, event.source.profile is stamped."""
+        adapter = self._adapter()
+        adapter._room_agent_profile_slug = "zhuang-john"
+        adapter._room = SimpleNamespace(
+            remote_participants={},
+            local_participant=SimpleNamespace(set_attributes=AsyncMock()),
+        )
+        dispatched = AsyncMock()
+        source = SimpleNamespace()
+        source.profile = None
+        event = livekit_adapter.MessageEvent(
+            text="John, what should we eat in Rotorua?",
+            message_type=livekit_adapter.MessageType.TEXT,
+            source=source,
+        )
+        with (
+            patch.object(adapter, "_publish_agent_event", AsyncMock()),
+            patch.object(adapter, "_prepare_invoked_event", AsyncMock(return_value=True)),
+            patch.object(livekit_adapter.BasePlatformAdapter, "handle_message", dispatched),
+        ):
+            await adapter.handle_message(event)
+        self.assertEqual(source.profile, "zhuang-john")
+
+    async def test_handle_message_does_not_stamp_when_slug_empty(self):
+        """Graceful degradation: empty slug → source.profile stays None (default profile)."""
+        adapter = self._adapter()
+        adapter._room_agent_profile_slug = ""
+        adapter._room = SimpleNamespace(
+            remote_participants={},
+            local_participant=SimpleNamespace(set_attributes=AsyncMock()),
+        )
+        dispatched = AsyncMock()
+        source = SimpleNamespace()
+        source.profile = None
+        event = livekit_adapter.MessageEvent(
+            text="MiRA, what should we eat?",
+            message_type=livekit_adapter.MessageType.TEXT,
+            source=source,
+        )
+        with (
+            patch.object(adapter, "_publish_agent_event", AsyncMock()),
+            patch.object(adapter, "_prepare_invoked_event", AsyncMock(return_value=True)),
+            patch.object(livekit_adapter.BasePlatformAdapter, "handle_message", dispatched),
+        ):
+            await adapter.handle_message(event)
+        self.assertIsNone(source.profile)
+
+
 class RoomTranscriptContextTests(unittest.TestCase):
     """Tests for _fetch_room_transcript and _merge_db_transcript_into_context."""
 

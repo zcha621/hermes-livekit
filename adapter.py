@@ -449,6 +449,11 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._room_agent_uuid: str = ""
         self._room_agent_display_name: str = ""
         self._room_agent_keyterms: tuple[str, ...] = ()
+        # Hermes profile slug (e.g. "zhuang-john") for the room's agent.
+        # Stamped onto event.source.profile so the multiplexer scopes the
+        # turn to the agent's own profile home (SOUL.md, skills, memories).
+        # Empty when the room has no agent or the slug hasn't been synced yet.
+        self._room_agent_profile_slug: str = ""
         # Diagnostic for the room-profile bind: a short reason string (e.g.
         # "ok", "no-agent-id", "db:agent_id-123-no-row") published into the
         # status payload so a failed bind is visible instead of silently
@@ -971,7 +976,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         try:
             with engine.connect() as connection:
                 result = connection.exec_driver_sql(
-                    "SELECT display_name, invocation_keyterms, system_prompt, is_active "
+                    "SELECT display_name, invocation_keyterms, system_prompt, is_active, "
+                    "hermes_profile_slug "
                     "FROM agents "
                     "WHERE agent_uuid = %s AND owner_user_id IS NOT NULL",
                     (agent_uuid,),
@@ -986,6 +992,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             "invocation_keyterms": self._parse_profile_keyterms(row.get("invocation_keyterms")),
             "system_prompt": row.get("system_prompt") or "",
             "is_active": bool(row.get("is_active")),
+            "hermes_profile_slug": row.get("hermes_profile_slug") or "",
         }
         # Row exists but is soft-disabled: the caller won't inject it. Say so
         # explicitly so it isn't mistaken for "the soul is being applied."
@@ -1174,7 +1181,8 @@ class LiveKitAdapter(BasePlatformAdapter):
                 # schema; if the DB is older and lacks one, the error is
                 # caught by the caller and the diag reflects it.
                 result = connection.exec_driver_sql(
-                    "SELECT agent_uuid, agent_name, display_name, invocation_keyterms "
+                    "SELECT agent_uuid, agent_name, display_name, invocation_keyterms, "
+                    "hermes_profile_slug "
                     "FROM agents WHERE agent_id = %s",
                     (agent_id,),
                 ).first()
@@ -1193,6 +1201,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             "display_name": row.get("display_name"),
             "agent_name": row.get("agent_name"),
             "invocation_keyterms": row.get("invocation_keyterms"),
+            "hermes_profile_slug": row.get("hermes_profile_slug"),
         }
 
     async def _refresh_room_agent_profile(self) -> bool:
@@ -1250,14 +1259,18 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._room_agent_display_name = display_name
         if keyterms:
             self._room_agent_keyterms = keyterms
+        self._room_agent_profile_slug = str(
+            profile.get("hermes_profile_slug") or ""
+        ).strip()
         await self._apply_room_agent_fields()
         self._room_agent_diag = (
             f"ok(build={ROOM_PROFILE_BIND_BUILD},name={display_name!r},"
-            f"keyterms={list(keyterms)})"
+            f"keyterms={list(keyterms)},slug={self._room_agent_profile_slug!r})"
         )
         logger.info(
-            "[%s] Bound room agent profile '%s' (name=%r keyterms=%r)",
+            "[%s] Bound room agent profile '%s' (name=%r keyterms=%r slug=%r)",
             self.name, uuid_value, display_name, keyterms,
+            self._room_agent_profile_slug,
         )
         return True
 
@@ -2447,6 +2460,14 @@ class LiveKitAdapter(BasePlatformAdapter):
                 ),
             ):
                 return
+
+        # Route the turn to the room's agent profile so the multiplexer
+        # scopes SOUL.md, skills, and memories to that profile's home.
+        # Only set when the room was created with a specific agent and the
+        # slug has been synced; otherwise leave source.profile as-is
+        # (None → default profile, the pre-feature behaviour).
+        if self._room_agent_profile_slug and getattr(event, "source", None) is not None:
+            event.source.profile = self._room_agent_profile_slug
 
         await self._set_agent_state("thinking", force=True)
         await super().handle_message(event)
