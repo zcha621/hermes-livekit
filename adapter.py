@@ -1951,6 +1951,11 @@ class LiveKitAdapter(BasePlatformAdapter):
                     # Same, for the current speaker's own profile — why their
                     # personal name/persona was or wasn't injected this turn.
                     "mira.agent.speaker_profile_bind": self._speaker_profile_diag,
+                    # The room-bound display name (e.g. the user's own agent
+                    # name), surfaced for the video-tile label. Clients read
+                    # this attribute; it tracks _effective_agent_name so it is
+                    # correct on the very first push and after every (re)bind.
+                    "mira.agent.display_name": self._effective_agent_name(),
                 }
                 try:
                     await self._room.local_participant.set_attributes(attributes)
