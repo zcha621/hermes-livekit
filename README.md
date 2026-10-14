@@ -92,6 +92,35 @@ and Hermes STT. LiveKit itself supplies per-participant identity, synchronized
 attributes, data packets, and interruption-capable media; it does not manage
 MiRA's wake phrases.
 
+### Co-creation map: place-tag reminders
+
+The web meeting screen has a shared map where the remote traveller watches the
+on-site companion's live location and tags places (see
+[`docs/Co-creation.md`](../../docs/Co-creation.md) at the repo root). The
+on-site companion experiences the map by voice only — they can't see it. To
+close that loop, the tourism backend RPUSHes a `place_tag_added` entry to a
+Redis list (`mira:session:{session_id}:place-tag-nudges`) whenever a tag lands,
+and this adapter drains that list at each safe turn boundary
+(`_drain_place_tag_nudges`). When there's a new, not-yet-announced tag, the
+adapter appends a short instruction-to-announce block to the turn's prompt so
+the model, on the next safe turn, reminds the on-site traveller by naming the
+place — presented as "your friend tagged X," never as a verified
+recommendation, and never asserting facts the tag doesn't carry.
+
+The reminder's content comes from the tag row itself (its reverse-geocoded
+`label` and the traveller's `note`), hydrated from the `mira_place_tag` table —
+not from the nudge text (the nudge's `label` is `None` at write time, before
+reverse-geocoding runs). This keeps the reminder faithful to what was actually
+tagged.
+
+Both the Redis and the DB reads are best-effort: if `redis` isn't installed,
+`MIRA_REDIS_URL` is unset/unreachable, or `MIRA_DATABASE_URL` can't resolve the
+room's session, the drain returns nothing and the voice flow is unaffected —
+the agent simply doesn't speak the reminder. `MIRA_REDIS_URL` defaults to
+`redis://127.0.0.1:6379/0`, matching the backend's own fallback, so a
+single-host deployment needs no extra wiring; point both at the same Redis or
+the reminder won't fire.
+
 ## Agent status in meeting clients
 
 The adapter publishes LiveKit's standard `lk.agent.state` participant attribute

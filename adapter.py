@@ -61,6 +61,17 @@ except ImportError:
     Image = None  # type: ignore[assignment,misc]
     BytesIO = None  # type: ignore[assignment,misc]
 
+# The co-creation map's place-tag nudge queue lives in Redis (written by the
+# tourism backend). It's an optional dependency: if ``redis`` isn't installed,
+# or the queue is unreachable, the voice flow is unaffected — the agent simply
+# doesn't speak the "your friend tagged X" reminder (Co-creation doc §7).
+try:
+    import redis as _redis_lib
+    REDIS_AVAILABLE = True
+except ImportError:
+    _redis_lib = None  # type: ignore[assignment]
+    REDIS_AVAILABLE = False
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -140,6 +151,22 @@ DEFAULT_TRANSCRIPT_MAX_ENTRIES = 80
 DEFAULT_TRANSCRIPT_MAX_CHARS = 12_000
 DEFAULT_TRANSCRIPT_PROMPT_MAX_ENTRIES = 12
 DEFAULT_TRANSCRIPT_PROMPT_MAX_CHARS = 3_000
+# Redis the co-creation map's place-tag nudge queue lives in. The tourism
+# backend RPUSHes a "place_tag_added" entry here whenever a tag lands
+# (repository._push_place_tag_nudge); this adapter drains it at each safe turn
+# boundary. Same Redis the backend's session-state store uses — point both at
+# the same host, or the reminder in the Co-creation doc §7 Option B won't fire.
+# Falls back to localhost so a single-host dev deployment needs no extra wiring.
+DEFAULT_PLACE_TAG_NUDGE_REDIS_URL = "redis://127.0.0.1:6379/0"
+# Cap the number of pending tags rendered into one turn's prompt so a burst of
+# tags (or a stalled drain) can't bloat the context. The queue itself is
+# trimmed by the backend; this is the model-facing ceiling.
+PLACE_TAG_NUDGE_MAX_RENDERED = 5
+# Per-turn LPOP batch cap: bounds the number of Redis round-trips in a single
+# safe-turn boundary so a long-accumulated queue can't stall the turn. The
+# backend trims the queue to 16; this is well above that, so a full drain
+# happens in one turn.
+NUDGE_DRAIN_BATCH = 32
 AGENT_STATUS_SCHEMA = "mira-agent-status.v1"
 AGENT_STATES = frozenset({"initializing", "idle", "listening", "thinking", "speaking"})
 TOPIC_MAX_LENGTH = 180
@@ -586,6 +613,21 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._agent_state_generation = 0
         self._agent_state_lock = asyncio.Lock()
 
+        # Co-creation map (docs/Co-creation.md §7, Option B). The tourism
+        # backend RPUSHes a "place_tag_added" entry to this room's Redis list
+        # whenever the remote traveller tags a place; we drain it at each safe
+        # turn boundary and, on the next safe turn, remind the on-site
+        # traveller by naming the place. Both the Redis client and the
+        # announced-tag set are best-effort: a missing redis lib / unreachable
+        # queue / no DB row all degrade to "no reminder," never a voice failure.
+        # _place_tag_nudge_redis is lazily created on first drain (see
+        # _place_tag_nudge_redis_client). _announced_place_tag_ids is per-room
+        # and cleared in _reset_room_context so a re-join re-arms reminders for
+        # tags added during the same session (rather than suppressing them).
+        self._place_tag_nudge_redis: Optional[Any] = None
+        self._place_tag_nudge_redis_tried = False
+        self._announced_place_tag_ids: set[str] = set()
+
         # Video streams are continuously drained to avoid native queue
         # overflows. Only a throttled latest frame is JPEG-encoded in memory.
         # Track SID keys allow camera and screen share to coexist.
@@ -765,6 +807,13 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._prepared_tts_source = ""
         self._prepared_tts_text = ""
         self._last_spoken_source = ""
+        # Re-arm the co-creation map reminder: tags added while the room was
+        # live but before this occupancy started (or after a previous
+        # occupancy announced some) become "new" again for the next drain, so
+        # the on-site traveller is reminded of them rather than silently
+        # suppressed. The Redis queue itself still holds un-drained nudges;
+        # this just resets which of them we've already spoken about.
+        self._announced_place_tag_ids.clear()
 
     def _participant_connection_metadata(self, identity: str) -> Dict[str, str]:
         """Return the trusted token metadata for a connected participant."""
@@ -1697,6 +1746,194 @@ class LiveKitAdapter(BasePlatformAdapter):
         )
         return header + "\n".join(lines)
 
+    # --- Co-creation map: place-tag nudge queue (docs/Co-creation.md §7) ---
+
+    def _place_tag_nudge_redis_client(self) -> Optional[Any]:
+        """Lazily connect to the Redis holding the place-tag nudge queue.
+
+        The backend RPUSHes a "place_tag_added" entry per tag to
+        ``mira:session:{session_id}:place-tag-nudges``. We read the same Redis
+        the backend's session-state store uses (env ``MIRA_REDIS_URL``) so a
+        single-host deployment wires up with no extra config. Best-effort: a
+        missing ``redis`` lib, an empty/unset URL, or a connection failure all
+        return ``None`` — the voice flow is never blocked by the map feature.
+        """
+        if self._place_tag_nudge_redis_tried:
+            return self._place_tag_nudge_redis
+        self._place_tag_nudge_redis_tried = True
+        if not REDIS_AVAILABLE:
+            return None
+        url = os.getenv("MIRA_REDIS_URL", "").strip() or DEFAULT_PLACE_TAG_NUDGE_REDIS_URL
+        try:
+            client = _redis_lib.Redis.from_url(
+                url, decode_responses=True, socket_connect_timeout=1, socket_timeout=1
+            )
+            client.ping()
+            self._place_tag_nudge_redis = client
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[%s] place-tag nudge Redis unavailable (%s); reminders disabled",
+                self.name, exc,
+            )
+            self._place_tag_nudge_redis = None
+        return self._place_tag_nudge_redis
+
+    def _resolve_mira_session_id(self) -> Optional[str]:
+        """Map this room's LiveKit name to its ``mira_session.session_id``.
+
+        Mirrors the lookup in ``_fetch_room_transcript``: one bounded SELECT
+        on ``mira_session`` where ``livekit_room_name == self._room_name``.
+        Returns the session id as a string, or ``None`` on any failure (no
+        ``MIRA_DATABASE_URL``, no SQLAlchemy, no matching row, or a query
+        error). Best-effort — a miss simply means no reminder this turn.
+        """
+        database_url = os.getenv("MIRA_DATABASE_URL", "").strip()
+        if not database_url:
+            return None
+        room_name = self._room_name
+        if not room_name:
+            return None
+        try:
+            from sqlalchemy import MetaData, Table, create_engine, select
+        except ImportError:
+            return None
+        try:
+            engine = create_engine(database_url, pool_pre_ping=True, future=True)
+            with engine.connect() as conn:
+                metadata = MetaData()
+                sessions = Table("mira_session", metadata, autoload_with=engine)
+                row = conn.execute(
+                    select(sessions.c.session_id).where(
+                        sessions.c.livekit_room_name == room_name
+                    )
+                ).first()
+                return str(row.session_id) if row else None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[%s] _resolve_mira_session_id failed: %s", self.name, exc)
+            return None
+
+    def _hydrate_place_tags(self, tag_ids: list[str]) -> list[Dict[str, Any]]:
+        """Fetch the current label/note/author for the given active tags.
+
+        The nudge payload's ``label`` is ``None`` at write time (reverse
+        geocoding hasn't run yet), so the reminder's content must come from
+        the tag row itself — its reverse-geocoded ``label`` and the traveller's
+        ``note`` — never from the nudge text (Co-creation doc §8: present as
+        "your friend tagged this," don't assert facts the tag doesn't carry).
+        Returns ``[]`` on any failure; callers fall back to the nudge's
+        (possibly empty) fields.
+        """
+        database_url = os.getenv("MIRA_DATABASE_URL", "").strip()
+        if not database_url or not tag_ids:
+            return []
+        try:
+            from sqlalchemy import MetaData, Table, create_engine, select
+        except ImportError:
+            return []
+        try:
+            engine = create_engine(database_url, pool_pre_ping=True, future=True)
+            with engine.connect() as conn:
+                metadata = MetaData()
+                tags = Table("mira_place_tag", metadata, autoload_with=engine)
+                rows = conn.execute(
+                    select(
+                        tags.c.tag_id, tags.c.label, tags.c.note,
+                        tags.c.author_role, tags.c.status,
+                    ).where(tags.c.tag_id.in_(tag_ids))
+                ).fetchall()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[%s] _hydrate_place_tags failed: %s", self.name, exc)
+            return []
+        return [
+            {
+                "tag_id": str(row.tag_id),
+                "label": str(row.label or "").strip(),
+                "note": str(row.note or "").strip(),
+                "author_role": str(row.author_role or ""),
+                "status": str(row.status or "active"),
+            }
+            for row in rows
+        ]
+
+    def _drain_place_tag_nudges(self) -> str:
+        """Drain this room's place-tag nudge queue and render a reminder block.
+
+        Called from ``_prepare_invoked_event`` at the safe-turn boundary. For
+        each "place_tag_added" nudge we haven't yet announced (tracked by
+        ``_announced_place_tag_ids``), we mark it announced and render a short
+        instruction-to-announce with the tag's facts. Returns "" when there is
+        nothing new (no Redis, no session, empty queue, or all already
+        spoken). The drain is best-effort and cheap: a pop that finds nothing
+        is a no-op, and a missing dependency returns "" without raising.
+        """
+        redis_client = self._place_tag_nudge_redis_client()
+        if redis_client is None:
+            return ""
+        session_id = self._resolve_mira_session_id()
+        if not session_id:
+            return ""
+        queue_key = f"mira:session:{session_id}:place-tag-nudges"
+        try:
+            # LPOP each pending entry one at a time; stop at an empty pop.
+            pending: list[Dict[str, Any]] = []
+            for _ in range(NUDGE_DRAIN_BATCH):
+                raw = redis_client.lpop(queue_key)
+                if raw is None:
+                    break
+                try:
+                    entry = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(entry, dict) or entry.get("kind") != "place_tag_added":
+                    continue
+                tag_id = str(entry.get("tag_id") or "")
+                if not tag_id or tag_id in self._announced_place_tag_ids:
+                    continue
+                self._announced_place_tag_ids.add(tag_id)
+                pending.append(entry)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[%s] nudge drain failed: %s", self.name, exc)
+            return ""
+        if not pending:
+            return ""
+        # Hydrate labels/notes from the tag rows (the nudge's label is None at
+        # write time). Hydration is best-effort: on failure we still announce
+        # with whatever the nudge carried (possibly just "a place").
+        hydrated = {
+            t["tag_id"]: t
+            for t in self._hydrate_place_tags([p.get("tag_id", "") for p in pending])
+        }
+        lines: list[str] = []
+        for entry in pending[:PLACE_TAG_NUDGE_MAX_RENDERED]:
+            tag_id = str(entry.get("tag_id") or "")
+            tag = hydrated.get(tag_id)
+            label = (tag or {}).get("label") or str(entry.get("label") or "").strip()
+            note = (tag or {}).get("note") or str(entry.get("note") or "").strip()
+            author = (tag or {}).get("author_role") or str(entry.get("author_role") or "").strip()
+            place = label or note or "a place"
+            # The on-site companion is the participant the reminder is *for*;
+            # a "tourist" (remote) tag is "your friend", anything else (the
+            # on-site traveller tagging their own location, or an unknown role)
+            # is "your companion". The backend's role vocabulary is
+            # "tourist" / "on_site" (see repository.place_tag write path).
+            who = "your friend" if author == "tourist" else "your companion"
+            line = f"- {who} tagged {place!r}"
+            if note and label:
+                line += f" (note: {note})"
+            lines.append(line)
+        if len(pending) > PLACE_TAG_NUDGE_MAX_RENDERED:
+            lines.append(f"- …and {len(pending) - PLACE_TAG_NUDGE_MAX_RENDERED} more")
+        block = (
+            "Shared map update (co-creation): your remote traveller added "
+            "the following place(s) to the map you can't see. At a safe "
+            "moment in the conversation, remind the on-site traveller by "
+            "naming the place — present it as what their friend tagged, not "
+            "as a verified recommendation, and do not assert any facts about "
+            "the place that the tag itself doesn't carry.\n"
+            + "\n".join(lines)
+        )
+        return block
+
     async def _prepare_invoked_event(
         self,
         event: MessageEvent,
@@ -1893,8 +2130,22 @@ class LiveKitAdapter(BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001
             logger.debug("[%s] DB transcript fetch failed, using in-memory only: %s", self.name, exc)
             transcript_context = self._transcript_context()
-        existing_prompt = str(getattr(event, "channel_prompt", "") or "").strip()
+        # Co-creation map (docs/Co-creation.md §7, Option B): drain this
+        # room's place-tag nudge queue at the safe-turn boundary. If the remote
+        # traveller tagged a place since the last safe turn, this returns a
+        # short instruction-to-announce block we append to the prompt so the
+        # model reminds the on-site traveller by naming the place on this turn.
+        # Empty string (the common case — no new tags) adds nothing, and a
+        # missing Redis/DB degrades to "" without blocking the turn.
+        place_tag_context = ""
+        try:
+            place_tag_context = await asyncio.to_thread(self._drain_place_tag_nudges)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[%s] place-tag nudge drain failed: %s", self.name, exc)
         contextual_prompt = f"{meeting_context}\n\n{transcript_context}"
+        if place_tag_context:
+            contextual_prompt = f"{contextual_prompt}\n\n{place_tag_context}"
+        existing_prompt = str(getattr(event, "channel_prompt", "") or "").strip()
         event.channel_prompt = (
             f"{existing_prompt}\n\n{contextual_prompt}"
             if existing_prompt

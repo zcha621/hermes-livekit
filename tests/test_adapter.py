@@ -1986,5 +1986,73 @@ class RoomTranscriptContextTests(unittest.TestCase):
         self.assertNotIn("[0]", result)
 
 
+class PlaceTagNudgeTests(unittest.TestCase):
+    """docs/Co-creation.md §7 Option B: the adapter drains the backend's
+    place-tag nudge queue and renders an instruction-to-announce block."""
+
+    def setUp(self):
+        self.adapter = make_adapter()
+
+    def tearDown(self):
+        livekit_adapter.LIVE_ADAPTERS.discard(self.adapter)
+
+    def _fake_redis(self, entries):
+        """A minimal LPOP stand-in that returns the given JSON strings, then None."""
+        queue = [json.dumps(e) for e in entries] + [None]
+        client = SimpleNamespace()
+        client.lpop = lambda *a, **k: queue.pop(0) if queue else None
+        return client
+
+    def test_drain_renders_new_tourist_tag_as_friend(self):
+        self.adapter._place_tag_nudge_redis = self._fake_redis([{
+            "kind": "place_tag_added", "session_id": "s1", "tag_id": "t1",
+            "label": None, "note": "Cafe for pavlova", "author_role": "tourist",
+        }])
+        self.adapter._place_tag_nudge_redis_tried = True
+        # Session resolves; hydration returns the tag's reverse-geocoded label.
+        self.adapter._resolve_mira_session_id = lambda: "s1"
+        self.adapter._hydrate_place_tags = lambda ids: [{
+            "tag_id": "t1", "label": "Queen St", "note": "Cafe for pavlova",
+            "author_role": "tourist", "status": "active",
+        }]
+
+        block = self.adapter._drain_place_tag_nudges()
+
+        self.assertIn("your friend", block)
+        self.assertIn("Queen St", block)
+        self.assertIn("Cafe for pavlova", block)
+        self.assertIn("t1", self.adapter._announced_place_tag_ids)
+
+    def test_drain_is_noop_when_no_new_nudges(self):
+        self.adapter._place_tag_nudge_redis = self._fake_redis([])
+        self.adapter._place_tag_nudge_redis_tried = True
+        self.adapter._resolve_mira_session_id = lambda: "s1"
+
+        self.assertEqual(self.adapter._drain_place_tag_nudges(), "")
+        self.assertEqual(self.adapter._announced_place_tag_ids, set())
+
+    def test_drain_skips_already_announced_tags(self):
+        entry = {
+            "kind": "place_tag_added", "session_id": "s1", "tag_id": "t9",
+            "label": None, "note": "x", "author_role": "tourist",
+        }
+        self.adapter._place_tag_nudge_redis = self._fake_redis([entry])
+        self.adapter._place_tag_nudge_redis_tried = True
+        self.adapter._resolve_mira_session_id = lambda: "s1"
+        self.adapter._announced_place_tag_ids.add("t9")  # already announced
+
+        self.assertEqual(self.adapter._drain_place_tag_nudges(), "")
+
+    def test_drain_returns_empty_when_redis_unavailable(self):
+        self.adapter._place_tag_nudge_redis = None
+        self.adapter._place_tag_nudge_redis_tried = True
+        self.assertEqual(self.adapter._drain_place_tag_nudges(), "")
+
+    def test_reset_room_context_rearms_announced_set(self):
+        self.adapter._announced_place_tag_ids.add("t1")
+        self.adapter._reset_room_context()
+        self.assertEqual(self.adapter._announced_place_tag_ids, set())
+
+
 if __name__ == "__main__":
     unittest.main()
