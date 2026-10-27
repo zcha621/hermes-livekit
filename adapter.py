@@ -2792,6 +2792,22 @@ class LiveKitAdapter(BasePlatformAdapter):
         await self._set_agent_state("thinking", force=True)
         await super().handle_message(event)
 
+    async def _process_message_background(self, event, session_key: str) -> None:
+        """Keep post-handler auto-TTS in the turn's profile and credential scope.
+
+        The base adapter synthesizes voice replies after the runner restores its
+        scope. Bind the whole background task so its speech request uses this
+        agent's config.yaml, including its saved voice. Context-local scoping
+        keeps simultaneous rooms isolated.
+        """
+        runner = getattr(self, "gateway_runner", None)
+        scope = getattr(runner, "_profile_scope_for_source", None)
+        if callable(scope):
+            with scope(event.source):
+                await super()._process_message_background(event, session_key)
+        else:
+            await super()._process_message_background(event, session_key)
+
     # -- LiveKit event handlers ---------------------------------------------
 
     def _on_track_subscribed(

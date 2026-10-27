@@ -525,3 +525,9 @@ A useful call check is:
 - `Setup-HermesLiveKit.cmd` — double-click setup for a Hermes Windows host.
 - `Setup-HermesLiveKit.ps1` — repeatable Windows install/update and migration.
 - `tests/test_adapter.py` — adapter behavior tests.
+
+Personal Kokoro voice choices are managed in the portal's **My Agent** page.
+The profile reconciler writes each agent's `tts.openai.voice` in its own
+`config.yaml`. The LiveKit adapter keeps the background reply (including
+post-handler auto-TTS) inside the routed profile's runtime scope, so concurrent
+rooms use their respective voices and credentials.

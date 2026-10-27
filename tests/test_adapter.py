@@ -2056,3 +2056,34 @@ class PlaceTagNudgeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VoiceProfileScopeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_post_handler_speech_uses_event_profile_and_restores_scope(self):
+        from contextlib import contextmanager
+        from contextvars import ContextVar
+        active = ContextVar('test_voice_profile', default='base')
+
+        @contextmanager
+        def scope(source):
+            token = active.set(source.profile)
+            try:
+                yield
+            finally:
+                active.reset(token)
+
+        adapter = make_adapter()
+        adapter.gateway_runner = SimpleNamespace(_profile_scope_for_source=scope)
+        observed = []
+
+        async def background(self, event, session_key):
+            await asyncio.sleep(0)
+            observed.append((event.source.profile, active.get()))
+
+        with patch.object(livekit_adapter.BasePlatformAdapter, '_process_message_background', background):
+            await asyncio.gather(*(
+                adapter._process_message_background(SimpleNamespace(source=SimpleNamespace(profile=profile)), profile)
+                for profile in ('alice', 'bob')
+            ))
+        self.assertCountEqual(observed, [('alice', 'alice'), ('bob', 'bob')])
+        self.assertEqual(active.get(), 'base')
