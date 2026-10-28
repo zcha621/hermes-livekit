@@ -17,12 +17,14 @@ try:
     from .adapter import (  # type: ignore[import-not-found]  # noqa: E402
         LIVE_ADAPTERS,
         LiveKitAdapter,
+        MultiRoomLiveKitAdapter,
         check_livekit_requirements,
     )
 except ImportError:  # Direct-file test and legacy entry-point compatibility.
     from adapter import (  # noqa: E402
         LIVE_ADAPTERS,
         LiveKitAdapter,
+        MultiRoomLiveKitAdapter,
         check_livekit_requirements,
     )
 
@@ -156,10 +158,13 @@ def _on_session_finalize_hook(session_id="", **kwargs) -> None:
     blocked on per-call futures; without this hook they'd hang until the
     per-call timeout.
     """
+    if not session_id:
+        return
     for adapter in list(LIVE_ADAPTERS):
         try:
-            adapter._finish_tool_acknowledgement_turn()
-            n = adapter.cancel_pending_tool_calls_for_session_reset()
+            if adapter._tool_ack_session_id == session_id:
+                adapter._finish_tool_acknowledgement_turn()
+            n = adapter.cancel_pending_tool_calls_for_session_reset(session_id)
             if n:
                 logger.info("session finalize: cancelled %d in-flight remote tool call(s)", n)
         except Exception as exc:
@@ -280,7 +285,7 @@ def register(ctx) -> None:
     ctx.register_platform(
         name="livekit",
         label="LiveKit",
-        adapter_factory=lambda cfg: LiveKitAdapter(cfg),
+        adapter_factory=lambda cfg: MultiRoomLiveKitAdapter(cfg),
         check_fn=check_livekit_requirements,
         is_connected=_is_connected,
         required_env=["LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"],

@@ -13,6 +13,8 @@ Requires:
 """
 
 import asyncio
+import copy
+from contextvars import ContextVar
 import hashlib
 import io
 import json
@@ -652,6 +654,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._tool_owners: Dict[str, str] = {}              # tool name -> owner identity
         self._pending_tool_calls: Dict[str, asyncio.Future] = {}  # call_id -> future
         self._pending_tool_owners: Dict[str, str] = {}      # call_id -> owner identity
+        self._pending_tool_sessions: Dict[str, str] = {}
 
         self._presence_poll_interval: float = self._resolve_presence_poll_interval()
         self._tool_call_timeout: float = self._resolve_tool_call_timeout()
@@ -2518,10 +2521,18 @@ class LiveKitAdapter(BasePlatformAdapter):
                 if self._room is not None and self._current_room_has_humans():
                     continue
                 target = await self._find_target_room()
-                if not target or (self._room is not None and target == self._room_name):
+                if self._room is not None and target == self._room_name:
                     continue
                 async with self._room_transition_lock:
                     if not self._running or self._current_room_has_humans():
+                        continue
+                    if not target:
+                        # A renderer may leave after the last human, or a server
+                        # reconnect may miss that participant's departure. Do
+                        # not keep an abandoned appearance room alive forever.
+                        # Local presence already confirmed there are no humans.
+                        if self._room is not None:
+                            await self._leave_room()
                         continue
                     if self._room is not None:
                         logger.info(
@@ -2790,7 +2801,12 @@ class LiveKitAdapter(BasePlatformAdapter):
             event.source.profile = self._room_agent_profile_slug
 
         await self._set_agent_state("thinking", force=True)
-        await super().handle_message(event)
+        supervisor = getattr(self, "_room_supervisor", None)
+        if supervisor is not None:
+            if supervisor._room_workers.get(self._room_name) is self:
+                await BasePlatformAdapter.handle_message(supervisor, event)
+        else:
+            await super().handle_message(event)
 
     async def _process_message_background(self, event, session_key: str) -> None:
         """Keep post-handler auto-TTS in the turn's profile and credential scope.
@@ -4272,6 +4288,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             return
         future = self._pending_tool_calls.pop(call_id, None)
         self._pending_tool_owners.pop(call_id, None)
+        self._pending_tool_sessions.pop(call_id, None)
         if future is None or future.done():
             # Late result for a cancelled/timed-out call — ignore.
             logger.debug("[%s] tool-result for unknown call_id %r", self.name, call_id)
@@ -4322,6 +4339,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             future = loop.create_future()
             self._pending_tool_calls[call_id] = future
             self._pending_tool_owners[call_id] = owner_identity
+            self._pending_tool_sessions[call_id] = str((arguments.get("_mira_source") or {}).get("hermes_session_id") or kwargs.get("session_id") or "")
             try:
                 logger.info(
                     "[%s] remote tool %r started via %s",
@@ -4374,6 +4392,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             finally:
                 self._pending_tool_calls.pop(call_id, None)
                 self._pending_tool_owners.pop(call_id, None)
+                self._pending_tool_sessions.pop(call_id, None)
 
         return proxy
 
@@ -4400,6 +4419,7 @@ class LiveKitAdapter(BasePlatformAdapter):
                 continue
             future = self._pending_tool_calls.pop(call_id, None)
             self._pending_tool_owners.pop(call_id, None)
+            self._pending_tool_sessions.pop(call_id, None)
             if future is not None and not future.done():
                 future.set_exception(
                     RuntimeError(f"client {identity!r} disconnected mid-call")
@@ -4415,10 +4435,11 @@ class LiveKitAdapter(BasePlatformAdapter):
                 future.set_exception(RuntimeError("livekit adapter shutting down"))
         self._pending_tool_calls.clear()
         self._pending_tool_owners.clear()
+        self._pending_tool_sessions.clear()
         self._client_tools.clear()
         self._tool_owners.clear()
 
-    def cancel_pending_tool_calls_for_session_reset(self) -> int:
+    def cancel_pending_tool_calls_for_session_reset(self, session_id: str = "") -> int:
         """Fail in-flight remote tool calls and tell the owning clients.
 
         Called from the plugin's ``on_session_finalize`` hook (and the
@@ -4435,6 +4456,8 @@ class LiveKitAdapter(BasePlatformAdapter):
             return 0
         cancelled = 0
         for call_id, future in list(self._pending_tool_calls.items()):
+            if session_id and self._pending_tool_sessions.get(call_id) != session_id:
+                continue
             owner = self._pending_tool_owners.get(call_id, "")
             if owner:
                 # Best-effort notification — schedule on the same loop the
@@ -4458,8 +4481,9 @@ class LiveKitAdapter(BasePlatformAdapter):
                     RuntimeError("agent session reset; tool call abandoned")
                 )
             cancelled += 1
-        self._pending_tool_calls.clear()
-        self._pending_tool_owners.clear()
+            self._pending_tool_calls.pop(call_id, None)
+            self._pending_tool_owners.pop(call_id, None)
+            self._pending_tool_sessions.pop(call_id, None)
         return cancelled
 
     def _drain_pending_captures(self) -> tuple[list[str], list[str]]:
@@ -4849,3 +4873,190 @@ class LiveKitAdapter(BasePlatformAdapter):
             "participants": participants,
         }
 
+
+
+class RoomLiveKitAdapter(LiveKitAdapter):
+    """A pinned media connection; its supervisor owns presence and dispatch."""
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        self._event_loop = asyncio.get_running_loop()
+        self._running = True
+        return await self._join_room()
+
+    def _on_disconnected(self, reason: str = ""):
+        # Let the next authoritative room snapshot decide whether to reconnect.
+        # Blind retries can recreate a room that its owner just closed.
+        self._mark_disconnected()
+
+    async def _leave_and_watch(self) -> None:
+        async with self._room_transition_lock:
+            await self._leave_room()
+
+
+class MultiRoomLiveKitAdapter(LiveKitAdapter):
+    """One gateway dispatcher, with independent media/state per occupied room."""
+
+    def __init__(self, config: PlatformConfig):
+        super().__init__(config)
+        self._room_workers: Dict[str, RoomLiveKitAdapter] = {}
+        self._room_turn_tasks: Dict[asyncio.Task, RoomLiveKitAdapter] = {}
+        self._turn_room = ContextVar("livekit_turn_room", default=None)
+        # Lifecycle hooks operate on media workers, never this dispatcher.
+        LIVE_ADAPTERS.discard(self)
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        if not (LIVEKIT_AVAILABLE and LIVEKIT_API_AVAILABLE and self._url
+                and self._api_key and self._api_secret):
+            return False
+        if self._presence_task and not self._presence_task.done():
+            return True
+        self._running = True
+        self._event_loop = asyncio.get_running_loop()
+        self._mark_connected()
+        await self._reconcile_room_workers()
+        self._presence_task = asyncio.create_task(self._watch_room_workers())
+        return True
+
+    async def _occupied_room_names(self) -> set[str]:
+        client = LiveKitAPI(url=self._server_api_url(), api_key=self._api_key,
+                            api_secret=self._api_secret)
+        try:
+            listed = await client.room.list_rooms(ListRoomsRequest())
+            occupied = set()
+            for room in listed.rooms:
+                if room.name != self._home_room_name and not _room_requests_hermes(room.metadata):
+                    continue
+                response = await client.room.list_participants(ListParticipantsRequest(room=room.name))
+                if any(_is_human_participant(p) for p in response.participants):
+                    occupied.add(room.name)
+            return occupied
+        finally:
+            await client.aclose()
+
+    def _make_room_worker(self, name: str) -> RoomLiveKitAdapter:
+        config = copy.deepcopy(self.config)
+        config.extra = {**(config.extra or {}), "room": name}
+        worker = RoomLiveKitAdapter(config)
+        worker._room_supervisor = self
+        worker.gateway_runner = getattr(self, "gateway_runner", None)
+        return worker
+
+    async def _remove_room_worker(self, name: str) -> None:
+        worker = self._room_workers.pop(name)
+        worker._running = False
+        # Cancel only turns owned by this occupancy. Other rooms keep speaking.
+        tasks = [task for task, owner in self._room_turn_tasks.items()
+                 if owner is worker and task is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await worker.disconnect()
+
+    async def _reconcile_room_workers(self) -> None:
+        try:
+            occupied = await self._occupied_room_names()
+        except Exception:
+            # An unavailable room API is not evidence that rooms became empty.
+            logger.warning("[Livekit] room discovery unavailable; keeping current connections", exc_info=True)
+            return
+        for name in list(self._room_workers):
+            if name not in occupied:
+                await self._remove_room_worker(name)
+        for name in sorted(occupied):
+            worker = self._room_workers.get(name)
+            if worker is not None:
+                worker.gateway_runner = getattr(self, "gateway_runner", None)
+                if worker._room is not None and worker._room.isconnected():
+                    continue
+                await self._remove_room_worker(name)
+            worker = self._make_room_worker(name)
+            self._room_workers[name] = worker
+            try:
+                if await worker.connect():
+                    continue
+            except Exception:
+                logger.exception("[Livekit] failed to join room %s", name)
+            await self._remove_room_worker(name)
+
+    async def _watch_room_workers(self) -> None:
+        try:
+            while self._running:
+                await asyncio.sleep(self._presence_poll_interval)
+                if self._running:
+                    await self._reconcile_room_workers()
+        except asyncio.CancelledError:
+            pass
+
+    def _worker_for_chat(self, chat_id: str) -> Optional[RoomLiveKitAdapter]:
+        for name, worker in self._room_workers.items():
+            # Raw room names support explicit scheduled delivery. Conversation
+            # IDs must match the current occupancy epoch, never a replacement.
+            if chat_id == name or chat_id.startswith(f"{name}:{worker._session_epoch}:"):
+                return worker
+        return None
+
+    async def handle_message(self, event) -> None:
+        worker = self._worker_for_chat(str(getattr(getattr(event, "source", None), "chat_id", "")))
+        if worker is not None:
+            await worker.handle_message(event)
+
+    async def _process_message_background(self, event, session_key: str) -> None:
+        worker = self._worker_for_chat(event.source.chat_id)
+        if worker is None:
+            self._pending_messages.pop(session_key, None)
+            self._active_sessions.pop(session_key, None)
+            self._session_tasks.pop(session_key, None)
+            return
+        task = asyncio.current_task()
+        self._room_turn_tasks[task] = worker
+        context_token = self._turn_room.set(worker)
+        try:
+            await super()._process_message_background(event, session_key)
+        finally:
+            self._turn_room.reset(context_token)
+            self._room_turn_tasks.pop(task, None)
+
+    def prepare_tts_text(self, text: str) -> str:
+        worker = self._turn_room.get()
+        if worker is not None:
+            return worker.prepare_tts_text(text)
+        return super().prepare_tts_text(text)
+
+    async def send(self, chat_id: str, content: str, reply_to=None, metadata=None) -> SendResult:
+        worker = self._worker_for_chat(chat_id)
+        if worker is None:
+            return SendResult(success=False, error="Room occupancy is no longer active")
+        return await worker.send(chat_id, content, reply_to=reply_to, metadata=metadata)
+
+    async def play_tts(self, chat_id: str, audio_path: str, reply_to=None, metadata=None, caption=None) -> SendResult:
+        worker = self._worker_for_chat(chat_id)
+        if worker is None:
+            return SendResult(success=False, error="Room occupancy is no longer active")
+        return await worker.play_tts(chat_id, audio_path, reply_to=reply_to, metadata=metadata, caption=caption)
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        worker = self._worker_for_chat(chat_id)
+        if worker is not None:
+            await worker.send_typing(chat_id, metadata=metadata)
+
+    async def stop_typing(self, chat_id: str) -> None:
+        worker = self._worker_for_chat(chat_id)
+        if worker is not None:
+            await worker.stop_typing(chat_id)
+
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        worker = self._worker_for_chat(chat_id)
+        if worker is None:
+            return {"chat_id": chat_id, "type": "group", "participants": []}
+        return await worker.get_chat_info(chat_id)
+
+    async def disconnect(self) -> None:
+        self._running = False
+        if self._presence_task:
+            self._presence_task.cancel()
+            await asyncio.gather(self._presence_task, return_exceptions=True)
+            self._presence_task = None
+        for name in list(self._room_workers):
+            await self._remove_room_worker(name)
+        await super().disconnect()

@@ -1,6 +1,6 @@
 # Hermes LiveKit plugin
 
-This submodule connects Hermes to a LiveKit room as a voice-first participant.
+This submodule connects Hermes to occupied LiveKit rooms as a voice-first participant.
 It supports audio, typed messages, camera/screen context, interruption, and
 client-provided tools without modifying Hermes core.
 
@@ -17,6 +17,21 @@ tools. LiveKit and Discord receive the same configured Hermes tools, skills,
 and MCP servers as the GUI/CLI, plus the MiRA tools. The plugin does not call
 the backend before or after ordinary model turns. The complete operator guide is
 [`docs/deployment/HERMES-SETUP.md`](../../docs/deployment/HERMES-SETUP.md).
+
+## Concurrent rooms
+
+The registered adapter is `MultiRoomLiveKitAdapter`. It discovers every
+human-occupied room marked for Hermes (plus the configured home room), then
+creates a separate `RoomLiveKitAdapter` media connection for each. The gateway
+keeps its normal session queues and per-agent profile scope. Audio buffers,
+transcripts, invocation state, TTS preparation and playback belong to their room.
+Replies require the room's current occupancy epoch, so a delayed reply cannot
+reach a replacement occupancy. Removing one room cancels only its active turns.
+A failed room API poll preserves existing connections for the next retry.
+
+Unity's appearance participant is independent of Hermes and publishes camera
+video only. Appearance-enabled rooms retain their Hermes runtime marker.
+Renderer and Hermes participants alone do not keep a room occupied.
 
 ## Invocation keyterms and shared meeting context
 

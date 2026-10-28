@@ -28,6 +28,25 @@ gateway_config._Platform__bundled_plugin_names = (
 ) | {"livekit"}
 
 
+class EmptyAppearanceRoomTests(unittest.IsolatedAsyncioTestCase):
+    async def test_presence_poll_releases_room_after_last_human_and_renderer_leave(self):
+        adapter = make_adapter()
+        adapter._running = True
+        adapter._presence_poll_interval = 0.001
+        adapter._room_name = "appearance-room"
+        adapter._room = SimpleNamespace(remote_participants={})
+        adapter._connect_task = None
+        adapter._find_target_room = AsyncMock(return_value=None)
+
+        async def leave():
+            adapter._room = None
+            adapter._running = False
+
+        adapter._leave_room = AsyncMock(side_effect=leave)
+        await asyncio.wait_for(adapter._presence_watch_loop(), timeout=1)
+        adapter._leave_room.assert_awaited_once()
+
+
 def authorize_unflagged_participants(adapter):
     """Treat participants without portal metadata as authorized in tests.
 
