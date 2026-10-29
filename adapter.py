@@ -4753,6 +4753,11 @@ class LiveKitAdapter(BasePlatformAdapter):
                         await self._audio_source.capture_frame(frame)
                         offset += bytes_per_frame
 
+                    if not self._playback_interrupt.is_set():
+                        wait_for_playout = getattr(self._audio_source, "wait_for_playout", None)
+                        if wait_for_playout is not None:
+                            await wait_for_playout()
+
                     return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
             except Exception as e:
                 logger.error("[%s] TTS playback error: %s", self.name, e)

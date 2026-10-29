@@ -27,6 +27,8 @@ class UnityRelay:
         self.epoch = uuid.uuid4().hex
         self.sequence = 0
         self.generation = 0
+        self._audio_deadline = None
+        self._playout_cancel = asyncio.Event()
 
     async def emit(self, kind, **payload):
         self.sequence += 1
@@ -38,13 +40,33 @@ class UnityRelay:
                                             destination_identities=[self.identity])
 
     async def capture_frame(self, frame):
+        now = time.monotonic()
+        if self._audio_deadline is None or now - self._audio_deadline > 0.25:
+            self._audio_deadline = now
+        generation = self.generation
         await self.emit('audio', pcm=base64.b64encode(bytes(frame.data)).decode())
-        # Data packets have no AudioSource capture backpressure. Pace PCM so
-        # long answers cannot fill the receiver queue or delay interruption.
-        await asyncio.sleep(frame.samples_per_channel / frame.sample_rate)
+        if generation != self.generation:
+            return
+        # Include publish latency in the frame period. Sleeping a full frame
+        # after every publish sends PCM slower than real time and causes gaps.
+        self._audio_deadline += frame.samples_per_channel / frame.sample_rate
+        await asyncio.sleep(max(0, self._audio_deadline - time.monotonic()))
+
+    async def wait_for_playout(self):
+        """Drain Unity's short jitter buffer before publishing speaking-stop."""
+        canceled = self._playout_cancel
+        await self.emit('audio-end')
+        try:
+            await asyncio.wait_for(canceled.wait(), timeout=0.16)
+        except asyncio.TimeoutError:
+            pass
+        self._audio_deadline = None
 
     def clear_queue(self):
         self.generation += 1
+        self._audio_deadline = None
+        self._playout_cancel.set()
+        self._playout_cancel = asyncio.Event()
         asyncio.create_task(self.emit('flush'))
 
 

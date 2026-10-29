@@ -8,6 +8,39 @@ from unity_relay import UnityRelay, relay_key
 
 
 class UnityRelayTests(IsolatedAsyncioTestCase):
+    async def test_pcm_clock_includes_network_publish_time(self):
+        clock = [100.0]
+        sent_at = []
+
+        async def publish(*args, **kwargs):
+            sent_at.append(clock[0])
+            clock[0] += .008
+
+        async def sleep(duration):
+            clock[0] += duration
+
+        relay = UnityRelay(SimpleNamespace(publish_data=publish), 'secret', 'room', 'agent')
+        frame = SimpleNamespace(data=bytes(1920), samples_per_channel=960, sample_rate=48000)
+        with patch('unity_relay.time.monotonic', side_effect=lambda: clock[0]), patch('unity_relay.asyncio.sleep', side_effect=sleep):
+            for _ in range(100):
+                await relay.capture_frame(frame)
+        self.assertAlmostEqual(clock[0] - 100, 2.0, places=6)
+        self.assertTrue(all(abs(b - a - .02) < 1e-6 for a, b in zip(sent_at, sent_at[1:])))
+
+    async def test_interrupt_resets_audio_clock_and_cancels_playout_wait(self):
+        relay = UnityRelay(SimpleNamespace(publish_data=AsyncMock()), 'secret', 'room', 'agent')
+        relay._audio_deadline = 123
+        waiting = asyncio.create_task(relay.wait_for_playout())
+        await asyncio.sleep(0)
+        relay.clear_queue()
+        await asyncio.wait_for(waiting, timeout=.05)
+        self.assertIsNone(relay._audio_deadline)
+        self.assertEqual(relay.generation, 1)
+        await asyncio.sleep(0)
+        kinds = [json.loads(base64.b64decode(json.loads(call.args[0])['body']))['kind']
+                 for call in relay.participant.publish_data.call_args_list]
+        self.assertEqual(kinds, ['audio-end', 'flush'])
+
     async def test_output_is_signed_and_only_addressed_to_unity(self):
         participant=SimpleNamespace(publish_data=AsyncMock())
         relay=UnityRelay(participant,'secret','room','agent-appearance-one')

@@ -39,6 +39,31 @@ excluded from ASR and text input to prevent feedback. Disabling appearance
 restores the normal Hermes voice participant. System and renderer participants
 alone do not keep a room occupied.
 
+Unity voice uses a monotonic 20 ms sender clock that includes network publish
+time. The renderer plays PCM on a dedicated thread with a 120 ms jitter buffer,
+so rendering cadence does not clock speech. Signed generation changes flush
+interrupted speech; `audio-end` drains short utterances and the final buffered
+frames before speaking ends. Unity exposes underrun and dropped-frame counters
+on `UnityAgentConversation` for diagnosing transport or host stalls.
+
+The streamed character uses the editable Behavior Designer tree at
+`Assets/Resources/Config/Behaviors/MeetingAgentBehavior.asset`. Its room-local
+`ConversationState` blackboard selects Listening, Speaking, Thinking, or Idle.
+Listening has highest priority for accepted push-to-talk; working/initializing
+map to Thinking, and queued speech keeps Speaking active until playback drains.
+The animator controller and listening/thinking clips are beside the tree.
+Add future states as reactive branches with matching animator states; this does
+not require changing the audio transport. The default assets can be created from
+Unity's **MiRA > Agent > Create Default Meeting Behavior Assets** menu (existing
+assets are preserved).
+
+`MiRA.Meeting.Tests` covers real humanoid state transitions, room isolation,
+interruption, and buffered playback under 10 FPS packet delivery. Its optional
+LiveKit integration test reads a temporary connection JSON file from
+`MIRA_AUDIO_TEST_CONFIG` (`url`, `token`, `relay_key`) and requires a separate
+test-room sender emitting ten seconds of PCM. Keep credentials outside version
+control. Verify the received audio as well as Unity's zero-underrun counters.
+
 ## Invocation keyterms and shared meeting context
 
 MiRA transcribes every completed room utterance but normally creates a Hermes
