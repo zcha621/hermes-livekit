@@ -85,7 +85,7 @@ class SetupAssetTests(unittest.TestCase):
         self.assertIn("Install-MiraSoul", setup)
         self.assertIn('Join-Path $sourcePlugin "skills"', setup)
         self.assertIn(
-            '"adapter.py", "__init__.py", "itinerary_tools.py", "transcript_store.py"',
+            '"adapter.py", "unity_relay.py", "__init__.py", "itinerary_tools.py", "transcript_store.py"',
             setup,
         )
 

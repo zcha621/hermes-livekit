@@ -253,7 +253,7 @@ LIVE_ADAPTERS: "set[LiveKitAdapter]" = set()
 # hermesMeetingPolicy.ts HERMES_ROOM_RUNTIME). Besides its configured home
 # room, the adapter follows travellers into any room carrying it.
 HERMES_ROOM_RUNTIME = "hermes"
-NON_HUMAN_IDENTITY_PREFIXES = ("hermes-", "agent-", SIMULATED_AGENT_IDENTITY_PREFIX)
+NON_HUMAN_IDENTITY_PREFIXES = ("hermes-", "agent-", "system-unity-", SIMULATED_AGENT_IDENTITY_PREFIX)
 # livekit.protocol ParticipantInfo.Kind: INGRESS=1, EGRESS=2, AGENT=4.
 NON_HUMAN_PARTICIPANT_KINDS = frozenset({1, 2, 4})
 
@@ -2566,16 +2566,24 @@ class LiveKitAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     logger.debug("[%s] image stream topic %s unavailable: %s", self.name, topic, exc)
 
+            relay_identity = str((self.config.extra or {}).get("unity_renderer_identity") or "")
+            # Unity owns the agent participant. This service can subscribe and
+            # send private output, but cannot publish any media tracks.
+            # Its hidden grant is enforced by LiveKit, independent of client UI.
+            processor_identity = "system-unity-" + hashlib.sha256(self._room_name.encode()).hexdigest()[:16]
             # Create access token
             import json as _json
             token = (
                 AccessToken(api_key=self._api_key, api_secret=self._api_secret)
-                .with_identity(f"hermes-{self._agent_name.lower()}")
-                .with_name(self._agent_name)
+                .with_identity(processor_identity if relay_identity else f"hermes-{self._agent_name.lower()}")
+                .with_name("Conversation processor" if relay_identity else self._agent_name)
+                .with_metadata(_json.dumps({"type": "system", "role": "unity-conversation"}) if relay_identity else "")
                 .with_grants(VideoGrants(
                     room_join=True,
                     room=self._room_name,
-                    can_publish=True,
+                    can_publish=not bool(relay_identity),
+                    can_publish_data=True,
+                    hidden=bool(relay_identity),
                     can_subscribe=True,
                     can_update_own_metadata=True,
                 ))
@@ -2584,6 +2592,14 @@ class LiveKitAdapter(BasePlatformAdapter):
 
             # Connect to room
             await self._room.connect(self._url, jwt_token)
+            if relay_identity:
+                try:
+                    from .unity_relay import UnityRelay, UnityRelayRoom
+                except ImportError:
+                    from unity_relay import UnityRelay, UnityRelayRoom
+                relay = UnityRelay(self._room.local_participant, self._api_secret, self._room_name, relay_identity)
+                self._room = UnityRelayRoom(self._room, relay)
+                self._audio_source = relay
             await self._set_agent_state("initializing", force=True)
 
             # Set metadata (including avatar) after connecting — avoids JWT size limits
@@ -2594,18 +2610,19 @@ class LiveKitAdapter(BasePlatformAdapter):
             if metadata:
                 await self._room.local_participant.set_metadata(_json.dumps(metadata))
 
-            # Publish a local audio track for TTS playback
-            self._audio_source = rtc.AudioSource(SAMPLE_RATE, NUM_CHANNELS)
-            self._local_track = rtc.LocalAudioTrack.create_audio_track(
-                "hermes-voice", self._audio_source
-            )
-            options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
-            local_publication = await self._room.local_participant.publish_track(
-                self._local_track, options
-            )
-            self._local_audio_track_sid = str(
-                getattr(local_publication, "sid", "") or ""
-            )
+            if not relay_identity:
+                # Publish a local audio track for TTS playback
+                self._audio_source = rtc.AudioSource(SAMPLE_RATE, NUM_CHANNELS)
+                self._local_track = rtc.LocalAudioTrack.create_audio_track(
+                    "hermes-voice", self._audio_source
+                )
+                options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+                local_publication = await self._room.local_participant.publish_track(
+                    self._local_track, options
+                )
+                self._local_audio_track_sid = str(
+                    getattr(local_publication, "sid", "") or ""
+                )
 
             # Start silence detection loop
             self._silence_task = asyncio.create_task(self._check_silence_loop())
@@ -2839,6 +2856,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         attached only for an explicit visual reference or capture request.
         """
         identity = participant.identity
+        if identity == (self.config.extra or {}).get("unity_renderer_identity"):
+            return  # Never transcribe the agent's own relayed speech.
 
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             logger.info("[%s] Audio track subscribed: %s", self.name, identity)
@@ -3608,6 +3627,11 @@ class LiveKitAdapter(BasePlatformAdapter):
         participant_identity = str(
             getattr(participant, "identity", "") if participant is not None else ""
         ).strip()
+
+        if participant_identity == (self.config.extra or {}).get("unity_renderer_identity"):
+            if getattr(packet, "topic", "") == "mira-unity-ready":
+                asyncio.create_task(self._set_agent_state(self._agent_state, force=True))
+            return  # Unity is republishing our output, not a new user turn.
 
         raw_payload = b""
         try:
@@ -4899,6 +4923,7 @@ class MultiRoomLiveKitAdapter(LiveKitAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config)
         self._room_workers: Dict[str, RoomLiveKitAdapter] = {}
+        self._room_transports: Dict[str, str] = {}
         self._room_turn_tasks: Dict[asyncio.Task, RoomLiveKitAdapter] = {}
         self._turn_room = ContextVar("livekit_turn_room", default=None)
         # Lifecycle hooks operate on media workers, never this dispatcher.
@@ -4923,19 +4948,26 @@ class MultiRoomLiveKitAdapter(LiveKitAdapter):
         try:
             listed = await client.room.list_rooms(ListRoomsRequest())
             occupied = set()
+            transports = {}
             for room in listed.rooms:
                 if room.name != self._home_room_name and not _room_requests_hermes(room.metadata):
                     continue
                 response = await client.room.list_participants(ListParticipantsRequest(room=room.name))
+                metadata = json.loads(room.metadata or "{}")
+                renderer = str(metadata.get("unity_renderer_identity") or "") if metadata.get("agent_transport") == "unity" else ""
+                if metadata.get("agent_transport") == "unity" and (not renderer or not any(p.identity == renderer for p in response.participants)):
+                    continue  # Appearance mode waits for Unity; never join visibly.
                 if any(_is_human_participant(p) for p in response.participants):
                     occupied.add(room.name)
+                    transports[room.name] = renderer
+            self._room_transports = transports
             return occupied
         finally:
             await client.aclose()
 
     def _make_room_worker(self, name: str) -> RoomLiveKitAdapter:
         config = copy.deepcopy(self.config)
-        config.extra = {**(config.extra or {}), "room": name}
+        config.extra = {**(config.extra or {}), "room": name, "unity_renderer_identity": self._room_transports.get(name, "")}
         worker = RoomLiveKitAdapter(config)
         worker._room_supervisor = self
         worker.gateway_runner = getattr(self, "gateway_runner", None)
@@ -4967,7 +4999,8 @@ class MultiRoomLiveKitAdapter(LiveKitAdapter):
             worker = self._room_workers.get(name)
             if worker is not None:
                 worker.gateway_runner = getattr(self, "gateway_runner", None)
-                if worker._room is not None and worker._room.isconnected():
+                if (worker._room is not None and worker._room.isconnected()
+                        and (worker.config.extra or {}).get("unity_renderer_identity", "") == self._room_transports.get(name, "")):
                     continue
                 await self._remove_room_worker(name)
             worker = self._make_room_worker(name)

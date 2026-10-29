@@ -419,7 +419,7 @@ try {
 
     New-Item -ItemType Directory -Path $pluginsDir -Force | Out-Null
     if ($sourcePlugin -ne $targetPlugin) {
-        foreach ($runtimeFile in @("adapter.py", "__init__.py", "itinerary_tools.py", "transcript_store.py", "configure_yaml.py", "plugin.yaml", "LICENSE")) {
+        foreach ($runtimeFile in @("adapter.py", "unity_relay.py", "__init__.py", "itinerary_tools.py", "transcript_store.py", "configure_yaml.py", "plugin.yaml", "LICENSE")) {
             $runtimeSource = Join-Path $sourcePlugin $runtimeFile
             if (-not (Test-Path -LiteralPath $runtimeSource -PathType Leaf)) {
                 throw "Required plugin runtime file is missing: $runtimeSource"
@@ -439,7 +439,7 @@ try {
             Remove-Item -LiteralPath $targetPlugin -Recurse -Force
         }
         New-Item -ItemType Directory -Path $targetPlugin -Force | Out-Null
-        foreach ($runtimeFile in @("adapter.py", "__init__.py", "itinerary_tools.py", "transcript_store.py", "configure_yaml.py", "plugin.yaml", "LICENSE")) {
+        foreach ($runtimeFile in @("adapter.py", "unity_relay.py", "__init__.py", "itinerary_tools.py", "transcript_store.py", "configure_yaml.py", "plugin.yaml", "LICENSE")) {
             $runtimeSource = Join-Path $sourcePlugin $runtimeFile
             Copy-Item -LiteralPath $runtimeSource -Destination (Join-Path $targetPlugin $runtimeFile) -Force
         }

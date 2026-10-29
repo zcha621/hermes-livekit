@@ -29,9 +29,15 @@ Replies require the room's current occupancy epoch, so a delayed reply cannot
 reach a replacement occupancy. Removing one room cancels only its active turns.
 A failed room API poll preserves existing connections for the next retry.
 
-Unity's appearance participant is independent of Hermes and publishes camera
-video only. Appearance-enabled rooms retain their Hermes runtime marker.
-Renderer and Hermes participants alone do not keep a room occupied.
+In appearance-enabled rooms, Unity owns the only visible agent participant and
+publishes both camera and voice. Hermes uses a hidden, non-media-publishing
+processing connection and sends signed, private output to Unity. Room metadata
+selects this transport before users join; the processor waits for the assigned
+Unity identity and never falls back to a second visible agent. Unity republishes
+replies and status under the same identity as its media. Its own output is
+excluded from ASR and text input to prevent feedback. Disabling appearance
+restores the normal Hermes voice participant. System and renderer participants
+alone do not keep a room occupied.
 
 ## Invocation keyterms and shared meeting context
 
