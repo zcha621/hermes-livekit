@@ -14,6 +14,7 @@ conversation.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import uuid
@@ -49,6 +50,7 @@ def _tables():
         MetaData,
         String,
         Table,
+        UniqueConstraint,
     )
 
     metadata = MetaData()
@@ -57,6 +59,9 @@ def _tables():
         metadata,
         Column("session_id", String(36), primary_key=True),
         Column("livekit_room_name", String(255), nullable=False, unique=True),
+        Column("study_id", String(36), nullable=False),
+        Column("status", String(32), nullable=False),
+        Column("created_at", DateTime(timezone=True), nullable=False),
     )
     participants = Table(
         "mira_participant",
@@ -68,6 +73,9 @@ def _tables():
         Column("livekit_identity", String(255), nullable=True),
         Column("account_id", String(36), nullable=True),
         Column("created_at", DateTime(timezone=True), nullable=False),
+        UniqueConstraint("session_id", "pseudonym"),
+        UniqueConstraint("session_id", "livekit_identity"),
+        UniqueConstraint("session_id", "account_id"),
     )
     transcript_segments = Table(
         "mira_transcript_segment",
@@ -84,6 +92,7 @@ def _tables():
         Column("payload", JSON, nullable=False),
         Column("source_kind", String(16), nullable=False),
         Column("correlation_id", String(128), nullable=False),
+        UniqueConstraint("participant_id", "device_id", "sequence"),
     )
     return sessions, participants, transcript_segments
 
@@ -102,6 +111,7 @@ def _resolve_session_id(connection, sessions_table, room_name: str) -> Optional[
     portal write will update the row it finds.
     """
     from sqlalchemy import select, insert
+    from sqlalchemy.exc import IntegrityError
 
     row = connection.execute(
         select(sessions_table.c.session_id).where(
@@ -114,12 +124,16 @@ def _resolve_session_id(connection, sessions_table, room_name: str) -> Optional[
     # No session row yet — create one so the transcript can be written.
     session_id = str(uuid.uuid4())
     try:
-        connection.execute(
-            insert(sessions_table).values(
-                session_id=session_id,
-                livekit_room_name=room_name[:255],
+        with connection.begin_nested():
+            connection.execute(
+                insert(sessions_table).values(
+                    session_id=session_id,
+                    livekit_room_name=room_name[:255],
+                    study_id=str(uuid.uuid5(uuid.NAMESPACE_URL, "mira:livekit:ad-hoc")),
+                    status="active",
+                    created_at=datetime.now(timezone.utc),
+                )
             )
-        )
         logger.debug(
             "auto-provisioned mira_session %s for room %r", session_id, room_name
         )
@@ -127,7 +141,6 @@ def _resolve_session_id(connection, sessions_table, room_name: str) -> Optional[
     except Exception as exc:  # noqa: BLE001
         # IntegrityError (race: another writer beat us to it) or transient
         # DB error — re-read once.
-        connection.rollback()
         row = connection.execute(
             select(sessions_table.c.session_id).where(
                 sessions_table.c.livekit_room_name == room_name
@@ -159,7 +172,14 @@ def _resolve_participant_id(
     # mira_participant.participant_id (see adapter.py _source_chat_id) — trust
     # it directly rather than looking it up.
     if mira_conversation_id:
-        return mira_conversation_id
+        bound = connection.execute(
+            select(participants_table.c.participant_id).where(
+                (participants_table.c.participant_id == mira_conversation_id)
+                & (participants_table.c.session_id == session_id)
+            )
+        ).first()
+        if bound is not None:
+            return bound.participant_id
 
     existing = connection.execute(
         select(participants_table.c.participant_id).where(
@@ -175,21 +195,22 @@ def _resolve_participant_id(
     # Provision a lightweight row so the transcript still has a speaker.
     new_id = str(uuid.uuid4())
     try:
-        connection.execute(
-            insert(participants_table).values(
-                participant_id=new_id,
-                session_id=session_id,
-                pseudonym=display_name[:128] or identity[:128] or "Participant",
-                role=role,
-                livekit_identity=identity,
-                account_id=None,
-                created_at=datetime.now(timezone.utc),
+        with connection.begin_nested():
+            connection.execute(
+                insert(participants_table).values(
+                    participant_id=new_id,
+                    session_id=session_id,
+                    pseudonym=(display_name[:100] or identity[:100] or "Participant")
+                    + "~" + hashlib.sha256(identity.encode()).hexdigest()[:12],
+                    role=role,
+                    livekit_identity=identity,
+                    account_id=None,
+                    created_at=datetime.now(timezone.utc),
+                )
             )
-        )
         return new_id
     except IntegrityError:
         # Lost a race with another concurrent insert for this identity.
-        connection.rollback()
         existing = connection.execute(
             select(participants_table.c.participant_id).where(
                 (participants_table.c.session_id == session_id)
@@ -265,7 +286,7 @@ def record_transcript_segment(entry: Dict[str, Any], *, room_name: str, mira_con
                     schema_name=_SCHEMA_NAME,
                     occurred_at=occurred_at,
                     received_at=now,
-                    device_id=identity[:128] or "livekit-voice",
+                    device_id=str(entry.get("stream_id") or identity or "livekit-voice")[:128],
                     sequence=int(entry.get("sequence") or 0),
                     payload={
                         "text": text,

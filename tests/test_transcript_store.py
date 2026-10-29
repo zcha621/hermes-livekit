@@ -41,7 +41,9 @@ class TranscriptStoreTests(unittest.TestCase):
         with self.engine.begin() as connection:
             connection.execute(
                 insert(self._sessions).values(
-                    session_id=session_id, livekit_room_name=room_name
+                    session_id=session_id, livekit_room_name=room_name,
+                    study_id="00000000-0000-0000-0000-000000000001",
+                    status="active", created_at=datetime.now(timezone.utc),
                 )
             )
         return session_id
@@ -99,9 +101,15 @@ class TranscriptStoreTests(unittest.TestCase):
         self.assertEqual(len(sessions), 1)
         self.assertEqual(len(rows), 2)
 
-    def test_trusts_mira_conversation_id_as_participant_id(self):
-        self._seed_session("room-1")
+    def test_uses_room_bound_mira_conversation_id_as_participant_id(self):
+        session_id = self._seed_session("room-1")
         participant_id = "22222222-2222-2222-2222-222222222222"
+        from sqlalchemy import insert
+        with self.engine.begin() as connection:
+            connection.execute(insert(self._participants).values(
+                participant_id=participant_id, session_id=session_id, pseudonym="Alice",
+                role="tourist", livekit_identity="alice", created_at=datetime.now(timezone.utc),
+            ))
 
         transcript_store.record_transcript_segment(
             self._entry(),
@@ -156,6 +164,43 @@ class TranscriptStoreTests(unittest.TestCase):
                 )
             ).all()
         self.assertEqual(len(participants), 1)
+
+    def test_duplicate_display_names_do_not_drop_other_speaker(self):
+        self._seed_session()
+        for identity in ("phone-alice", "browser-alice"):
+            transcript_store.record_transcript_segment(
+                self._entry(identity=identity, name="Alice"), room_name="room-1")
+        from sqlalchemy import select
+        with self.engine.connect() as connection:
+            rows = connection.execute(select(self._transcript_segments)).all()
+        self.assertEqual({r.payload["speaker_id"] for r in rows}, {"phone-alice", "browser-alice"})
+
+    def test_reconnected_stream_sequence_can_restart(self):
+        self._seed_session()
+        for stream in ("occupancy-one", "occupancy-two"):
+            transcript_store.record_transcript_segment(
+                self._entry(sequence=1, stream_id=stream), room_name="room-1")
+        from sqlalchemy import select
+        with self.engine.connect() as connection:
+            rows = connection.execute(select(self._transcript_segments)).all()
+        self.assertEqual(len(rows), 2)
+
+    def test_session_insert_race_preserves_outer_transaction(self):
+        from sqlalchemy import insert, select
+        session_id = self._seed_session()
+        with self.engine.begin() as connection:
+            execute = connection.execute
+            calls = 0
+            def race(statement, *args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return execute(select(self._sessions).where(self._sessions.c.session_id == "missing"))
+                return execute(statement, *args, **kwargs)
+            with patch.object(connection, "execute", side_effect=race):
+                resolved = transcript_store._resolve_session_id(connection, self._sessions, "room-1")
+            self.assertEqual(resolved, session_id)
+            self.assertEqual(connection.execute(select(self._sessions.c.session_id)).scalar_one(), session_id)
 
 
 if __name__ == "__main__":

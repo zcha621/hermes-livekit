@@ -1963,7 +1963,7 @@ class RoomTranscriptContextTests(unittest.TestCase):
         self.assertIn("[5]", result)
         self.assertIn("[10]", result)
 
-    def test_merge_deduplicates_by_sequence(self):
+    def test_merge_deduplicates_same_segment(self):
         """DB rows already in the in-memory list are not duplicated."""
         adapter = self._adapter()
         adapter._conversation_transcript = [
@@ -1973,7 +1973,7 @@ class RoomTranscriptContextTests(unittest.TestCase):
         ]
         # DB has the same sequence 7 — it should NOT appear twice
         db_entries = [
-            {"sequence": 7, "occurred_at": "t7", "speaker": "Alice",
+            {"sequence": 7, "occurred_at": "t7", "speaker": "Alice", "identity": "alice",
              "role": "user", "text": "I am already here"},
             {"sequence": 3, "occurred_at": "t3", "speaker": "Carol",
              "role": "user", "text": "From before"},
@@ -1984,6 +1984,17 @@ class RoomTranscriptContextTests(unittest.TestCase):
         # Carol (seq 3, prior) should be present
         self.assertIn("Carol", result)
         self.assertIn("[3]", result)
+
+    def test_reused_sequence_does_not_hide_prior_speaker(self):
+        adapter = self._adapter()
+        adapter._conversation_transcript = [{
+            "sequence": 1, "name": "Alice", "identity": "alice", "timestamp": "new",
+            "role": "user", "text": "New visit", "kind": "speech"}]
+        context = adapter._merge_db_transcript_into_context([{
+            "sequence": 1, "occurred_at": "old", "speaker": "Bob", "identity": "bob",
+            "role": "user", "text": "I suggested the museum"}])
+        self.assertIn("I suggested the museum", context)
+        self.assertIn("New visit", context)
 
     def test_merge_respects_char_budget(self):
         adapter = self._adapter()
@@ -2106,3 +2117,93 @@ class VoiceProfileScopeTests(unittest.IsolatedAsyncioTestCase):
             ))
         self.assertCountEqual(observed, [('alice', 'alice'), ('bob', 'bob')])
         self.assertEqual(active.get(), 'base')
+
+
+class SharedMapAndPhoneCameraTests(unittest.TestCase):
+    def setUp(self):
+        self.adapter = make_adapter()
+        self.addCleanup(livekit_adapter.LIVE_ADAPTERS.discard, self.adapter)
+
+    def test_shared_questions_choose_phone_camera_but_explicit_self_view_does_not(self):
+        now = time.monotonic()
+        self.adapter._video_track_meta = {
+            "phone": ("phone-user", "source_camera"), "web": ("web-user", "source_camera")}
+        self.adapter._latest_video_frames = {
+            "phone": (b"phone-view", now, "source_camera", 640, 480),
+            "web": (b"web-view", now + .1, "source_camera", 640, 480)}
+        self.adapter._participant_connection_metadata = lambda who: (
+            {"aware_device_id": "onsite-device"} if who == "phone-user" else {})
+        with patch.object(self.adapter, "_queue_latest_video_frame") as capture:
+            self.adapter._queue_video_for_text("What can you see?", "web-user")
+            capture.assert_called_with("phone-user", preferred_source="camera")
+            self.adapter._queue_video_for_text("Look at my camera", "web-user")
+            capture.assert_called_with("web-user", preferred_source="camera")
+            self.adapter._queue_video_for_text("Look at the shared screen", "web-user")
+            capture.assert_called_with("web-user", preferred_source="screen")
+
+    def test_stale_phone_camera_does_not_displace_fresh_speaker_video(self):
+        self.adapter._video_track_meta = {"phone": ("phone-user", "source_camera")}
+        self.adapter._latest_video_frames = {
+            "phone": (b"old", time.monotonic() - 3600, "source_camera", 640, 480)}
+        self.adapter._participant_connection_metadata = lambda who: {"aware_device_id": "phone"}
+        with patch.object(self.adapter, "_queue_latest_video_frame") as capture:
+            self.adapter._queue_video_for_text("What can you see?", "web-user")
+            capture.assert_called_with("web-user", preferred_source="")
+
+    def test_map_context_refreshes_active_tags_location_and_full_itinerary(self):
+        state = {"latest_location": {"longitude": 174.76, "is_stale": False},
+                 "tags": [{"note": "Old tag"}], "itinerary": {"items": [{"activity": "Walk"}]}}
+        seen = []
+        def fetch(room):
+            seen.append(room)
+            return state
+        with patch.dict(sys.modules, {"room_map": SimpleNamespace(fetch_room_map=fetch)}):
+            first = self.adapter._shared_map_context()
+            state["tags"] = [{"note": "New tag"}]
+            state["latest_location"]["longitude"] = 174.77
+            second = self.adapter._shared_map_context()
+        self.assertIn("Old tag", first)
+        self.assertNotIn("Old tag", second)
+        self.assertIn("New tag", second)
+        self.assertIn("174.77", second)
+        self.assertIn('"activity": "Walk"', second)
+        self.assertEqual(seen, [self.adapter._room_name, self.adapter._room_name])
+
+
+class SharedMeetingContextIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_remote_turn_receives_both_speakers_phone_frame_and_current_map(self):
+        adapter = authorize_unflagged_participants(make_adapter())
+        self.addCleanup(livekit_adapter.LIVE_ADAPTERS.discard, adapter)
+        adapter._room = SimpleNamespace(remote_participants={
+            "phone": SimpleNamespace(name="On-site traveller", metadata=json.dumps({"aware_device_id": "phone-device"})),
+            "browser": SimpleNamespace(name="Remote traveller", metadata="{}"),
+        })
+        adapter._auto_vision = True
+        adapter._load_agent_profile = lambda _: None
+        adapter._publish_transcript_entry = AsyncMock()
+        adapter._publish_agent_event = AsyncMock()
+        adapter._set_agent_state = AsyncMock()
+        adapter._fetch_room_transcript = lambda _: []
+        adapter._drain_place_tag_nudges = lambda: ""
+        now = time.monotonic()
+        adapter._video_track_meta = {"phone-track": ("phone", "camera"), "web-track": ("browser", "camera")}
+        adapter._latest_video_frames = {
+            "phone-track": (b"actual-phone-frame", now, "camera", 640, 480),
+            "web-track": (b"browser-frame", now+.01, "camera", 640, 480),
+        }
+        ambient = adapter._build_spoken_transcript_event("I would like to visit the museum", "phone")
+        self.assertFalse(await adapter._prepare_invoked_event(ambient))
+        state = {"latest_location": {"longitude": 174.77, "is_stale": False},
+                 "tags": [{"note": "Meet at the cafe"}], "itinerary": {"items": [{"activity": "Harbour walk"}]}}
+        with patch.dict(sys.modules, {"room_map": SimpleNamespace(fetch_room_map=lambda _: state)}):
+            event = adapter._build_spoken_transcript_event("What can you see, and how does it fit our plan?", "browser")
+            self.addCleanup(Path(event.media_urls[0]).unlink, missing_ok=True)
+            self.assertTrue(await adapter._prepare_invoked_event(event, force_invoke=True))
+            self.assertEqual(Path(event.media_urls[0]).read_bytes(), b"actual-phone-frame")
+            for expected in ("visit the museum", "Remote traveller", "174.77", "Meet at the cafe",
+                             "Harbour walk", "on-site Android phone"):
+                self.assertIn(expected, event.channel_prompt)
+            state["tags"] = []
+            followup = adapter._build_spoken_transcript_event("Any map updates?", "browser")
+            self.assertTrue(await adapter._prepare_invoked_event(followup, force_invoke=True))
+            self.assertNotIn("Meet at the cafe", followup.channel_prompt)
