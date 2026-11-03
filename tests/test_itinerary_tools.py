@@ -251,10 +251,10 @@ class BackendAuthorizationTests(unittest.TestCase):
             serialization.PrivateFormat.PKCS8,
             serialization.NoEncryption(),
         )
-        with tempfile.NamedTemporaryFile(suffix=".pem") as handle:
-            handle.write(pem)
-            handle.flush()
-            env = {"MIRA_AUTH_PRIVATE_KEY_PATH": handle.name, "MIRA_AUTH_KEY_ID": "kid-1"}
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "key.pem"
+            key_path.write_bytes(pem)
+            env = {"MIRA_AUTH_PRIVATE_KEY_PATH": str(key_path), "MIRA_AUTH_KEY_ID": "kid-1"}
             with patch.dict("os.environ", env):
                 header = tools._worker_authorization_header()
         token = header.removeprefix("Bearer ")

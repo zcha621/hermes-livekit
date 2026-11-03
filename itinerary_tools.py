@@ -4,10 +4,8 @@ Registered directly (not through the hermes-mira-context MCP server) because
 the model driving this plugin's realtime LiveKit route has never once
 successfully invoked an MCP-prefixed tool (``mcp__hermes_mira_context__*``)
 in this deployment's history, while natively-registered tools are called
-reliably. The MCP server still owns the read-only lookups
-(get_confirmed_itinerary, get_traveller_location, get_meeting_transcript) —
-those are lower-stakes if occasionally skipped. Saving a draft is not, so
-that write path gets the native tool's reliability instead.
+reliably. Read-only context also has native tools in context_tools.py,
+and the adapter automatically supplies fresh database context each turn.
 
 Talks to the same tourism-ai-backend endpoint
 (``POST /gateway/planning-workspace``) the hermes-mira-context MCP server

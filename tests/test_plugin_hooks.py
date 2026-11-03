@@ -20,9 +20,9 @@ spec.loader.exec_module(plugin)
 
 
 class PluginHookTests(unittest.IsolatedAsyncioTestCase):
-    def test_platform_hint_describes_transport_without_injecting_domain_policy(self):
-        self.assertIn("Hermes conversation", plugin._LIVEKIT_PLATFORM_HINT)
-        self.assertIn("Decide whether and when", plugin._LIVEKIT_PLATFORM_HINT)
+    def test_platform_hint_requires_database_context_independent_of_soul(self):
+        self.assertIn("independent of SOUL", plugin._LIVEKIT_PLATFORM_HINT)
+        self.assertIn("For explicit location or time questions", plugin._LIVEKIT_PLATFORM_HINT)
         self.assertIn("MCP servers", plugin._LIVEKIT_PLATFORM_HINT)
         self.assertIn("/no_think", plugin._LIVEKIT_PLATFORM_HINT)
         self.assertNotIn("Aotearoa New Zealand", plugin._LIVEKIT_PLATFORM_HINT)
@@ -37,17 +37,13 @@ class PluginHookTests(unittest.IsolatedAsyncioTestCase):
             "mira-new-zealand-tourism", plugin._TOURISM_SKILL_PATH
         )
         context.register_platform.assert_called_once()
-        # Read-only itinerary/location/transcript lookups are served by the
-        # hermes-mira-context MCP server. Saving/confirming an itinerary is
-        # registered here as native tools instead (see itinerary_tools.py)
-        # because MCP-prefixed tools are never reliably invoked by this
-        # deployment's model.
+        # Read and write capabilities register independently of any SOUL file.
         registered_tool_names = [
             call.kwargs.get("name", call.args[0] if call.args else None)
             for call in context.register_tool.call_args_list
         ]
         self.assertEqual(
-            registered_tool_names, ["save_itinerary_draft", "confirm_itinerary_draft"]
+            registered_tool_names, ["save_itinerary_draft", "confirm_itinerary_draft", "get_confirmed_itinerary", "get_traveller_location", "get_meeting_transcript"]
         )
         hook_names = [call.args[0] for call in context.register_hook.call_args_list]
         self.assertEqual(

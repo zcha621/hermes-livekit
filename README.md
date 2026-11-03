@@ -577,3 +577,23 @@ The profile reconciler writes each agent's `tts.openai.voice` in its own
 `config.yaml`. The LiveKit adapter keeps the background reply (including
 post-handler auto-TTS) inside the routed profile's runtime scope, so concurrent
 rooms use their respective voices and credentials.
+
+
+### Built-in meeting context
+
+Every invoked meeting turn reads the database-backed Android phone snapshot,
+saved room itinerary and speaker-labelled meeting transcript before the model
+runs. These capabilities are plugin behavior and do not depend on SOUL.md.
+Location/time answers use the phone measurement timestamp, accuracy and staleness;
+the backend calculates current local time from the GPS coordinates and IANA zone,
+including daylight saving. The browser map viewport is never a location source.
+A missing or withdrawn phone share stays unavailable; delayed AWARE batches do
+not replace it. A stale fix and its timezone describe only the last-known place.
+
+Native `get_traveller_location`, `get_confirmed_itinerary` and
+`get_meeting_transcript` tools can refresh/expand the context. They take no room,
+account or device identifiers: the gateway binds them to the active room for the
+entire model/tool loop, including concurrent meetings. Transcript `limit` is
+bounded to 500. The profile reconciler enables the plugin toolset for every
+profile, including profiles with a blank or edited SOUL. The MCP location tool
+also accepts `room_name` to use the same consent-aware phone snapshot.

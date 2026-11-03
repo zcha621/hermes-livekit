@@ -13,6 +13,8 @@ import gateway.config as gateway_config
 from gateway.config import PlatformConfig
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+if str(PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_ROOT))
 ADAPTER_SPEC = importlib.util.spec_from_file_location(
     "hermes_livekit_adapter_test", PLUGIN_ROOT / "adapter.py"
 )

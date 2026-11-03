@@ -176,7 +176,16 @@ already transcribed, and a recent camera or shared-screen frame may be attached
 when the participant explicitly refers to visual context. Traveller context —
 their confirmed itinerary, current location and local time, and earlier speech
 from this meeting — is available through the hermes-mira-context MCP server's
-tools, alongside Hermes's normal tools, skills, and other MCP servers. Decide whether and when to use them exactly as in any other Hermes conversation.
+tools and built-in get_confirmed_itinerary, get_traveller_location and
+get_meeting_transcript tools, alongside Hermes's normal tools, skills, and other
+MCP servers. These basic capabilities are independent of SOUL/persona settings.
+Fresh database phone GPS, local time and the saved plan are supplied each turn.
+For explicit location or time questions, use that fresh database result or call
+get_traveller_location again. Never infer the traveller's location from a browser
+map viewport, camera, persona or past conversation. Distinguish the on-site phone
+participant from the remote speaker; report stale fixes as last known and missing
+GPS as unavailable. Refer to the saved itinerary for planning and use the
+speaker-labelled meeting transcript to recall what participants said.
 For this realtime Qwen route, respond without extended reasoning so a selected
 tool can start immediately.
 /no_think"""
@@ -320,9 +329,7 @@ def register(ctx) -> None:
     # Itinerary save/confirm as native tools, not MCP: this deployment's
     # model has never once successfully invoked an MCP-prefixed tool, while
     # natively-registered tools are called reliably (see itinerary_tools.py's
-    # docstring for the evidence). Read-only lookups (get_confirmed_itinerary,
-    # get_traveller_location, get_meeting_transcript) still come from the
-    # hermes-mira-context MCP server — lower-stakes if occasionally skipped.
+    # docstring for the evidence).
     try:
         try:
             from .itinerary_tools import register_tools
@@ -332,9 +339,14 @@ def register(ctx) -> None:
     except Exception:
         logger.exception("could not register the itinerary save/confirm tools")
 
-    # No backend orchestration hooks are registered. LiveKit and Discord use
-    # Hermes's normal model loop, and context/action calls occur only when
-    # Hermes selects a registered tool. The post-API hook only normalizes the
+    try:
+        from .context_tools import register_tools as register_context_tools
+    except ImportError:
+        from context_tools import register_tools as register_context_tools
+    register_context_tools(ctx)
+
+    # The adapter supplies fresh database context independently of tool choice.
+    # Hermes owns the normal model/tool loop. The post-API hook normalizes the
     # configured Qwen server's text-encoded tool-call wire format; the lifecycle
     # hook releases in-flight futures during reset.
     try:
