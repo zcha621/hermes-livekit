@@ -20,6 +20,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+
+try:
+    from gateway.platforms._shared import get_scoped_secret as _getenv
+except ImportError:  # Hermes releases before profile-scoped credentials.
+    _getenv = os.getenv
 import re
 import time
 import urllib.error
@@ -351,7 +356,7 @@ _WORKER_SCOPES = ("accounts:read", "accounts:write", "itinerary:read")
 
 
 def _configured(name: str) -> str:
-    value = os.getenv(name, "").strip()
+    value = _getenv(name, "").strip()
     # Hermes leaves an unset ${VAR} placeholder in place; treat it as unset.
     return "" if value.startswith("${") else value
 
@@ -389,7 +394,7 @@ def _worker_authorization_header() -> str | None:
 
 
 def _backend_base_url() -> str:
-    return os.getenv("MIRA_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
+    return _getenv("MIRA_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 
 
 def _post_gateway_command(command: dict) -> dict:

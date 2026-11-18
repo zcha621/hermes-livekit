@@ -17,6 +17,11 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+
+try:
+    from gateway.platforms._shared import get_scoped_secret as _getenv
+except ImportError:  # Hermes releases before profile-scoped credentials.
+    _getenv = os.getenv
 import uuid
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -30,7 +35,7 @@ _SCHEMA_NAME = "livekit-transcript.v1"
 @lru_cache(maxsize=1)
 def _engine():
     """Lazily build the SQLAlchemy engine — import cost paid only if used."""
-    database_url = os.getenv("MIRA_DATABASE_URL", "").strip()
+    database_url = _getenv("MIRA_DATABASE_URL", "").strip()
     if not database_url:
         return None
     try:

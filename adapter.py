@@ -1,4 +1,4 @@
-﻿"""LiveKit voice platform adapter using WebRTC.
+"""LiveKit voice platform adapter using WebRTC.
 
 Joins a LiveKit room as a participant, transcribes inbound audio via
 Hermes's STT pipeline, feeds transcripts into the agent loop, and publishes
@@ -21,6 +21,11 @@ import json
 import logging
 import math
 import os
+
+try:
+    from gateway.platforms._shared import get_scoped_secret as _getenv
+except ImportError:  # Hermes releases before profile-scoped credentials.
+    _getenv = os.getenv
 import random
 import re
 import struct
@@ -106,7 +111,7 @@ logger = logging.getLogger("gateway.platforms.livekit")
 # Unset → inherit from hermes's root logger config (INFO under the standard
 # gateway setup), matching every other built-in adapter.
 def _apply_env_log_level() -> None:
-    raw = os.getenv("HERMES_LIVEKIT_LOG_LEVEL", "").strip()
+    raw = _getenv("HERMES_LIVEKIT_LOG_LEVEL", "").strip()
     if not raw:
         return
     try:
@@ -317,12 +322,12 @@ def select_target_room(
 
 
 def check_livekit_requirements() -> bool:
-    """Check if LiveKit dependencies are available and configured."""
-    if not LIVEKIT_AVAILABLE or not LIVEKIT_API_AVAILABLE:
-        return False
-    if not os.getenv("LIVEKIT_URL") or not os.getenv("LIVEKIT_API_KEY") or not os.getenv("LIVEKIT_API_SECRET"):
-        return False
-    return True
+    """Probe SDKs without requiring credentials in the dependency-check scope.
+
+    Hermes can run this probe outside the adapter's profile scope. Transport
+    credentials are resolved into PlatformConfig and validated by connect().
+    """
+    return LIVEKIT_AVAILABLE and LIVEKIT_API_AVAILABLE
 
 
 def _compute_rms(pcm_data: bytes) -> float:
@@ -369,15 +374,15 @@ class LiveKitAdapter(BasePlatformAdapter):
         super().__init__(config, Platform("livekit"))
 
         extra = config.extra or {}
-        self._url: str = extra.get("url") or os.getenv("LIVEKIT_URL", "")
-        self._api_key: str = extra.get("api_key") or os.getenv("LIVEKIT_API_KEY", "")
-        self._api_secret: str = extra.get("api_secret") or os.getenv("LIVEKIT_API_SECRET", "")
-        self._room_name: str = extra.get("room") or os.getenv("LIVEKIT_ROOM", "hermes")
+        self._url: str = extra.get("url") or _getenv("LIVEKIT_URL", "")
+        self._api_key: str = extra.get("api_key") or _getenv("LIVEKIT_API_KEY", "")
+        self._api_secret: str = extra.get("api_secret") or _getenv("LIVEKIT_API_SECRET", "")
+        self._room_name: str = extra.get("room") or _getenv("LIVEKIT_ROOM", "hermes")
         # The configured room is only Hermes's home; ``_room_name`` tracks the
         # room it is currently serving (see ``select_target_room``).
         self._home_room_name: str = self._room_name
-        self._agent_name: str = extra.get("agent_name") or os.getenv("LIVEKIT_AGENT_NAME", "Hermes")
-        self._agent_avatar: str = extra.get("agent_avatar") or os.getenv("LIVEKIT_AGENT_AVATAR", "") or self._find_default_avatar()
+        self._agent_name: str = extra.get("agent_name") or _getenv("LIVEKIT_AGENT_NAME", "Hermes")
+        self._agent_avatar: str = extra.get("agent_avatar") or _getenv("LIVEKIT_AGENT_AVATAR", "") or self._find_default_avatar()
 
         audio_config = extra.get("audio") if isinstance(extra.get("audio"), dict) else {}
         vision_config = extra.get("vision") if isinstance(extra.get("vision"), dict) else {}
@@ -1028,7 +1033,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         not cache them; the diags returned here are for the non-exception
         branches only.
         """
-        database_url = os.getenv("MIRA_AGENT_DATABASE_URL", "").strip()
+        database_url = _getenv("MIRA_AGENT_DATABASE_URL", "").strip()
         if not database_url:
             return None, "no-agent-db-url"
         try:
@@ -1217,7 +1222,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         status bar without host access. The build marker also proves which
         adapter commit is running: if the expected marker is absent, the
         gateway is still on pre-raw-SQL code (the deploy did not reach it)."""
-        database_url = os.getenv("MIRA_AGENT_DATABASE_URL", "").strip()
+        database_url = _getenv("MIRA_AGENT_DATABASE_URL", "").strip()
         # Three URL shapes: scheme://user[:pass]@host[:port]/db,
         # scheme://host[:port]/db, or scheme://host/db. The user group is
         # optional so a host-only URL still surfaces the database name.
@@ -1271,7 +1276,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         when schema introspection is unavailable and only selects columns that
         exist on the deployed schema.
         """
-        database_url = os.getenv("MIRA_AGENT_DATABASE_URL", "").strip()
+        database_url = _getenv("MIRA_AGENT_DATABASE_URL", "").strip()
         if not database_url:
             self._room_agent_diag = "no-agent-db-url"
             return None
@@ -1607,7 +1612,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         display name; it never writes and never blocks the event loop
         (callers run it via ``asyncio.to_thread``).
         """
-        database_url = os.getenv("MIRA_DATABASE_URL", "").strip()
+        database_url = _getenv("MIRA_DATABASE_URL", "").strip()
         if not database_url:
             return []
         room_name = self._room_name
@@ -1787,7 +1792,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._place_tag_nudge_redis_tried = True
         if not REDIS_AVAILABLE:
             return None
-        url = os.getenv("MIRA_REDIS_URL", "").strip() or DEFAULT_PLACE_TAG_NUDGE_REDIS_URL
+        url = _getenv("MIRA_REDIS_URL", "").strip() or DEFAULT_PLACE_TAG_NUDGE_REDIS_URL
         try:
             client = _redis_lib.Redis.from_url(
                 url, decode_responses=True, socket_connect_timeout=1, socket_timeout=1
@@ -1811,7 +1816,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         ``MIRA_DATABASE_URL``, no SQLAlchemy, no matching row, or a query
         error). Best-effort — a miss simply means no reminder this turn.
         """
-        database_url = os.getenv("MIRA_DATABASE_URL", "").strip()
+        database_url = _getenv("MIRA_DATABASE_URL", "").strip()
         if not database_url:
             return None
         room_name = self._room_name
@@ -1876,7 +1881,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         Returns ``[]`` on any failure; callers fall back to the nudge's
         (possibly empty) fields.
         """
-        database_url = os.getenv("MIRA_DATABASE_URL", "").strip()
+        database_url = _getenv("MIRA_DATABASE_URL", "").strip()
         if not database_url or not tag_ids:
             return []
         try:
@@ -2398,7 +2403,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         LiveKit Cloud hosts on ``*.livekit.cloud``; anything else is treated
         as a self-hosted deployment and gets the faster default.
         """
-        override = os.getenv("LIVEKIT_PRESENCE_POLL_INTERVAL", "").strip()
+        override = _getenv("LIVEKIT_PRESENCE_POLL_INTERVAL", "").strip()
         if override:
             try:
                 parsed = float(override)
@@ -2415,7 +2420,7 @@ class LiveKitAdapter(BasePlatformAdapter):
 
     def _resolve_tool_call_timeout(self) -> float:
         """Per-call timeout for remote tools. HERMES_LIVEKIT_TOOL_TIMEOUT_SEC overrides."""
-        raw = os.getenv("HERMES_LIVEKIT_TOOL_TIMEOUT_SEC", "").strip()
+        raw = _getenv("HERMES_LIVEKIT_TOOL_TIMEOUT_SEC", "").strip()
         if raw:
             try:
                 parsed = float(raw)
@@ -2701,7 +2706,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             # profile applied, ask the LLM for a name. Skipped when a
             # room-bound profile exists — its display name wins and must not
             # be clobbered by a random LLM-chosen name.
-            if not room_profile_bound and not os.getenv("LIVEKIT_AGENT_NAME") \
+            if not room_profile_bound and not _getenv("LIVEKIT_AGENT_NAME") \
                     and not (self.config.extra or {}).get("agent_name"):
                 asyncio.create_task(self._resolve_agent_name())
 

@@ -8,6 +8,11 @@ point uses an existing ``register_platform()`` hook.
 import json
 import logging
 import os
+
+try:
+    from gateway.platforms._shared import get_scoped_secret as _getenv
+except ImportError:  # Hermes releases before profile-scoped credentials.
+    _getenv = os.getenv
 import re
 import uuid
 from pathlib import Path
@@ -199,19 +204,19 @@ def _env_enablement() -> Optional[dict]:
     instantiating the LiveKit SDK. Returns ``None`` when LiveKit isn't
     minimally configured; the caller skips auto-enabling.
     """
-    url = (os.getenv("LIVEKIT_URL") or "").strip()
-    api_key = (os.getenv("LIVEKIT_API_KEY") or "").strip()
-    api_secret = (os.getenv("LIVEKIT_API_SECRET") or "").strip()
+    url = (_getenv("LIVEKIT_URL") or "").strip()
+    api_key = (_getenv("LIVEKIT_API_KEY") or "").strip()
+    api_secret = (_getenv("LIVEKIT_API_SECRET") or "").strip()
     if not (url and api_key and api_secret):
         return None
 
-    room = os.getenv("LIVEKIT_ROOM", "hermes")
+    room = _getenv("LIVEKIT_ROOM", "hermes")
     seed: dict = {
         "url": url,
         "api_key": api_key,
         "api_secret": api_secret,
         "room": room,
-        "agent_avatar": os.getenv("LIVEKIT_AGENT_AVATAR", ""),
+        "agent_avatar": _getenv("LIVEKIT_AGENT_AVATAR", ""),
     }
 
     # Do not seed agent_name here. Hermes applies this mapping with
@@ -224,12 +229,12 @@ def _env_enablement() -> Optional[dict]:
     # channel by definition. Default LIVEKIT_HOME_CHANNEL to LIVEKIT_ROOM
     # unless explicitly overridden — keeps cron / cross-platform delivery
     # sensible without requiring the user to duplicate the value.
-    home = (os.getenv("LIVEKIT_HOME_CHANNEL") or room).strip()
+    home = (_getenv("LIVEKIT_HOME_CHANNEL") or room).strip()
     if home:
         os.environ.setdefault("LIVEKIT_HOME_CHANNEL", home)
         seed["home_channel"] = {
             "chat_id": home,
-            "name": os.getenv("LIVEKIT_HOME_CHANNEL_NAME", "Home"),
+            "name": _getenv("LIVEKIT_HOME_CHANNEL_NAME", "Home"),
         }
     return seed
 

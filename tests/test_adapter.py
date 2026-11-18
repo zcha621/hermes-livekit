@@ -30,6 +30,29 @@ gateway_config._Platform__bundled_plugin_names = (
 ) | {"livekit"}
 
 
+class ProfileCredentialTests(unittest.TestCase):
+    def test_livekit_uses_profile_credentials_without_process_environment(self):
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+        credentials = {
+            "LIVEKIT_URL": "wss://profile.example.invalid",
+            "LIVEKIT_API_KEY": "profile-key",
+            "LIVEKIT_API_SECRET": "profile-secret",
+        }
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(livekit_adapter, "LIVEKIT_AVAILABLE", True), \
+                patch.object(livekit_adapter, "LIVEKIT_API_AVAILABLE", True):
+            token = set_secret_scope(credentials)
+            try:
+                self.assertTrue(livekit_adapter.check_livekit_requirements())
+                adapter = livekit_adapter.LiveKitAdapter(PlatformConfig(enabled=True))
+                self.assertEqual(adapter._url, credentials["LIVEKIT_URL"])
+                self.assertEqual(adapter._api_key, credentials["LIVEKIT_API_KEY"])
+                self.assertEqual(adapter._api_secret, credentials["LIVEKIT_API_SECRET"])
+            finally:
+                reset_secret_scope(token)
+
+
 class EmptyAppearanceRoomTests(unittest.IsolatedAsyncioTestCase):
     async def test_presence_poll_releases_room_after_last_human_and_renderer_leave(self):
         adapter = make_adapter()
