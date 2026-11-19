@@ -42,6 +42,11 @@ leaked tool invocations, and context-compaction chatter before chat or TTS.
 Pre-generated audio requires a known, clean speech script; unsafe audio is
 discarded rather than played with a sanitized caption. Old internal assistant
 transcripts remain in the audit store but are excluded from prompt context.
+The newer Hermes runner's captionless auto-voice path is bridged through the
+same preparation step before synthesis. Its verified script stays local to
+the active task and room, so ordinary replies play without accepting unknown
+audio or mixing concurrent conversations. `tests/test_runner_voice.py` exercises
+the installed runner's synthesis and delivery methods, not just adapter mocks.
 `tests/manual_owner_presence.py` verifies departure/rejoin and output delivery
 in a temporary synthetic room against a real LiveKit server.
 

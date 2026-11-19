@@ -238,6 +238,49 @@ def _meeting_output_text(text: str) -> str:
         return ""
     return text.strip()
 
+
+# The runner's text-input auto-voice path bypasses prepare_tts_text and sends
+# captionless files. Keep the verified script in the synthesis task's context,
+# never in another room's mutable preparation cache.
+_runner_voice_script = ContextVar("livekit_runner_voice_script", default=None)
+
+
+def _install_runner_voice_preparation(runner) -> None:
+    """Bridge newer Hermes auto-voice through the LiveKit output boundary.
+
+    Older Hermes uses the adapter's auto-TTS hook. Newer runners also synthesize
+    replies to text-typed events directly in _send_voice_reply. LiveKit uses
+    those events for transcribed speech with optional camera attachments.
+    Wrap only this runner instance; all other platforms retain their behavior.
+    """
+    original = getattr(runner, "_send_voice_reply", None)
+    if not callable(original) or getattr(runner, "_livekit_voice_preparation", False):
+        return
+
+    async def send_verified_voice(event, text):
+        platform = getattr(event.source.platform, "value", event.source.platform)
+        if platform != "livekit":
+            return await original(event, text)
+        worker = active_room.get()
+        chat_id = str(event.source.chat_id)
+        if worker is None or not (
+            chat_id == worker._room_name
+            or chat_id.startswith(f"{worker._room_name}:{worker._session_epoch}:")
+        ):
+            logger.info("Suppressed LiveKit auto-voice without an active room turn")
+            return
+        script = worker.prepare_tts_text(text)
+        if not script:
+            return
+        token = _runner_voice_script.set((worker, script, text))
+        try:
+            return await original(event, script)
+        finally:
+            _runner_voice_script.reset(token)
+
+    runner._send_voice_reply = send_verified_voice
+    runner._livekit_voice_preparation = True
+
 # LiveKit audio defaults
 SAMPLE_RATE = 48000
 NUM_CHANNELS = 1
@@ -2975,6 +3018,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         keeps simultaneous rooms isolated.
         """
         runner = getattr(self, "gateway_runner", None)
+        _install_runner_voice_preparation(runner)
         scope = getattr(runner, "_profile_scope_for_source", None)
         worker = self._turn_room.get() if hasattr(self, "_turn_room") else self
         token = active_room.set(worker)
@@ -4802,7 +4846,11 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         notice = (metadata or {}).get("non_conversational") or (metadata or {}).get("_interim_send")
         acknowledgement = (metadata or {}).get("tool_acknowledgement")
-        script = str(caption or self._prepared_tts_text or "").strip()
+        verified = _runner_voice_script.get()
+        if verified is not None and verified[0] is not self:
+            verified = None
+        script = str(caption or (verified[1] if verified else self._prepared_tts_text) or "").strip()
+        source_text = verified[2] if verified else self._prepared_tts_source
         clean_script = _meeting_output_text(script)
         # Audio cannot be redacted after synthesis. Reject the entire file if
         # its script is unknown or contains material that would be removed.
@@ -4839,7 +4887,7 @@ class LiveKitAdapter(BasePlatformAdapter):
                             error="Not connected to room at playback time",
                         )
 
-                    spoken_text = str(caption or self._prepared_tts_text or "").strip()
+                    spoken_text = script
                     if spoken_text:
                         kind = (
                             "acknowledgement"
@@ -4848,7 +4896,7 @@ class LiveKitAdapter(BasePlatformAdapter):
                         )
                         await self._record_agent_transcript(spoken_text, kind=kind)
                         if not (metadata or {}).get("non_conversational"):
-                            self._last_spoken_source = self._prepared_tts_source
+                            self._last_spoken_source = source_text
                     self._prepared_tts_source = ""
                     self._prepared_tts_text = ""
 
