@@ -29,6 +29,22 @@ Replies require the room's current occupancy epoch, so a delayed reply cannot
 reach a replacement occupancy. Removing one room cancels only its active turns.
 A failed room API poll preserves existing connections for the next retry.
 
+Personal agents require their owner's presence, matched against the portal's
+`agent_owner_account_id` and signed participant `mira_account_id`. Older room
+metadata can use `agent_video_owner_identity` until refreshed. When the last
+owner connection leaves, speech and that room's turns stop immediately; other
+participants stay connected. Shared-agent access does not confer ownership.
+The appearance assignment service applies the same rule. Returning owners
+start a new occupancy; late speech cannot recreate an abandoned connection.
+
+Meeting output suppresses non-conversational gateway notices, tagged reasoning,
+leaked tool invocations, and context-compaction chatter before chat or TTS.
+Pre-generated audio requires a known, clean speech script; unsafe audio is
+discarded rather than played with a sanitized caption. Old internal assistant
+transcripts remain in the audit store but are excluded from prompt context.
+`tests/manual_owner_presence.py` verifies departure/rejoin and output delivery
+in a temporary synthetic room against a real LiveKit server.
+
 In appearance-enabled rooms, Unity owns the only visible agent participant and
 publishes both camera and voice. Hermes uses a hidden, non-media-publishing
 processing connection and sends signed, private output to Unity. Room metadata

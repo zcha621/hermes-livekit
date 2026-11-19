@@ -209,6 +209,35 @@ REASONING_ONLY_SPOKEN_FAILURE = (
     "I couldn't produce a final answer. Please try again."
 )
 
+# Operational notices and unstructured model scratchpads are never meeting
+# dialogue. Apply this after stripping tagged reasoning, so a valid final
+# answer following <think> remains usable. Do not match ordinary "thinking"
+# or "compact" (e.g. a compact car) in a travel answer.
+INTERNAL_OUTPUT_RE = re.compile(
+    r"(?:\b(?:context|conversation|session|history)\b.{0,60}\b(?:compact\w*|compress\w*)"
+    r"|\b(?:compact\w*|compress\w*)\b.{0,60}\b(?:context|conversation|session|history)\b"
+    r"|\b(?:context window|token budget|scratchpad|chain.of.thought|internal reasoning)\b"
+    r"|\b(?:tool[_ -]?(?:calls?|results?|outputs?)|function_call|analysis to=|recipient=)\b"
+    r"|(?:^|\n)\s*(?:analysis|reasoning|thoughts?|observation|tool|system)\s*:"
+    r"|\b(?:I (?:need to|should|must|will)|let me)\s+(?:call|invoke|use)\s+(?:the\s+)?[\w.-]+\s+(?:tool|function)\b"
+    r"|\b(?:preflight compression|fallback context marker|retrying in \d|rate limited)\b)",
+    re.IGNORECASE,
+)
+
+
+def _meeting_output_text(text: str) -> str:
+    """Keep user-facing answer text; suppress runtime messages and scratchpads."""
+    text = str(text or "")
+    if REASONING_ONLY_FALLBACK_RE.match(text):
+        return REASONING_ONLY_SPOKEN_FAILURE
+    text = re.sub(r"<(think|analysis|reasoning|tool_call|tool_result)\b[^>]*>.*?</\1\s*>", "", text, flags=re.I | re.S)
+    text = re.sub(r"<(?:think|analysis|reasoning|tool_call|tool_result)\b[^>]*>.*\Z", "", text, flags=re.I | re.S)
+    # Providers occasionally put a function invocation into plain content.
+    text = re.sub(r"(?ims)(?:^|[\r\n])\s*[A-Za-z_][\w.]*\s*\(.*?\)\s*(?=$|[\r\n])", "\n", text)
+    if INTERNAL_OUTPUT_RE.search(text):
+        return ""
+    return text.strip()
+
 # LiveKit audio defaults
 SAMPLE_RATE = 48000
 NUM_CHANNELS = 1
@@ -287,6 +316,36 @@ def _room_requests_hermes(metadata: Any) -> bool:
     except (TypeError, ValueError):
         return False
     return isinstance(decoded, dict) and decoded.get("agent_runtime") == HERMES_ROOM_RUNTIME
+
+
+def _room_has_required_presence(metadata: str, participants) -> bool:
+    """A personal agent follows its owner, never an observer or a renderer.
+
+    The portal supplies the owner's signed-token identity for both direct and
+    appearance modes. Unmanaged legacy rooms retain their human-presence rule.
+    A managed room with missing/corrupt ownership fails closed.
+    """
+    try:
+        room = json.loads(metadata or "{}")
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(room, dict):
+        return False
+    owner = str(room.get("agent_video_owner_identity") or "").strip()
+    account = str(room.get("agent_owner_account_id") or "").strip()
+    managed = owner or account or room.get("agent_id") or room.get("owner_user_id")
+    def is_owner(participant):
+        if not account:
+            return bool(owner) and participant.identity == owner
+        try:
+            binding = json.loads(getattr(participant, "metadata", "") or "{}")
+            return isinstance(binding, dict) and binding.get("mira_account_id") == account
+        except (TypeError, ValueError):
+            return False
+    return any(
+        _is_human_participant(p) and (not managed or is_owner(p))
+        for p in participants
+    )
 
 
 def select_target_room(
@@ -1717,6 +1776,14 @@ class LiveKitAdapter(BasePlatformAdapter):
             return (item.get("sequence"), stamp,
                     item.get("identity") or item.get("speaker"), item.get("text"))
 
+        # Keep old operational leakage in the audit store, but do not feed it
+        # back to the model as an example of something the agent should say.
+        db_entries = [
+            {**entry, "text": _meeting_output_text(entry["text"])}
+            if entry.get("role") == "assistant" else entry
+            for entry in (db_entries or [])
+        ]
+        db_entries = [entry for entry in db_entries if entry.get("text")]
         in_memory_keys = {fingerprint(item) for item in self._conversation_transcript}
         # DB rows not already in memory (i.e. from a previous occupancy)
         prior_entries = [
@@ -2172,6 +2239,10 @@ class LiveKitAdapter(BasePlatformAdapter):
             + "LiveKit meeting context: the current speaker is "
             + f"{display_name} (identity {identity}). "
             "Address the correct speaker and distinguish participants. "
+            "Only produce the answer meant for the people in this meeting. "
+            "Keep reasoning, tool invocations/results, context compression, token limits, "
+            "and runtime status out of every spoken or written reply. "
+            "Use tools silently and explain their useful findings in ordinary language. "
             + f"Latest participant topics/requests: {ledger}."
             + self._mcp_identifier_context(identity)
         )
@@ -2546,6 +2617,8 @@ class LiveKitAdapter(BasePlatformAdapter):
                     except Exception as e:
                         logger.debug("[%s] participant check for '%s' failed: %s", self.name, room.name, e)
                         continue
+                    if not _room_has_required_presence(room.metadata, resp.participants):
+                        continue
                     candidates.append({
                         "name": room.name,
                         "creation_time": int(getattr(room, "creation_time", 0) or 0),
@@ -2563,9 +2636,9 @@ class LiveKitAdapter(BasePlatformAdapter):
     def _current_room_has_humans(self) -> bool:
         if self._room is None:
             return False
-        return any(
-            _is_human_participant(participant)
-            for participant in getattr(self._room, "remote_participants", {}).values()
+        return _room_has_required_presence(
+            getattr(self._room, "metadata", ""),
+            getattr(self._room, "remote_participants", {}).values(),
         )
 
     async def _presence_watch_loop(self) -> None:
@@ -2656,6 +2729,9 @@ class LiveKitAdapter(BasePlatformAdapter):
 
             # Connect to room
             await self._room.connect(self._url, jwt_token)
+            if not self._current_room_has_humans():
+                await self._leave_room()
+                return False
             if relay_identity:
                 try:
                     from .unity_relay import UnityRelay, UnityRelayRoom
@@ -3024,8 +3100,15 @@ class LiveKitAdapter(BasePlatformAdapter):
         # Drop any tools this client had registered + fail their pending calls.
         self._cleanup_client_tools(identity)
 
-        if self._room and not self._room.remote_participants:
-            logger.info("[%s] Last participant left '%s', leaving room", self.name, self._room_name)
+        if self._room and not _room_has_required_presence(
+            getattr(self._room, "metadata", ""),
+            [p for p in self._room.remote_participants.values() if p.identity != identity],
+        ):
+            # Stop queued speech immediately, before waiting for turn cleanup.
+            self._playback_interrupt.set()
+            if self._audio_source is not None:
+                self._audio_source.clear_queue()
+            logger.info("[%s] Required owner/presence left '%s'", self.name, self._room_name)
             asyncio.create_task(self._leave_and_watch())
 
     async def _leave_and_watch(self) -> None:
@@ -4660,6 +4743,13 @@ class LiveKitAdapter(BasePlatformAdapter):
         if not self._room:
             return SendResult(success=False, error="Not connected to room")
 
+        if (metadata or {}).get("non_conversational") or (metadata or {}).get("_interim_send"):
+            return SendResult(success=True)
+        original_content = content
+        content = _meeting_output_text(content)
+        if not content:
+            return SendResult(success=True)
+
         # A normal response closes the acknowledgement window. Telemetry and
         # tool cues are explicitly non-conversational and must not do so.
         if not (metadata or {}).get("non_conversational"):
@@ -4679,7 +4769,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         # transcription channel). This still runs if best-effort text delivery
         # failed, because the room transcript is the source of future context.
         if not (metadata or {}).get("non_conversational"):
-            if content != self._last_spoken_source:
+            if original_content != self._last_spoken_source:
                 # No play_tts call accompanied this content, so nothing else
                 # will close out the turn -- do it here as a fallback.
                 await self._record_agent_transcript(
@@ -4709,6 +4799,17 @@ class LiveKitAdapter(BasePlatformAdapter):
         """Play TTS audio into the LiveKit room via the published audio track."""
         if not self._audio_source or not self._room:
             return SendResult(success=False, error="Not connected to room")
+
+        notice = (metadata or {}).get("non_conversational") or (metadata or {}).get("_interim_send")
+        acknowledgement = (metadata or {}).get("tool_acknowledgement")
+        script = str(caption or self._prepared_tts_text or "").strip()
+        clean_script = _meeting_output_text(script)
+        # Audio cannot be redacted after synthesis. Reject the entire file if
+        # its script is unknown or contains material that would be removed.
+        if (not clean_script or clean_script != script
+                or notice and not (acknowledgement and script in self._ack_phrases)):
+            logger.info("[%s] Suppressed non-conversational/unverified speech", self.name)
+            return SendResult(success=True)
 
         async with self._playback_lock:
             speaking_generation = 0
@@ -4837,11 +4938,9 @@ class LiveKitAdapter(BasePlatformAdapter):
             return
         if not self._running:
             return
-        if await self._join_room():
-            logger.info(
-                "[%s] Rejoined '%s' for in-flight TTS playback",
-                self.name, self._room_name,
-            )
+        # Only presence discovery may create a new occupancy. A late response
+        # must never resurrect the agent after its owner has left.
+        return
 
     @staticmethod
     def _decode_audio_to_pcm(audio_path: str) -> Optional[bytes]:
@@ -4906,13 +5005,13 @@ class LiveKitAdapter(BasePlatformAdapter):
         try:
             from tools.tts_text_normalize import strip_nonspoken_blocks
 
-            text = strip_nonspoken_blocks(source_text)
+            text = strip_nonspoken_blocks(_meeting_output_text(source_text))
         except Exception:
             # Best-effort compatibility with older Hermes installations.
             text = _re.sub(
                 r"<think(?:\s[^>]*)?>.*?</think\s*>",
                 " ",
-                source_text,
+                _meeting_output_text(source_text),
                 flags=_re.IGNORECASE | _re.DOTALL,
             )
             text = _re.sub(
@@ -4971,6 +5070,14 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._prepared_tts_text = prepared
         return prepared
 
+    async def send_or_update_status(self, chat_id: str, status_key: str, content: str, metadata=None) -> SendResult:
+        """Runtime status belongs in server logs; the orb conveys working state.
+
+        Hermes only stamps non_conversational on Discord notifications. This
+        hook is therefore necessary for LiveKit even when metadata is absent.
+        """
+        return SendResult(success=True)
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Mirror Discord's working indicator through LiveKit agent state."""
         await self._set_agent_state("thinking")
@@ -5010,6 +5117,12 @@ class RoomLiveKitAdapter(LiveKitAdapter):
         self._mark_disconnected()
 
     async def _leave_and_watch(self) -> None:
+        if self._current_room_has_humans():
+            return  # The owner reconnected before this departure was handled.
+        supervisor = getattr(self, "_room_supervisor", None)
+        if supervisor is not None and supervisor._room_workers.get(self._room_name) is self:
+            await supervisor._remove_room_worker(self._room_name)
+            return
         async with self._room_transition_lock:
             await self._leave_room()
 
@@ -5054,7 +5167,7 @@ class MultiRoomLiveKitAdapter(LiveKitAdapter):
                 renderer = str(metadata.get("unity_renderer_identity") or "") if metadata.get("agent_transport") == "unity" else ""
                 if metadata.get("agent_transport") == "unity" and (not renderer or not any(p.identity == renderer for p in response.participants)):
                     continue  # Appearance mode waits for Unity; never join visibly.
-                if any(_is_human_participant(p) for p in response.participants):
+                if _room_has_required_presence(room.metadata, response.participants):
                     occupied.add(room.name)
                     transports[room.name] = renderer
             self._room_transports = transports
@@ -5071,7 +5184,9 @@ class MultiRoomLiveKitAdapter(LiveKitAdapter):
         return worker
 
     async def _remove_room_worker(self, name: str) -> None:
-        worker = self._room_workers.pop(name)
+        worker = self._room_workers.pop(name, None)
+        if worker is None:
+            return
         worker._running = False
         # Cancel only turns owned by this occupancy. Other rooms keep speaking.
         tasks = [task for task, owner in self._room_turn_tasks.items()

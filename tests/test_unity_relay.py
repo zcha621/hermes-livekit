@@ -58,7 +58,8 @@ class UnityRelayTests(IsolatedAsyncioTestCase):
         adapter=make_adapter({'unity_renderer_identity':'agent-appearance-one'})
         participant=SimpleNamespace(publish_data=AsyncMock(),publish_track=AsyncMock())
         room=SimpleNamespace(on=lambda *a:None,register_byte_stream_handler=lambda *a:None,
-            connect=AsyncMock(),disconnect=AsyncMock(),local_participant=participant)
+            connect=AsyncMock(),disconnect=AsyncMock(),local_participant=participant,
+            remote_participants={'alice':SimpleNamespace(identity='alice', metadata='{}')})
         adapter._set_agent_state=AsyncMock()
         adapter._refresh_room_agent_profile=AsyncMock(return_value=True)
         with patch.object(mod.rtc,'Room',return_value=room):
