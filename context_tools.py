@@ -5,6 +5,11 @@ import asyncio
 import json
 from contextvars import ContextVar
 
+try:
+    from .service_access import room_service_call
+except ImportError:
+    from service_access import room_service_call
+
 # Bound for the entire Hermes model/tool loop, not just prompt preparation.
 # ContextVar propagates into asyncio.to_thread without mixing concurrent rooms.
 active_room = ContextVar("mira_context_room", default=None)
@@ -12,6 +17,10 @@ active_turn = ContextVar("mira_context_turn", default=None)
 
 
 def read_context(adapter, name: str, limit: int = 50) -> dict:
+    return room_service_call(adapter, _read_context, adapter, name, limit)
+
+
+def _read_context(adapter, name: str, limit: int = 50) -> dict:
     if name == "get_meeting_transcript":
         entries = adapter._fetch_room_transcript(max(1, min(int(limit), 500)))
         return {"found": bool(entries), "entries": entries, "room_name": adapter._room_name}

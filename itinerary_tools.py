@@ -20,12 +20,10 @@ from __future__ import annotations
 import json
 import asyncio
 import logging
-import os
-
 try:
-    from gateway.platforms._shared import get_scoped_secret as _getenv
-except ImportError:  # Hermes releases before profile-scoped credentials.
-    _getenv = os.getenv
+    from .service_access import service_env as _getenv, room_service_call
+except ImportError:
+    from service_access import service_env as _getenv, room_service_call
 import re
 import time
 import urllib.error
@@ -399,6 +397,14 @@ def _backend_base_url() -> str:
 
 
 def _post_gateway_command(command: dict) -> dict:
+    try:
+        from .context_tools import active_room
+    except ImportError:
+        from context_tools import active_room
+    return room_service_call(active_room.get(), _send_gateway_command, command)
+
+
+def _send_gateway_command(command: dict) -> dict:
     url = f"{_backend_base_url()}/api/v1/gateway/planning-workspace"
     body = json.dumps(command).encode("utf-8")
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -531,7 +537,7 @@ async def _handle_add_confirmed_tag(args=None, **kwargs):
         return json.dumps({"error": "A verbal confirmation from the room owner is required"})
     args = args or {}
     try:
-        state = await asyncio.to_thread(fetch_room_map, worker._room_name)
+        state = await asyncio.to_thread(room_service_call, worker, fetch_room_map, worker._room_name)
         if not state or not state.get("session_id"):
             return json.dumps({"error": "Shared map is unavailable; no itinerary changes were made"})
         result = await asyncio.to_thread(_post_gateway_command, {

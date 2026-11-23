@@ -39,8 +39,10 @@ from typing import Any, Dict, Optional, Union
 
 try:
     from .context_tools import active_room, active_turn
+    from .service_access import MeetingServiceAccess, meeting_service_method, room_service_call, service_env as _service_getenv
 except ImportError:
     from context_tools import active_room, active_turn
+    from service_access import MeetingServiceAccess, meeting_service_method, room_service_call, service_env as _service_getenv
 
 try:
     from livekit import rtc
@@ -477,6 +479,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         # registers the platform name dynamically and Platform._missing_
         # creates a pseudo-member on first lookup.
         super().__init__(config, Platform("livekit"))
+        self._meeting_service_access = MeetingServiceAccess()
 
         extra = config.extra or {}
         self._url: str = extra.get("url") or _getenv("LIVEKIT_URL", "")
@@ -1659,14 +1662,16 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         async def _run() -> None:
             try:
-                from transcript_store import record_transcript_segment
+                from .transcript_store import record_transcript_segment
             except ImportError:
                 try:
-                    from .transcript_store import record_transcript_segment
+                    from transcript_store import record_transcript_segment
                 except ImportError:
                     return
             try:
                 await asyncio.to_thread(
+                    room_service_call,
+                    self,
                     record_transcript_segment,
                     entry,
                     room_name=room_name,
@@ -1698,6 +1703,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         )
         return entry
 
+    @meeting_service_method
     def _fetch_room_transcript(self, limit: int = 50) -> list[Dict[str, Any]]:
         """Read the current room's recent transcript rows from the DB.
 
@@ -1717,7 +1723,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         display name; it never writes and never blocks the event loop
         (callers run it via ``asyncio.to_thread``).
         """
-        database_url = _getenv("MIRA_DATABASE_URL", "").strip()
+        database_url = _service_getenv("MIRA_DATABASE_URL", "").strip()
         if not database_url:
             return []
         room_name = self._room_name
@@ -1920,6 +1926,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._place_tag_nudge_redis = None
         return self._place_tag_nudge_redis
 
+    @meeting_service_method
     def _resolve_mira_session_id(self) -> Optional[str]:
         """Map this room's LiveKit name to its ``mira_session.session_id``.
 
@@ -1929,7 +1936,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         ``MIRA_DATABASE_URL``, no SQLAlchemy, no matching row, or a query
         error). Best-effort — a miss simply means no reminder this turn.
         """
-        database_url = _getenv("MIRA_DATABASE_URL", "").strip()
+        database_url = _service_getenv("MIRA_DATABASE_URL", "").strip()
         if not database_url:
             return None
         room_name = self._room_name
@@ -1954,6 +1961,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             logger.debug("[%s] _resolve_mira_session_id failed: %s", self.name, exc)
             return None
 
+    @meeting_service_method
     def _shared_map_context(self) -> str:
         try:
             try:
@@ -1989,6 +1997,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             logger.debug("[%s] shared map read failed: %s", self.name, exc)
             return "Database traveller context is unavailable this turn; do not claim current location, local time or map changes."
 
+    @meeting_service_method
     def _hydrate_place_tags(self, tag_ids: list[str]) -> list[Dict[str, Any]]:
         """Fetch the current label/note/author for the given active tags.
 
@@ -2000,7 +2009,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         Returns ``[]`` on any failure; callers fall back to the nudge's
         (possibly empty) fields.
         """
-        database_url = _getenv("MIRA_DATABASE_URL", "").strip()
+        database_url = _service_getenv("MIRA_DATABASE_URL", "").strip()
         if not database_url or not tag_ids:
             return []
         try:
@@ -5247,6 +5256,7 @@ class MultiRoomLiveKitAdapter(LiveKitAdapter):
         config.extra = {**(config.extra or {}), "room": name, "unity_renderer_identity": self._room_transports.get(name, "")}
         worker = RoomLiveKitAdapter(config)
         worker._room_supervisor = self
+        worker._meeting_service_access = self._meeting_service_access
         worker.gateway_runner = getattr(self, "gateway_runner", None)
         return worker
 

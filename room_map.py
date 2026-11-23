@@ -1,12 +1,10 @@
 """Authoritative shared map snapshot for a LiveKit room's current agent turn."""
 from __future__ import annotations
 
-import os
-
 try:
-    from gateway.platforms._shared import get_scoped_secret as _getenv
-except ImportError:  # Hermes releases before profile-scoped credentials.
-    _getenv = os.getenv
+    from .service_access import service_env as _getenv
+except ImportError:
+    from service_access import service_env as _getenv
 import time
 import uuid
 from pathlib import Path
