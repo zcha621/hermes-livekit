@@ -243,6 +243,7 @@ def _meeting_output_text(text: str) -> str:
 # captionless files. Keep the verified script in the synthesis task's context,
 # never in another room's mutable preparation cache.
 _runner_voice_script = ContextVar("livekit_runner_voice_script", default=None)
+_text_only_turn = ContextVar("livekit_text_only_turn", default=False)
 
 
 def _install_runner_voice_preparation(runner) -> None:
@@ -261,6 +262,8 @@ def _install_runner_voice_preparation(runner) -> None:
         platform = getattr(event.source.platform, "value", event.source.platform)
         if platform != "livekit":
             return await original(event, text)
+        if _text_only_turn.get() or getattr(event, "_livekit_text_only", False):
+            return
         worker = active_room.get()
         chat_id = str(event.source.chat_id)
         if worker is None or not (
@@ -2408,7 +2411,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         """Arm one acknowledgement for the next real tool call in this turn."""
         self._event_loop = asyncio.get_running_loop()
         self._tool_ack_generation += 1
-        self._tool_ack_pending = self._ack_enabled
+        self._tool_ack_pending = self._ack_enabled and not _text_only_turn.get()
         self._tool_ack_session_id = ""
 
     def bind_tool_acknowledgement_session(self, session_id: str) -> None:
@@ -2501,13 +2504,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._tool_ack_session_id = ""
 
     def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
-        """LiveKit is voice-first — always auto-TTS unless the chat opted out.
-
-        On text platforms the default is gated by ``voice.auto_tts`` (off by
-        default). On LiveKit the channel itself is audio, so a typed-only
-        reply gives the user nothing. Per-chat ``/voice off`` still wins.
-        """
-        if chat_id in self._auto_tts_disabled_chats:
+        """Speak voice turns unless opted out; typed turns always reply silently."""
+        if _text_only_turn.get() or chat_id in self._auto_tts_disabled_chats:
             return False
         return True
 
@@ -3022,6 +3020,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         scope = getattr(runner, "_profile_scope_for_source", None)
         worker = self._turn_room.get() if hasattr(self, "_turn_room") else self
         token = active_room.set(worker)
+        text_token = _text_only_turn.set(bool(getattr(event, "_livekit_text_only", False)))
         try:
             if callable(scope):
                 with scope(event.source):
@@ -3029,6 +3028,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             else:
                 await super()._process_message_background(event, session_key)
         finally:
+            _text_only_turn.reset(text_token)
             active_room.reset(token)
 
     # -- LiveKit event handlers ---------------------------------------------
@@ -3841,7 +3841,9 @@ class LiveKitAdapter(BasePlatformAdapter):
         anything else is ignored (silently — keeps the protocol open for
         unrelated apps sharing the same data channel without spamming logs).
         """
-        # Handle all topics - browser chatbox sends text on any topic
+        # Public meeting chat and our own output are not agent invocations.
+        if getattr(packet, "topic", "") in {"lk-chat-topic", "lk.chat", "hermes-chat"}:
+            return
         participant = getattr(packet, "participant", None)
         participant_identity = str(
             getattr(participant, "identity", "") if participant is not None else ""
@@ -4035,15 +4037,16 @@ class LiveKitAdapter(BasePlatformAdapter):
             )
 
     async def _handle_client_message(self, msg: Dict[str, Any], identity: str) -> None:
-        """Inject a typed text message as if it were a transcribed voice utterance.
+        """Invoke the room agent with text input and a text-only reply.
 
         Useful for clients that want to text-chat with the agent over the
-        LiveKit data channel (no STT needed). Any pending captures attach
+        LiveKit data channel (no STT or TTS). Any pending captures attach
         to this message, same as the voice path.
         """
-        text = (msg.get("text") or "").strip()
-        if not text:
+        text = msg.get("text")
+        if not isinstance(text, str) or not text.strip() or not self._can_bring_agent(identity):
             return
+        text = text.strip()
 
         if self._auto_vision and self._should_attach_video(text):
             self._queue_video_for_text(text, identity)
@@ -4065,6 +4068,10 @@ class LiveKitAdapter(BasePlatformAdapter):
             media_types=media_types,
             timestamp=datetime.now(tz=timezone.utc),
         )
+
+        # Carry modality on the event: queued turns must not inherit the
+        # previous turn's voice policy, nor change another room's policy.
+        event._livekit_text_only = True
 
         # A submitted chat message is an explicit request to MiRA. Requiring
         # the spoken wake phrase here made the portal silently transcribe the
@@ -4813,7 +4820,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         # transcription channel). This still runs if best-effort text delivery
         # failed, because the room transcript is the source of future context.
         if not (metadata or {}).get("non_conversational"):
-            if original_content != self._last_spoken_source:
+            if _text_only_turn.get() or original_content != self._last_spoken_source:
                 # No play_tts call accompanied this content, so nothing else
                 # will close out the turn -- do it here as a fallback.
                 await self._record_agent_transcript(
@@ -4841,6 +4848,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
     ) -> SendResult:
         """Play TTS audio into the LiveKit room via the published audio track."""
+        if _text_only_turn.get():
+            return SendResult(success=True)
         if not self._audio_source or not self._room:
             return SendResult(success=False, error="Not connected to room")
 
@@ -5032,6 +5041,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         """
         import re as _re
 
+        if _text_only_turn.get():
+            return ""
         source_text = str(text or "")
         self._prepared_tts_source = ""
         self._prepared_tts_text = ""

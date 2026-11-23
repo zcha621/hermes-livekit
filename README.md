@@ -526,6 +526,20 @@ with `-AuxiliaryBaseUrl` and `-AuxiliaryModel` when needed.
 
 ## Validate
 
+During a portal video call, open **Chat**, choose **Your agent**, and send a
+message. The room's agent owner and accounts with shared access can use this
+recipient. Typed turns use `client:message` on `hermes-control`, enter the same
+conversation/context pipeline as push-to-talk, and reply on `hermes-chat`
+without STT or TTS. Replies are visible to the room. **Everyone** retains normal
+participant chat and does not invoke the agent. Voice turns still use the saved
+voice settings. Both the portal and this adapter must be updated together.
+
+Run the text-turn regression checks with:
+
+```powershell
+python -m unittest discover -s .\agents\hermes-livekit\tests -p test_text_chat.py -v
+```
+
 ```powershell
 $hermes = "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\hermes.exe"
 & $hermes config check
