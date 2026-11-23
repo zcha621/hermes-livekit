@@ -169,13 +169,13 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RegisterToolsTests(unittest.TestCase):
-    def test_registers_both_native_tools(self):
+    def test_registers_native_planning_and_confirmed_tag_tools(self):
         ctx = Mock()
         tools.register_tools(ctx)
 
-        self.assertEqual(ctx.register_tool.call_count, 2)
+        self.assertEqual(ctx.register_tool.call_count, 3)
         names = [call.kwargs["name"] for call in ctx.register_tool.call_args_list]
-        self.assertEqual(names, ["save_itinerary_draft", "confirm_itinerary_draft"])
+        self.assertEqual(names, ["save_itinerary_draft", "confirm_itinerary_draft", "add_confirmed_place_to_itinerary"])
         self.assertTrue(all(call.kwargs["toolset"] == "hermes-livekit" for call in ctx.register_tool.call_args_list))
         self.assertTrue(all(call.kwargs["is_async"] for call in ctx.register_tool.call_args_list))
 

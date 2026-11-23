@@ -18,6 +18,7 @@ without them the backend must run with MIRA_AUTH_MODE=disabled.
 from __future__ import annotations
 
 import json
+import asyncio
 import logging
 import os
 
@@ -490,11 +491,73 @@ async def _handle_confirm_itinerary_draft(args=None, **kwargs):
         return json.dumps({"error": str(exc)})
 
 
+_ADD_CONFIRMED_TAG_SCHEMA = {
+    "name": "add_confirmed_place_to_itinerary",
+    "description": (
+        "Add a place tagged on this meeting's shared map to the owner's saved itinerary. "
+        "Only call after the room owner explicitly verbally confirms they want to explore that exact place. "
+        "A tag, another participant's request, silence, or thanks is not confirmation. "
+        "If the place or visit time is ambiguous, ask the owner. Read the current confirmed itinerary "
+        "for expected_revision (0 if none). Use the tag_id from current shared-map context. "
+        "Preserves other stops and saves the tagged coordinates; never claim success unless the tool succeeds."
+    ),
+    "parameters": {
+        "type": "object", "additionalProperties": False,
+        "required": ["tag_id", "expected_revision", "starts_at", "duration_minutes"],
+        "properties": {
+            "tag_id": {"type": "string", "description": "Exact UUID of the confirmed shared-map tag"},
+            "expected_revision": {"type": "integer", "minimum": 0},
+            "starts_at": {"type": "string", "description": "Agreed visit time in ISO 8601 with timezone offset"},
+            "duration_minutes": {"type": "integer", "minimum": 1, "maximum": 1440},
+        },
+    },
+}
+
+
+async def _handle_add_confirmed_tag(args=None, **kwargs):
+    try:
+        from .context_tools import active_room, active_turn
+        from .room_map import fetch_room_map
+    except ImportError:
+        from context_tools import active_room, active_turn
+        from room_map import fetch_room_map
+    worker, event = active_room.get(), active_turn.get()
+    if worker is None or event is None:
+        return json.dumps({"error": "No active owner voice turn"})
+    identity = str(getattr(event.source, "user_id", "") or "")
+    metadata = worker._participant_connection_metadata(identity)
+    spoken = bool((getattr(event, "metadata", None) or {}).get("livekit_spoken_transcript"))
+    if metadata.get("mira_room_owner") != "true" or not spoken:
+        return json.dumps({"error": "A verbal confirmation from the room owner is required"})
+    args = args or {}
+    try:
+        state = await asyncio.to_thread(fetch_room_map, worker._room_name)
+        if not state or not state.get("session_id"):
+            return json.dumps({"error": "Shared map is unavailable; no itinerary changes were made"})
+        result = await asyncio.to_thread(_post_gateway_command, {
+            "action": "add_place_tag",
+            "source": {
+                "platform": "livekit", "user_id": identity,
+                "chat_id": str(event.source.chat_id), "hermes_session_id": _session_source()[2],
+            },
+            "session_id": state["session_id"], "tag_id": args.get("tag_id"),
+            "expected_revision": args.get("expected_revision"), "tag_starts_at": args.get("starts_at"),
+            "tag_duration_minutes": args.get("duration_minutes"),
+            # Evidence is the current voice turn, never model-authored text.
+            "confirmation_event_id": str(event.message_id), "confirmation_text": str(event.text),
+        })
+        return json.dumps(result, ensure_ascii=False, default=str)
+    except Exception as exc:
+        logger.warning("add_confirmed_place_to_itinerary failed: %s", exc)
+        return json.dumps({"error": str(exc)})
+
+
 def register_tools(ctx) -> None:
     """Expose the itinerary save/confirm write path as native Hermes tools."""
     registrations = (
         (_SAVE_ITINERARY_DRAFT_SCHEMA, _handle_save_itinerary_draft, "\U0001f4be"),
         (_CONFIRM_ITINERARY_DRAFT_SCHEMA, _handle_confirm_itinerary_draft, "✅"),
+        (_ADD_CONFIRMED_TAG_SCHEMA, _handle_add_confirmed_tag, "📍"),
     )
     for schema, handler, emoji in registrations:
         ctx.register_tool(

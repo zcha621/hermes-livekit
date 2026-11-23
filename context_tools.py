@@ -8,6 +8,7 @@ from contextvars import ContextVar
 # Bound for the entire Hermes model/tool loop, not just prompt preparation.
 # ContextVar propagates into asyncio.to_thread without mixing concurrent rooms.
 active_room = ContextVar("mira_context_room", default=None)
+active_turn = ContextVar("mira_context_turn", default=None)
 
 
 def read_context(adapter, name: str, limit: int = 50) -> dict:
