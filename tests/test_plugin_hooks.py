@@ -43,7 +43,15 @@ class PluginHookTests(unittest.IsolatedAsyncioTestCase):
             for call in context.register_tool.call_args_list
         ]
         self.assertEqual(
-            registered_tool_names, ["save_itinerary_draft", "confirm_itinerary_draft", "get_confirmed_itinerary", "get_traveller_location", "get_meeting_transcript"]
+            registered_tool_names,
+            [
+                "save_itinerary_draft",
+                "confirm_itinerary_draft",
+                "add_confirmed_place_to_itinerary",
+                "get_confirmed_itinerary",
+                "get_traveller_location",
+                "get_meeting_transcript",
+            ],
         )
         hook_names = [call.args[0] for call in context.register_hook.call_args_list]
         self.assertEqual(
