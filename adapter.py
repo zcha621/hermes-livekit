@@ -1693,7 +1693,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         entry = self._append_transcript(
             role="assistant",
             identity=identity,
-            name=self._agent_name,
+            name=self._effective_agent_name(),
             text=text,
             invoked=self._conversation_is_active(),
             kind=kind,

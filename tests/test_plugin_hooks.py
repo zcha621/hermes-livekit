@@ -20,6 +20,24 @@ spec.loader.exec_module(plugin)
 
 
 class PluginHookTests(unittest.IsolatedAsyncioTestCase):
+    def test_only_process_home_can_create_room_transport(self):
+        from hermes_constants import get_process_hermes_home, set_hermes_home_override, reset_hermes_home_override
+        home = get_process_hermes_home()
+        with patch.object(plugin, "MultiRoomLiveKitAdapter") as factory:
+            token = set_hermes_home_override(home / "profiles" / "john")
+            try:
+                self.assertIsNone(plugin._create_livekit_adapter(Mock()))
+                factory.assert_not_called()
+            finally:
+                reset_hermes_home_override(token)
+            token = set_hermes_home_override(home)
+            try:
+                config = Mock()
+                self.assertIs(plugin._create_livekit_adapter(config), factory.return_value)
+                factory.assert_called_once_with(config)
+            finally:
+                reset_hermes_home_override(token)
+
     def test_platform_hint_requires_database_context_independent_of_soul(self):
         self.assertIn("independent of SOUL", plugin._LIVEKIT_PLATFORM_HINT)
         self.assertIn("For explicit location or time questions", plugin._LIVEKIT_PLATFORM_HINT)

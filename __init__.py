@@ -288,6 +288,14 @@ def _interactive_setup() -> None:
     print("LiveKit settings saved.")
 
 
+def _create_livekit_adapter(config):
+    """The process home owns transport; routed profiles expose tools only."""
+    from hermes_constants import get_hermes_home, get_process_hermes_home
+    if get_hermes_home().resolve() != get_process_hermes_home().resolve():
+        return None
+    return MultiRoomLiveKitAdapter(config)
+
+
 def register(ctx) -> None:
     """Plugin entry point — called by the hermes-agent plugin loader.
 
@@ -299,7 +307,7 @@ def register(ctx) -> None:
     ctx.register_platform(
         name="livekit",
         label="LiveKit",
-        adapter_factory=lambda cfg: MultiRoomLiveKitAdapter(cfg),
+        adapter_factory=_create_livekit_adapter,
         check_fn=check_livekit_requirements,
         is_connected=_is_connected,
         required_env=["LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"],

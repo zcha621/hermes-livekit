@@ -50,6 +50,10 @@ try:
             module=importlib.import_module(entry.handler.__module__)
             prefix=module.__package__
             modules.append(prefix)
+            profile_plugin=importlib.import_module(prefix)
+            with patch.object(profile_plugin,'MultiRoomLiveKitAdapter') as transport:
+                assert profile_plugin._create_livekit_adapter(SimpleNamespace(extra={})) is None
+                transport.assert_not_called()
             profile_context=importlib.import_module(prefix+'.context_tools')
             profile_service=importlib.import_module(prefix+'.service_access')
             assert profile_context.active_room is context_tools.active_room
