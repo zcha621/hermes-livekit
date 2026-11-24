@@ -134,6 +134,46 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         result = await tools._handle_save_itinerary_draft({"plan_text": ""})
         self.assertIn("error", json.loads(result))
 
+    async def test_text_revision_preserves_mapped_stop_and_confirmation_evidence(self):
+        original = {
+            "item_id": "saved-stop", "activity": "Visit the tagged place",
+            "starts_at": "2026-08-30T17:00:00+12:00", "ends_at": "2026-08-30T17:30:00+12:00",
+            "location": {"name": "Selected food court", "latitude": -36.85, "longitude": 174.76},
+            "transportation": {"mode": "walking"}, "source_tag_id": "selected-tag",
+            "confirmation_event_id": "actual-voice", "confirmation_text": "Yes, add that place",
+            "notes": "Meet by the entrance",
+        }
+        calls = []
+        def post(command):
+            calls.append(command)
+            return {"itinerary": {"items": [original]}} if command["action"] == "load" else {"saved": True}
+        with patch.object(tools, "_post_gateway_command", side_effect=post):
+            result = await tools._handle_save_itinerary_draft({
+                "plan_text": "16:00 - 16:30 Visit the tagged place\n18:00 - Dinner",
+                "plan_date": "2026-08-30",
+            })
+        self.assertTrue(json.loads(result)["saved"])
+        self.assertEqual([c["action"] for c in calls], ["load", "revise"])
+        saved = calls[1]["draft"]["items"][0]
+        self.assertEqual(saved, {**original, "starts_at": "2026-08-30T16:00:00+12:00", "ends_at": "2026-08-30T16:30:00+12:00"})
+        self.assertEqual(original["starts_at"], "2026-08-30T17:00:00+12:00")
+
+    async def test_verified_location_reaches_saved_draft(self):
+        location = {"activity": "Walk in the park", "name": "Selected park", "latitude": -36.85, "longitude": 174.76}
+        with patch.object(tools, "_post_gateway_command", return_value={}) as post:
+            result = await tools._handle_save_itinerary_draft({
+                "plan_text": "10:00 - Walk in the park", "plan_date": "2026-08-30", "stop_locations": [location],
+            })
+        self.assertNotIn("error", json.loads(result))
+        self.assertEqual(post.call_args.args[0]["draft"]["items"][0]["location"], {k:v for k,v in location.items() if k != "activity"})
+
+    async def test_unavailable_previous_plan_prevents_destructive_rewrite(self):
+        with patch.object(tools, "_post_gateway_command", side_effect=RuntimeError("database unavailable")) as post:
+            result = await tools._handle_save_itinerary_draft({"plan_text": "10:00 - Walk", "plan_date": "2026-08-30"})
+        self.assertIn("database unavailable", json.loads(result)["error"])
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(post.call_args.args[0]["action"], "load")
+
     async def test_save_itinerary_draft_reports_when_no_items_parsed(self):
         result = await tools._handle_save_itinerary_draft(
             {"plan_text": "just some prose", "plan_date": "2026-08-30"}
@@ -278,3 +318,35 @@ class BackendAuthorizationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class StopLocationRetentionTests(unittest.TestCase):
+    def draft(self, text='10:00 - Walk', date='2026-08-30'):
+        return tools._build_draft(title='Day', summary='Day', timezone='Pacific/Auckland', plan_date=date, plan_text=text, requirements='')
+
+    def test_changed_activity_or_day_never_inherits_coordinates(self):
+        previous = self.draft()
+        previous['items'][0]['location'].update(latitude=-36.85, longitude=174.76)
+        for draft in (self.draft('10:00 - Different walk'), self.draft(date='2026-08-31')):
+            tools._retain_stop_details(draft, previous)
+            self.assertNotIn('latitude', draft['items'][0]['location'])
+
+    def test_repeated_activities_are_not_matched_arbitrarily(self):
+        previous = self.draft()
+        previous['items'][0]['location'].update(latitude=-36.85, longitude=174.76)
+        draft = self.draft('10:00 - Walk\n13:00 - Walk')
+        tools._retain_stop_details(draft, previous)
+        self.assertTrue(all('latitude' not in i['location'] for i in draft['items']))
+        with self.assertRaises(ValueError):
+            tools._apply_stop_locations(draft, [{'activity':'Walk','name':'Park','latitude':-36.85,'longitude':174.76}])
+
+    def test_invalid_or_unmatched_coordinates_are_rejected(self):
+        for updates in ({'latitude':91}, {'longitude':float('nan')}, {'latitude':True}, {'activity':'Missing'}, {'name':''}):
+            point = {'activity':'Walk','name':'Park','latitude':-36.85,'longitude':174.76, **updates}
+            with self.subTest(updates=updates), self.assertRaises(ValueError):
+                tools._apply_stop_locations(self.draft(), [point])
+
+    def test_tag_confirmation_cannot_be_reused_for_a_different_location(self):
+        draft = self.draft()
+        draft['items'][0]['source_tag_id'] = 'original-tag'
+        with self.assertRaises(ValueError):
+            tools._apply_stop_locations(draft, [{'activity':'Walk','name':'Another place','latitude':-36.85,'longitude':174.76}])

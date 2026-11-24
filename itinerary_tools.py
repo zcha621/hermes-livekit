@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+from copy import deepcopy
 import logging
 try:
     from .service_access import service_env as _getenv, room_service_call
@@ -84,6 +85,10 @@ _SAVE_ITINERARY_DRAFT_SCHEMA = {
         "its time), then pass that same text here as plan_text. A spoken "
         "or chat description alone is not enough — if this is never "
         "called, nothing is saved and the traveller will not see it later."
+        " Unchanged activities keep their saved map locations and details. "
+        "Use stop_locations for verified coordinates from a map selection or place lookup; "
+        "never guess coordinates. For an owner-approved map tag use "
+        "add_confirmed_place_to_itinerary instead."
     ),
     "parameters": {
         "type": "object",
@@ -112,6 +117,21 @@ _SAVE_ITINERARY_DRAFT_SCHEMA = {
             "title": {"type": "string", "maxLength": 255},
             "timezone": {"type": "string", "maxLength": 64, "default": "Pacific/Auckland"},
             "requirements": {"type": "string", "maxLength": 5000},
+            "stop_locations": {
+                "type": "array",
+                "description": "Verified map locations, matched by exact activity text after the time. Omit unresolved places and ask the traveller to select them on the map.",
+                "items": {
+                    "type": "object", "additionalProperties": False,
+                    "required": ["activity", "name", "latitude", "longitude"],
+                    "properties": {
+                        "activity": {"type": "string"},
+                        "name": {"type": "string", "minLength": 1, "maxLength": 255},
+                        "address": {"type": "string", "maxLength": 500},
+                        "latitude": {"type": "number", "minimum": -90, "maximum": 90},
+                        "longitude": {"type": "number", "minimum": -180, "maximum": 180},
+                    },
+                },
+            },
         },
     },
 }
@@ -347,6 +367,49 @@ def _build_draft(*, title, summary, timezone, plan_date, plan_text, requirements
     }
 
 
+def _retain_stop_details(draft, previous):
+    """Reuse only unambiguous, unchanged activities on the same calendar day."""
+    def key(item):
+        return (str(item.get("activity", "")).strip(), str(item.get("starts_at", ""))[:10])
+    old = {}
+    for item in (previous or {}).get("items", []):
+        old.setdefault(key(item), []).append(item)
+    counts = {}
+    for item in draft["items"]:
+        counts[key(item)] = counts.get(key(item), 0) + 1
+    for index, item in enumerate(draft["items"]):
+        matches = old.get(key(item), [])
+        if len(matches) == 1 and counts[key(item)] == 1:
+            retained = deepcopy(matches[0])
+            retained.update(starts_at=item["starts_at"], ends_at=item["ends_at"], activity=item["activity"])
+            draft["items"][index] = retained
+
+
+def _apply_stop_locations(draft, locations):
+    """Reject ambiguous matches and invalid coordinates before any write."""
+    import math
+    if not isinstance(locations, list):
+        raise ValueError("stop_locations must be an array")
+    seen = set()
+    for location in locations:
+        activity = str(location.get("activity", "")).strip()
+        matches = [item for item in draft["items"] if item["activity"].strip() == activity]
+        if len(matches) != 1 or activity in seen:
+            raise ValueError("Each stop location must match exactly one unique activity")
+        seen.add(activity)
+        point = {key: location[key] for key in ("name", "address", "latitude", "longitude") if key in location}
+        if not isinstance(point.get("name"), str) or not point["name"].strip():
+            raise ValueError("Stop location name is required")
+        for key, limit in (("latitude", 90), ("longitude", 180)):
+            value = point.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or abs(value) > limit:
+                raise ValueError("Stop location requires valid latitude and longitude")
+        item = matches[0]
+        if item.get("source_tag_id") and point != item.get("location"):
+            raise ValueError("Use the map's Adjust location action to change a confirmed tagged stop")
+        item["location"] = point
+
+
 # Mirrors services/hermes-mcp/src/hermes_mcp/auth.py (and the portal's
 # issueWorkerAccessToken): the backend's gateway planning endpoint only
 # accepts this subject with accounts:read + accounts:write.
@@ -452,15 +515,17 @@ async def _handle_save_itinerary_draft(args=None, **kwargs):
                     )
                 }
             )
-        result = _post_gateway_command(
+        source = {
+            "platform": platform, "user_id": user_id,
+            "chat_id": hermes_session_id, "hermes_session_id": hermes_session_id,
+        }
+        workspace = await asyncio.to_thread(_post_gateway_command, {"action": "load", "source": source})
+        _retain_stop_details(draft, workspace.get("draft") or workspace.get("itinerary"))
+        _apply_stop_locations(draft, args.get("stop_locations", []))
+        result = await asyncio.to_thread(_post_gateway_command,
             {
                 "action": "revise",
-                "source": {
-                    "platform": platform,
-                    "user_id": user_id,
-                    "chat_id": hermes_session_id,
-                    "hermes_session_id": hermes_session_id,
-                },
+                "source": source,
                 "draft": draft,
             }
         )
