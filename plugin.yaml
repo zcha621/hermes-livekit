@@ -11,6 +11,7 @@ author: kortexa-ai
 provides_tools:
   - save_itinerary_draft
   - confirm_itinerary_draft
+  - add_confirmed_place_to_itinerary
   - get_confirmed_itinerary
   - get_traveller_location
   - get_meeting_transcript

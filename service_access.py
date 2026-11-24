@@ -4,10 +4,14 @@ Capture at adapter construction. Only synchronous trusted database/backend
 operations enter this scope; the model loop, subprocesses and profile files do
 not receive these settings. Room and speaker authorization stays with callers.
 """
-from contextvars import ContextVar
 from functools import wraps
 from types import MappingProxyType
 import os
+
+try:
+    from .runtime_context import service_settings as _settings
+except ImportError:
+    from runtime_context import service_settings as _settings
 
 try:
     from gateway.platforms._shared import get_scoped_secret
@@ -19,7 +23,6 @@ _NAMES = (
     "MIRA_AUTH_KEY_ID", "MIRA_AUTH_ISSUER", "MIRA_AUTH_AUDIENCE",
     "MIRA_AUTH_TOKEN_TTL_SECONDS",
 )
-_settings = ContextVar("mira_meeting_service_settings", default=None)
 
 
 def service_env(name, default=None):

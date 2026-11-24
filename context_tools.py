@@ -3,17 +3,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextvars import ContextVar
 
 try:
     from .service_access import room_service_call
+    from .runtime_context import active_room, active_turn
 except ImportError:
     from service_access import room_service_call
+    from runtime_context import active_room, active_turn
 
 # Bound for the entire Hermes model/tool loop, not just prompt preparation.
 # ContextVar propagates into asyncio.to_thread without mixing concurrent rooms.
-active_room = ContextVar("mira_context_room", default=None)
-active_turn = ContextVar("mira_context_turn", default=None)
 
 
 def read_context(adapter, name: str, limit: int = 50) -> dict:

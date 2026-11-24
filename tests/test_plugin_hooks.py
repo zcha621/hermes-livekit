@@ -53,6 +53,9 @@ class PluginHookTests(unittest.IsolatedAsyncioTestCase):
                 "get_meeting_transcript",
             ],
         )
+        import yaml
+        declared = yaml.safe_load((PLUGIN_ROOT / "plugin.yaml").read_text())["provides_tools"]
+        self.assertEqual(set(declared), set(registered_tool_names))
         hook_names = [call.args[0] for call in context.register_hook.call_args_list]
         self.assertEqual(
             hook_names, ["post_api_request", "on_session_finalize"]
