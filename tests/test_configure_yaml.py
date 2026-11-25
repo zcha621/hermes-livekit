@@ -50,7 +50,13 @@ class ConfigureYamlTests(unittest.TestCase):
             config = yaml.safe_load(path.read_text(encoding="utf-8"))
             self.assertEqual(config["agent"]["system_prompt"], "Keep this prompt.")
             extra = config["platforms"]["livekit"]["extra"]
-            self.assertEqual(extra["acknowledgements"], {"enabled": False})
+            self.assertEqual(extra["acknowledgements"], {"enabled": True})
+            self.assertEqual(config["display"]["busy_input_mode"], "steer")
+            surface = config["display"]["platforms"]["livekit"]
+            self.assertTrue(surface["interim_assistant_messages"])
+            self.assertTrue(surface["long_running_notifications"])
+            self.assertFalse(surface["streaming"])
+            self.assertEqual(surface["tool_progress"], "off")
             self.assertEqual(extra["audio"]["silence_threshold_seconds"], 0.7)
             self.assertEqual(extra["audio"]["min_speech_duration_seconds"], 0.3)
             self.assertEqual(
@@ -397,6 +403,28 @@ class ConfigureYamlTests(unittest.TestCase):
             )
         finally:
             path.unlink(missing_ok=True)
+
+    def test_conversation_only_preserves_host_settings_and_is_idempotent(self):
+        original = {
+            "model": {"model": "custom-model", "base_url": "https://model.invalid"},
+            "tts": {"provider": "openai", "openai": {"voice": "custom-voice"}},
+            "platform_toolsets": {"livekit": ["custom-toolset"]},
+            "platforms": {"livekit": {"extra": {"acknowledgements": {
+                "enabled": False, "phrases": ["Let me check."]}}}},
+            "display": {"platforms": {"discord": {"streaming": True}}},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(yaml.safe_dump(original), encoding="utf-8")
+            self.assertTrue(configure_yaml.update_conversation_config(path))
+            result = yaml.safe_load(path.read_text(encoding="utf-8"))
+            for name in ("model", "tts", "platform_toolsets"):
+                self.assertEqual(result[name], original[name])
+            self.assertEqual(result["platforms"]["livekit"]["extra"]["acknowledgements"]["phrases"], ["Let me check."])
+            self.assertEqual(result["display"]["platforms"]["discord"], {"streaming": True})
+            unchanged = path.read_bytes()
+            self.assertFalse(configure_yaml.update_conversation_config(path))
+            self.assertEqual(path.read_bytes(), unchanged)
 
 
 if __name__ == "__main__":

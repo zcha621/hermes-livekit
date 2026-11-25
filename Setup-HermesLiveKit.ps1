@@ -544,9 +544,9 @@ try {
         & $pythonExe @yamlArguments
         if ($LASTEXITCODE -ne 0) { throw "Hermes LiveKit YAML update failed." }
         & $hermesExe config set voice.auto_tts true
-        & $hermesExe config set display.busy_input_mode interrupt
+        & $hermesExe config set display.busy_input_mode steer
         & $hermesExe config set display.platforms.livekit.streaming false
-        & $hermesExe config set display.platforms.livekit.long_running_notifications false
+        & $hermesExe config set display.platforms.livekit.long_running_notifications true
         & $hermesExe config set display.platforms.livekit.busy_ack_detail false
 
         & $pythonExe -c "import livekit.rtc, livekit.api, PIL, yaml; print('Dependency check: OK')"

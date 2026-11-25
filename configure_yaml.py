@@ -182,7 +182,7 @@ def update_config(
         "frame_max_age_seconds": 10,
         "image_stream_topics": ["test", "hermes-image"],
     }
-    extra["acknowledgements"] = {"enabled": False}
+    apply_conversation_defaults(config)
     extra["invocation"] = {
         "enabled": True,
         "keyterms": list(INVOCATION_KEYTERMS),
@@ -331,6 +331,10 @@ def update_config(
         if str(edge.get("voice") or "") in STOCK_EDGE_VOICES:
             edge["voice"] = DEFAULT_NEW_ZEALAND_VOICE
 
+    _write_config(config_path, config)
+
+
+def _write_config(config_path: Path, config: dict) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{config_path.name}.", suffix=".tmp", dir=config_path.parent
@@ -349,6 +353,42 @@ def update_config(
         raise
 
 
+def apply_conversation_defaults(config: dict) -> None:
+    """Managed LiveKit conversation policy, shared by both host installers."""
+    def mapping(parent, key):
+        value = parent.setdefault(key, {})
+        if not isinstance(value, dict):
+            raise ValueError(f"Hermes {key} config must be a YAML mapping")
+        return value
+    livekit = mapping(mapping(config, "platforms"), "livekit")
+    mapping(mapping(livekit, "extra"), "acknowledgements")["enabled"] = True
+    display = mapping(config, "display")
+    display["busy_input_mode"] = "steer"
+    # Complete commentary works for text and voice; token fragments cannot be
+    # edited in this transport and would become repeated/unfinished speech.
+    mapping(mapping(display, "platforms"), "livekit").update({
+        "streaming": False,
+        "interim_assistant_messages": True,
+        "long_running_notifications": True,
+        "tool_progress": "off",
+        "busy_ack_detail": False,
+    })
+
+
+def update_conversation_config(config_path: Path) -> bool:
+    """Apply only conversation flags, preserving inference, voices and tools."""
+    import copy
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8-sig")) or {}
+    if not isinstance(config, dict):
+        raise ValueError("Hermes config root must be a YAML mapping")
+    previous = copy.deepcopy(config)
+    apply_conversation_defaults(config)
+    if config == previous:
+        return False
+    _write_config(config_path, config)
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, type=Path)
@@ -358,7 +398,11 @@ def main() -> None:
     parser.add_argument("--hermes-root", type=Path)
     parser.add_argument("--mcp-python-exe", default="")
     parser.add_argument("--reverse-geocoder-env", action="store_true")
+    parser.add_argument("--conversation-only", action="store_true")
     args = parser.parse_args()
+    if args.conversation_only:
+        print("changed" if update_conversation_config(args.config) else "unchanged")
+        return
     update_config(
         args.config,
         auxiliary_model=args.auxiliary_model,

@@ -21,6 +21,7 @@ from typing import Optional
 try:
     from .adapter import (  # type: ignore[import-not-found]  # noqa: E402
         LIVE_ADAPTERS,
+        active_room,
         LiveKitAdapter,
         MultiRoomLiveKitAdapter,
         check_livekit_requirements,
@@ -28,6 +29,7 @@ try:
 except ImportError:  # Direct-file test and legacy entry-point compatibility.
     from adapter import (  # noqa: E402
         LIVE_ADAPTERS,
+        active_room,
         LiveKitAdapter,
         MultiRoomLiveKitAdapter,
         check_livekit_requirements,
@@ -155,6 +157,18 @@ def _on_post_api_request_hook(**kwargs) -> None:
         str(kwargs.get("platform") or "?"),
     )
 
+def _on_pre_tool_call_hook(**kwargs) -> None:
+    """Acknowledge the first tool only in the originating LiveKit turn."""
+    adapter = active_room.get()
+    if adapter is not None:
+        adapter.bind_tool_acknowledgement_session(str(kwargs.get("session_id") or ""))
+        adapter.schedule_tool_acknowledgement(
+            session_id=str(kwargs.get("session_id") or ""),
+            turn_id=str(kwargs.get("turn_id") or ""),
+            tool_call_id=str(kwargs.get("tool_call_id") or ""),
+        )
+
+
 def _on_session_finalize_hook(session_id="", **kwargs) -> None:
     """Cancel pending remote tool calls when the user resets the session.
 
@@ -191,6 +205,15 @@ map viewport, camera, persona or past conversation. Distinguish the on-site phon
 participant from the remote speaker; report stale fixes as last known and missing
 GPS as unavailable. Refer to the saved itinerary for planning and use the
 speaker-labelled meeting transcript to recall what participants said.
+Keep the conversation responsive while working. Before a task that needs tools,
+give a brief, natural acknowledgement describing what you will check. Share useful
+findings or changes in plan between steps, then deliver the result when ready.
+For lengthy independent work, use delegate_task when available. Follow its
+background-delivery instructions: once dispatched, give a short status and end
+your turn so you can respond to the user while the work continues. Handle the
+completion message and update the user; never claim success before the result.
+Answer follow-up questions naturally and preserve unfinished work unless the
+user explicitly asks to stop it. Do not narrate internal tool names or reasoning.
 For this realtime Qwen route, respond without extended reasoning so a selected
 tool can start immediately.
 /no_think"""
@@ -364,6 +387,7 @@ def register(ctx) -> None:
     # hook releases in-flight futures during reset.
     try:
         ctx.register_middleware("llm_request", _qwen_realtime_request_middleware)
+        ctx.register_hook("pre_tool_call", _on_pre_tool_call_hook)
         ctx.register_hook("post_api_request", _on_post_api_request_hook)
         ctx.register_hook("on_session_finalize", _on_session_finalize_hook)
     except Exception as exc:

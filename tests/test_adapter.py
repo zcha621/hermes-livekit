@@ -536,7 +536,7 @@ class AdapterTests(unittest.TestCase):
     def test_voice_defaults_prioritize_low_latency(self):
         self.assertEqual(self.adapter._silence_threshold_seconds, 0.7)
         self.assertEqual(self.adapter._min_speech_duration_seconds, 0.3)
-        self.assertFalse(self.adapter._ack_enabled)
+        self.assertTrue(self.adapter._ack_enabled)
         self.assertEqual(
             self.adapter._ack_phrases,
             livekit_adapter.DEFAULT_ACK_PHRASES,
@@ -1176,24 +1176,12 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "alice",
             )
 
-            # The agent's speech is flushed and the press itself starts a
-            # held @Agent turn immediately — neither waits on the backend
-            # /stop dispatch below, which is why this holds before the
-            # event loop even gets a chance to run that background task.
+            # Speech stops immediately, but the press never cancels backend work.
             self.assertTrue(source.cleared)
             self.assertTrue(self.adapter._playback_interrupt.is_set())
             self.assertEqual(self.adapter._push_to_talk_sessions["alice"], "press-1")
-            dispatched.assert_not_awaited()
-
-            # The prior turn's backend work is still dropped via the
-            # priority /stop, just as a background task instead of
-            # blocking this press.
             await asyncio.sleep(0)
-
-        dispatched.assert_awaited_once()
-        event = dispatched.await_args.args[0]
-        self.assertEqual(event.text, "/stop")
-        self.assertEqual(event.source.user_id, "alice")
+        dispatched.assert_not_awaited()
 
     async def test_push_to_talk_start_skips_stop_dispatch_when_agent_is_idle(self):
         self.adapter._room = SimpleNamespace(
@@ -1518,23 +1506,15 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
         os.unlink(path)
         published.assert_awaited()
 
-    async def test_tool_acknowledgement_is_spoken_with_transcript_caption(self):
-        self.adapter._room = object()
-        self.adapter._active_sessions["session"] = asyncio.Event()
+    async def test_first_tool_acknowledgement_uses_interim_delivery(self):
+        self.adapter._running = True
         phrase = livekit_adapter.DEFAULT_ACK_PHRASES[0]
-        self.adapter._tool_ack_audio_paths[phrase] = __file__
-
-        with (
-            patch.object(livekit_adapter.random, "choice", return_value=phrase),
-            patch.object(self.adapter, "play_tts", AsyncMock()) as play,
-        ):
+        with patch.object(livekit_adapter.random, "choice", return_value=phrase), \
+                patch.object(self.adapter, "send", AsyncMock()) as send:
             await self.adapter._play_tool_acknowledgement(0)
-
-        play.assert_awaited_once_with(
-            "test-room",
-            __file__,
-            metadata={"non_conversational": True, "tool_acknowledgement": True},
-            caption=phrase,
+        send.assert_awaited_once_with(
+            "test-room", phrase,
+            metadata={"_interim_send": True, "tool_acknowledgement": True},
         )
 
 

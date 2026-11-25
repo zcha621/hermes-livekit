@@ -540,7 +540,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._image_stream_topics = tuple(
             str(topic).strip() for topic in topics if str(topic).strip()
         ) if isinstance(topics, (list, tuple)) else DEFAULT_IMAGE_STREAM_TOPICS
-        self._ack_enabled = self._config_bool(ack_config.get("enabled"), False)
+        self._ack_enabled = self._config_bool(ack_config.get("enabled"), True)
         phrases = ack_config.get("phrases", DEFAULT_ACK_PHRASES)
         if isinstance(phrases, str):
             phrases = [phrases]
@@ -682,6 +682,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._is_playing = False
         self._playback_interrupt = asyncio.Event()
         self._playback_lock = asyncio.Lock()
+        self._conversation_update_lock = asyncio.Lock()
         self._stt_lock = asyncio.Lock()
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._tool_ack_generation = 0
@@ -700,6 +701,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._invoked_turn_generation = 0
         self._participant_topics: Dict[str, str] = {}
         self._participant_call_ids: Dict[str, str] = {}
+        self._reply_modalities: Dict[str, bool] = {}
         # Salts every Hermes chat_id this occupancy of the room produces
         # (see _source_chat_id). Regenerated in _reset_room_context so a
         # room that empties out and is rejoined later — even by the same
@@ -914,6 +916,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         """Forget conversational state when the room session ends."""
         self._participant_topics.clear()
         self._participant_call_ids.clear()
+        self._reply_modalities.clear()
         self._session_epoch = uuid.uuid4().hex[:12]
         self._armed_participant_wakes.clear()
         self._agent_profile_cache.clear()
@@ -2426,7 +2429,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         """Arm one acknowledgement for the next real tool call in this turn."""
         self._event_loop = asyncio.get_running_loop()
         self._tool_ack_generation += 1
-        self._tool_ack_pending = self._ack_enabled and not _text_only_turn.get()
+        self._tool_ack_pending = self._ack_enabled
+        self._conversation_update_seen = False
         self._tool_ack_session_id = ""
 
     def bind_tool_acknowledgement_session(self, session_id: str) -> None:
@@ -2474,44 +2478,55 @@ class LiveKitAdapter(BasePlatformAdapter):
 
     async def _play_tool_acknowledgement(self, generation: int) -> None:
         """Speak one short phrase only while the originating turn is active."""
-        phrase = random.choice(self._ack_phrases)
+        if (generation != self._tool_ack_generation or not self._running
+                or getattr(self, "_conversation_update_seen", False)):
+            return
+        await self.send(
+            self._room_name, random.choice(self._ack_phrases),
+            metadata={"_interim_send": True, "tool_acknowledgement": True},
+        )
+
+    async def _speak_conversation_update(self, text: str, generation: int) -> None:
+        # Preserve conversational order even when synthesis latency varies.
+        async with self._conversation_update_lock:
+            await self._synthesize_conversation_update(text, generation)
+
+    async def _synthesize_conversation_update(self, text: str, generation: int) -> None:
+        """Synthesize off-loop without delaying tools; discard stale updates.
+
+        Use a unique file per request: profiles can choose different voices and
+        credentials, so a shared phrase cache could speak with another voice.
+        """
+        output_path = ""
         try:
-            audio_path = self._tool_ack_audio_paths.get(phrase, "")
-            if not audio_path or not os.path.isfile(audio_path):
-                from tools.tts_tool import check_tts_requirements, text_to_speech_tool
-
-                if not check_tts_requirements():
-                    return
-                digest = hashlib.sha256(phrase.encode("utf-8")).hexdigest()[:12]
-                output_path = os.path.join(
-                    tempfile.gettempdir(), "hermes_livekit", f"tool_ack_{digest}.mp3"
-                )
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                raw_result = await asyncio.to_thread(
-                    text_to_speech_tool,
-                    text=phrase,
-                    output_path=output_path,
-                )
-                result = json.loads(raw_result)
-                audio_path = str(result.get("file_path") or output_path)
-                if not result.get("success", True) or not os.path.isfile(audio_path):
-                    return
-                self._tool_ack_audio_paths[phrase] = audio_path
-
-            # Do not let a late TTS synthesis talk over a response that has
-            # already completed or a newer user turn.
-            if generation != self._tool_ack_generation or not self._active_sessions:
+            if generation != self._tool_ack_generation or not self._room:
+                return
+            from tools.tts_tool import check_tts_requirements, text_to_speech_tool
+            if not check_tts_requirements():
+                return
+            directory = os.path.join(tempfile.gettempdir(), "hermes_livekit")
+            os.makedirs(directory, exist_ok=True)
+            output_path = os.path.join(directory, f"update_{uuid.uuid4().hex}.mp3")
+            result = json.loads(await asyncio.to_thread(
+                text_to_speech_tool, text=text, output_path=output_path,
+            ))
+            if (generation != self._tool_ack_generation
+                    or not result.get("success", True)
+                    or not os.path.isfile(output_path)):
                 return
             await self.play_tts(
-                self._room_name,
-                audio_path,
-                metadata={"non_conversational": True, "tool_acknowledgement": True},
-                caption=phrase,
+                self._room_name, output_path, caption=text,
+                metadata={"_interim_send": True,
+                          "_livekit_update_generation": generation,
+                          "_livekit_transcript_recorded": True},
             )
         except asyncio.CancelledError:
-            return
-        except Exception as exc:
-            logger.debug("[%s] tool acknowledgement failed: %s", self.name, exc)
+            raise
+        except Exception:
+            logger.debug("[%s] Conversation update speech failed", self.name, exc_info=True)
+        finally:
+            if output_path and os.path.isfile(output_path):
+                os.unlink(output_path)
 
     def _finish_tool_acknowledgement_turn(self) -> None:
         self._tool_ack_generation += 1
@@ -2994,6 +3009,17 @@ class LiveKitAdapter(BasePlatformAdapter):
             await super().handle_message(event)
             return
 
+        if getattr(event, "internal", False):
+            # Hermes-generated completion events are not ambient user speech.
+            # Admit only sessions opened in this occupancy; never publish the
+            # internal completion envelope as a participant transcript.
+            chat_id = str(event.source.chat_id)
+            if not self._room or chat_id not in self._reply_modalities:
+                return
+            event._livekit_text_only = self._reply_modalities[chat_id]
+            event._livekit_invocation_checked = True
+            self._activate_invoked_turn()
+
         if not getattr(event, "_livekit_invocation_checked", False):
             if not await self._prepare_invoked_event(
                 event,
@@ -3005,6 +3031,13 @@ class LiveKitAdapter(BasePlatformAdapter):
                 ),
             ):
                 return
+
+        if not getattr(event, "internal", False):
+            chat_id = str(getattr(event.source, "chat_id", "") or "")
+            if chat_id:
+                self._reply_modalities[chat_id] = bool(
+                    getattr(event, "_livekit_text_only", False)
+                )
 
         # Route the turn to the room's agent profile so the multiplexer
         # scopes SOUL.md, skills, and memories to that profile's home.
@@ -3037,6 +3070,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         token = active_room.set(worker)
         turn_token = active_turn.set(event)
         text_token = _text_only_turn.set(bool(getattr(event, "_livekit_text_only", False)))
+        worker._arm_tool_acknowledgement()
         try:
             if callable(scope):
                 with scope(event.source):
@@ -3044,6 +3078,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             else:
                 await super()._process_message_background(event, session_key)
         finally:
+            worker._finish_tool_acknowledgement_turn()
             active_turn.reset(turn_token)
             _text_only_turn.reset(text_token)
             active_room.reset(token)
@@ -4156,20 +4191,11 @@ class LiveKitAdapter(BasePlatformAdapter):
             )
             return
 
-        # Pressing @Agent is a barge-in: if Hermes is mid-speech or still
-        # generating/running tools for a prior turn, drop that work immediately
-        # instead of making this request queue behind it. The playback flush
-        # is synchronous (audio cuts the instant the button is pressed); the
-        # backend /stop dispatch runs in the background so cancelling a
-        # prior turn never delays this press from starting to listen — see
-        # _dispatch_stop_command's docstring.
-        # `_conversation_is_active()` alone can go stale (see
-        # `_handle_client_interrupt`); `_is_playing` catches a real in-flight
-        # turn this flag hasn't caught up to yet.
+        # Barge-in stops speech, while the gateway steers the follow-up into
+        # unfinished work. Only the explicit Stop agent control sends /stop.
         if self._conversation_is_active() or self._is_playing:
             self._interrupt_playback(identity)
             self._finish_tool_acknowledgement_turn()
-            asyncio.create_task(self._dispatch_stop_command(identity, request_id))
 
         self._push_to_talk_sessions[identity] = request_id
         if identity in self._audio_buffers:
@@ -4811,8 +4837,9 @@ class LiveKitAdapter(BasePlatformAdapter):
         if not self._room:
             return SendResult(success=False, error="Not connected to room")
 
-        if (metadata or {}).get("non_conversational") or (metadata or {}).get("_interim_send"):
+        if (metadata or {}).get("non_conversational"):
             return SendResult(success=True)
+        interim = bool((metadata or {}).get("_interim_send"))
         original_content = content
         content = _meeting_output_text(content)
         if not content:
@@ -4820,8 +4847,12 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         # A normal response closes the acknowledgement window. Telemetry and
         # tool cues are explicitly non-conversational and must not do so.
-        if not (metadata or {}).get("non_conversational"):
+        if not interim:
             self._finish_tool_acknowledgement_turn()
+        else:
+            # A meaningful update replaces the generic first-tool cue.
+            self._tool_ack_pending = False
+            self._conversation_update_seen = True
 
         try:
             data = content.encode("utf-8")
@@ -4830,6 +4861,19 @@ class LiveKitAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             logger.debug("[%s] Data channel send failed (non-critical): %s", self.name, e)
+
+        if interim:
+            await self._record_agent_transcript(
+                content, kind="acknowledgement" if (metadata or {}).get("tool_acknowledgement") else "commentary",
+                publish_standard=False,
+            )
+            if self._should_auto_tts_for_chat(chat_id):
+                task = asyncio.create_task(self._speak_conversation_update(
+                    content, self._tool_ack_generation,
+                ))
+                self._tool_ack_tasks.add(task)
+                task.add_done_callback(self._tool_ack_tasks.discard)
+            return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
 
         # Auto-TTS runs before text delivery. If that speech was already
         # logged, do not duplicate the same assistant turn; otherwise log the
@@ -4870,7 +4914,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         if not self._audio_source or not self._room:
             return SendResult(success=False, error="Not connected to room")
 
-        notice = (metadata or {}).get("non_conversational") or (metadata or {}).get("_interim_send")
+        notice = (metadata or {}).get("non_conversational")
+        interim = bool((metadata or {}).get("_interim_send"))
         acknowledgement = (metadata or {}).get("tool_acknowledgement")
         verified = _runner_voice_script.get()
         if verified is not None and verified[0] is not self:
@@ -4885,7 +4930,12 @@ class LiveKitAdapter(BasePlatformAdapter):
             logger.info("[%s] Suppressed non-conversational/unverified speech", self.name)
             return SendResult(success=True)
 
+        if not interim and not acknowledgement:
+            self._finish_tool_acknowledgement_turn()
         async with self._playback_lock:
+            update_generation = (metadata or {}).get("_livekit_update_generation")
+            if update_generation is not None and update_generation != self._tool_ack_generation:
+                return SendResult(success=True)
             speaking_generation = 0
             turn_generation = self._invoked_turn_generation
             try:
@@ -4920,8 +4970,9 @@ class LiveKitAdapter(BasePlatformAdapter):
                             if (metadata or {}).get("tool_acknowledgement")
                             else "speech"
                         )
-                        await self._record_agent_transcript(spoken_text, kind=kind)
-                        if not (metadata or {}).get("non_conversational"):
+                        if not (metadata or {}).get("_livekit_transcript_recorded"):
+                            await self._record_agent_transcript(spoken_text, kind=kind)
+                        if not notice and not interim:
                             self._last_spoken_source = source_text
                     self._prepared_tts_source = ""
                     self._prepared_tts_text = ""
@@ -4965,11 +5016,14 @@ class LiveKitAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=str(e))
             finally:
                 self._is_playing = False
-                if not (metadata or {}).get("non_conversational"):
+                if not notice and not interim:
                     self._finish_invoked_turn(turn_generation)
                 await self._publish_agent_event("agent:speaking-stop")
                 if speaking_generation:
-                    await self._finish_state_if_current(speaking_generation)
+                    if interim and self._agent_state_generation == speaking_generation:
+                        await self._set_agent_state("thinking")
+                    else:
+                        await self._finish_state_if_current(speaking_generation)
 
     async def send_voice(
         self,

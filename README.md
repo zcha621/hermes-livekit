@@ -243,9 +243,22 @@ tool, and child-agent work regardless of the configured busy-input mode.
 
 ## Low-latency voice path
 
-Tool acknowledgements are disabled and the plugin registers no pre-tool cue
-hook, so a selected tool starts without an extra TTS request. Ordinary and
-tool-using turns both stay in Hermes's normal response loop.
+Conversation updates are enabled. Hermes can send a short natural acknowledgement
+before tools and useful updates between steps. If it starts a tool without a
+message, a first-tool hook sends one brief fallback acknowledgement. Text chat
+receives text only; voice turns also speak updates asynchronously, without
+holding up the tool. Internal reasoning and operational notices remain filtered.
+
+Interim speech leaves the task active and returns the status to thinking. Late
+speech is discarded when a final response, stop, or newer turn supersedes it.
+Push-to-talk interrupts audio while preserving backend work; **Stop agent**
+still cancels it. The gateway uses `busy_input_mode: steer` for follow-ups.
+A blocking tool accepts steering at its next safe boundary. For longer independent
+work, Hermes is instructed to use its native background `delegate_task`, end the
+foreground turn, continue chatting, and report the completion message afterward.
+This requires a Hermes version with asynchronous delegation (the deployed
+`0f02b4d4346` runtime supports it); an acknowledgement alone is not a separate
+background conversation worker.
 
 The realtime Spark Qwen request middleware sends its native
 `extra_body.enable_thinking: false` flag and a final `/no_think` marker on the
@@ -449,7 +462,7 @@ platforms:
           - test
           - hermes-image
       acknowledgements:
-        enabled: false
+        enabled: true
       invocation:
         enabled: true
         keyterms:
@@ -489,11 +502,13 @@ voice:
   auto_tts: true
 
 display:
-  busy_input_mode: interrupt
+  busy_input_mode: steer
   platforms:
     livekit:
       streaming: false
-      long_running_notifications: false
+      interim_assistant_messages: true
+      long_running_notifications: true
+      tool_progress: off
       busy_ack_detail: false
 ```
 
@@ -513,7 +528,10 @@ isolated research room must be accepted, rerun setup with `-AllowAllUsers` after
 reviewing the room-token and participant-admission policy. Upgrades preserve an
 existing explicit `true` or `false` value.
 
-The setup keeps `acknowledgements.enabled: false` for the thin transport path.
+Windows setup and Linux deployment enable the same conversation policy. Linux
+uses `configure_yaml.py --config <home>/config.yaml --conversation-only`, which
+preserves models, tools, custom phrases and voices. Profile sync inherits these
+settings from the base home.
 The setup changes the stock US Edge voice to the New Zealand English Molly
 voice, but preserves any custom voice or provider. It does not alter STT.
 
@@ -569,8 +587,9 @@ gateway.
 A useful call check is:
 
 1. Ask a question that needs no tool. MiRA should answer directly.
-2. Ask a question that requires a tool. The tool should start without a
-   separate acknowledgement turn, then MiRA should deliver the answer.
+2. Ask a question that requires a tool. An acknowledgement should arrive before
+   the result, then MiRA should deliver the answer. During a long delegated task,
+   ask a follow-up and confirm the task completes and reports back afterward.
 3. Ask a multi-tool question. Hermes should choose and sequence the tools.
 4. Speak during playback. MiRA should stop and listen.
 5. While MiRA is working or speaking, use **Stop agent** and confirm playback

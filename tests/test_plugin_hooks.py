@@ -76,7 +76,7 @@ class PluginHookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(declared), set(registered_tool_names))
         hook_names = [call.args[0] for call in context.register_hook.call_args_list]
         self.assertEqual(
-            hook_names, ["post_api_request", "on_session_finalize"]
+            hook_names, ["pre_tool_call", "post_api_request", "on_session_finalize"]
         )
         context.register_middleware.assert_called_once_with(
             "llm_request", plugin._qwen_realtime_request_middleware
@@ -193,6 +193,31 @@ class PluginHookTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(seed)
         self.assertNotIn("agent_name", seed)
+
+    async def test_tool_hook_is_thread_safe_and_scoped_to_the_originating_room(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+        from test_adapter import make_adapter, livekit_adapter
+        worker = make_adapter()
+        unrelated = make_adapter()
+        worker._running = True
+        worker._room = object()
+        worker._arm_tool_acknowledgement()
+        token = plugin.active_room.set(worker)
+        try:
+            with patch.object(worker, "send", AsyncMock()) as send, \
+                    patch.object(unrelated, "send", AsyncMock()) as other:
+                await asyncio.to_thread(plugin._on_pre_tool_call_hook,
+                                        session_id="session", tool_call_id="call")
+                await asyncio.sleep(0)
+                await asyncio.gather(*list(worker._tool_ack_tasks))
+                send.assert_awaited_once()
+                other.assert_not_awaited()
+                self.assertEqual(worker._tool_ack_session_id, "session")
+        finally:
+            plugin.active_room.reset(token)
+            livekit_adapter.LIVE_ADAPTERS.discard(worker)
+            livekit_adapter.LIVE_ADAPTERS.discard(unrelated)
 
 if __name__ == "__main__":
     unittest.main()
