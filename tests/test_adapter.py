@@ -7,7 +7,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import gateway.config as gateway_config
 from gateway.config import PlatformConfig
@@ -1181,6 +1181,20 @@ class AsyncAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(self.adapter._playback_interrupt.is_set())
             self.assertEqual(self.adapter._push_to_talk_sessions["alice"], "press-1")
             await asyncio.sleep(0)
+        dispatched.assert_not_awaited()
+
+    async def test_push_to_talk_flushes_speech_even_after_invocation_flag_is_cleared(self):
+        source = SimpleNamespace(clear_queue=Mock())
+        self.adapter._audio_source = source
+        self.adapter._is_playing = True
+        self.adapter._invoked_turn_active = False
+        with patch.object(self.adapter, '_publish_agent_event', AsyncMock()), \
+                patch.object(self.adapter, '_set_listening_state', AsyncMock()), \
+                patch.object(self.adapter, 'handle_message', AsyncMock()) as dispatched:
+            await self.adapter._handle_push_to_talk_start({'request_id': 'press-stale'}, 'alice')
+        self.assertTrue(self.adapter._playback_interrupt.is_set())
+        source.clear_queue.assert_called_once()
+        self.assertEqual(self.adapter._push_to_talk_sessions['alice'], 'press-stale')
         dispatched.assert_not_awaited()
 
     async def test_push_to_talk_start_skips_stop_dispatch_when_agent_is_idle(self):

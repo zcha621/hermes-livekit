@@ -246,6 +246,7 @@ def _meeting_output_text(text: str) -> str:
 # never in another room's mutable preparation cache.
 _runner_voice_script = ContextVar("livekit_runner_voice_script", default=None)
 _text_only_turn = ContextVar("livekit_text_only_turn", default=False)
+_prepared_voice_generation = ContextVar("livekit_prepared_voice_generation", default=None)
 
 
 def _install_runner_voice_preparation(runner) -> None:
@@ -277,7 +278,7 @@ def _install_runner_voice_preparation(runner) -> None:
         script = worker.prepare_tts_text(text)
         if not script:
             return
-        token = _runner_voice_script.set((worker, script, text))
+        token = _runner_voice_script.set((worker, script, text, worker._speech_generation))
         try:
             return await original(event, script)
         finally:
@@ -541,6 +542,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             str(topic).strip() for topic in topics if str(topic).strip()
         ) if isinstance(topics, (list, tuple)) else DEFAULT_IMAGE_STREAM_TOPICS
         self._ack_enabled = self._config_bool(ack_config.get("enabled"), True)
+        self._ack_delay_seconds = self._nonnegative_float(ack_config.get("delay_seconds"), 2.0)
         phrases = ack_config.get("phrases", DEFAULT_ACK_PHRASES)
         if isinstance(phrases, str):
             phrases = [phrases]
@@ -681,11 +683,13 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._paused = False
         self._is_playing = False
         self._playback_interrupt = asyncio.Event()
+        self._speech_generation = 0
         self._playback_lock = asyncio.Lock()
         self._conversation_update_lock = asyncio.Lock()
         self._stt_lock = asyncio.Lock()
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._tool_ack_generation = 0
+        self._turn_ack_timer: Optional[asyncio.Task] = None
         self._tool_ack_pending = False
         self._tool_ack_session_id = ""
         self._tool_ack_tasks: set[asyncio.Task] = set()
@@ -2426,12 +2430,28 @@ class LiveKitAdapter(BasePlatformAdapter):
             await self._set_agent_state("idle")
 
     def _arm_tool_acknowledgement(self) -> None:
-        """Arm one acknowledgement for the next real tool call in this turn."""
+        """Acknowledge slow turns even when context lets the model skip tools."""
+        self._cancel_turn_ack_timer()
         self._event_loop = asyncio.get_running_loop()
         self._tool_ack_generation += 1
         self._tool_ack_pending = self._ack_enabled
         self._conversation_update_seen = False
         self._tool_ack_session_id = ""
+        if self._ack_enabled:
+            self._turn_ack_timer = asyncio.create_task(
+                self._acknowledge_slow_turn(self._tool_ack_generation))
+
+    def _cancel_turn_ack_timer(self) -> None:
+        if self._turn_ack_timer is not None:
+            self._turn_ack_timer.cancel()
+            self._turn_ack_timer = None
+
+    async def _acknowledge_slow_turn(self, generation: int) -> None:
+        await asyncio.sleep(self._ack_delay_seconds)
+        if (generation == self._tool_ack_generation and self._tool_ack_pending
+                and self._running and self._room is not None):
+            self._tool_ack_pending = False
+            self._start_tool_ack_task(generation)
 
     def bind_tool_acknowledgement_session(self, session_id: str) -> None:
         """Bind the armed LiveKit turn to Hermes's persisted session ID."""
@@ -2529,6 +2549,7 @@ class LiveKitAdapter(BasePlatformAdapter):
                 os.unlink(output_path)
 
     def _finish_tool_acknowledgement_turn(self) -> None:
+        self._cancel_turn_ack_timer()
         self._tool_ack_generation += 1
         self._tool_ack_pending = False
         self._tool_ack_session_id = ""
@@ -2919,6 +2940,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._video_track_meta.clear()
         self._latest_video_frames.clear()
 
+        self._finish_tool_acknowledgement_turn()
         for task in list(self._tool_ack_tasks):
             task.cancel()
         self._tool_ack_tasks.clear()
@@ -3070,17 +3092,20 @@ class LiveKitAdapter(BasePlatformAdapter):
         token = active_room.set(worker)
         turn_token = active_turn.set(event)
         text_token = _text_only_turn.set(bool(getattr(event, "_livekit_text_only", False)))
-        worker._arm_tool_acknowledgement()
+        voice_token = _prepared_voice_generation.set(None)
         try:
             if callable(scope):
                 with scope(event.source):
+                    worker._arm_tool_acknowledgement()
                     await super()._process_message_background(event, session_key)
             else:
+                worker._arm_tool_acknowledgement()
                 await super()._process_message_background(event, session_key)
         finally:
             worker._finish_tool_acknowledgement_turn()
             active_turn.reset(turn_token)
             _text_only_turn.reset(text_token)
+            _prepared_voice_generation.reset(voice_token)
             active_room.reset(token)
 
     # -- LiveKit event handlers ---------------------------------------------
@@ -3634,9 +3659,13 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._video_track_meta.pop(key, None)
             self._latest_video_frames.pop(key, None)
 
-    def _interrupt_playback(self, identity: str) -> bool:
-        if not self._is_playing or not self._conversation_is_active():
+    def _interrupt_playback(self, identity: str, *, explicit: bool = False) -> bool:
+        # An authorized button press must flush actual audio even after the
+        # conversation flag was cleared, and invalidate in-flight synthesis.
+        # Ambient VAD retains its invocation gate.
+        if not explicit and (not self._is_playing or not self._conversation_is_active()):
             return False
+        self._speech_generation += 1
         logger.info("[%s] Barge-in detected from %s; stopping TTS", self.name, identity)
         self._playback_interrupt.set()
         if self._audio_source is not None:
@@ -4193,9 +4222,8 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         # Barge-in stops speech, while the gateway steers the follow-up into
         # unfinished work. Only the explicit Stop agent control sends /stop.
-        if self._conversation_is_active() or self._is_playing:
-            self._interrupt_playback(identity)
-            self._finish_tool_acknowledgement_turn()
+        self._interrupt_playback(identity, explicit=True)
+        self._finish_tool_acknowledgement_turn()
 
         self._push_to_talk_sessions[identity] = request_id
         if identity in self._audio_buffers:
@@ -4332,7 +4360,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         first if it needs to report a distinct "nothing to interrupt"
         outcome.
         """
-        self._interrupt_playback(identity)
+        self._interrupt_playback(identity, explicit=True)
         self._finish_tool_acknowledgement_turn()
         await self._dispatch_stop_command(identity, request_id)
 
@@ -4930,9 +4958,17 @@ class LiveKitAdapter(BasePlatformAdapter):
             logger.info("[%s] Suppressed non-conversational/unverified speech", self.name)
             return SendResult(success=True)
 
+        prepared_generation = _prepared_voice_generation.get()
+        speech_generation = (
+            verified[3] if verified else
+            prepared_generation[1] if prepared_generation and prepared_generation[0] is self
+            else self._speech_generation
+        )
         if not interim and not acknowledgement:
             self._finish_tool_acknowledgement_turn()
         async with self._playback_lock:
+            if speech_generation != self._speech_generation or self._push_to_talk_sessions:
+                return SendResult(success=True)
             update_generation = (metadata or {}).get("_livekit_update_generation")
             if update_generation is not None and update_generation != self._tool_ack_generation:
                 return SendResult(success=True)
@@ -4947,6 +4983,8 @@ class LiveKitAdapter(BasePlatformAdapter):
                 )
                 if not pcm_data:
                     return SendResult(success=False, error="Failed to decode audio")
+                if speech_generation != self._speech_generation or self._push_to_talk_sessions:
+                    return SendResult(success=True)
 
                 # The room may have been torn down while the LLM reply was
                 # being synthesized (the presence watch leaves when the last
@@ -5114,6 +5152,7 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         if _text_only_turn.get():
             return ""
+        _prepared_voice_generation.set((self, self._speech_generation))
         source_text = str(text or "")
         self._prepared_tts_source = ""
         self._prepared_tts_text = ""

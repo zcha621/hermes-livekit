@@ -1,4 +1,4 @@
-﻿"""Conversation delivery stays live while tools run, without ending the task."""
+"""Conversation delivery stays live while tools run, without ending the task."""
 import asyncio
 import json
 import tempfile
@@ -21,6 +21,7 @@ class ConversationUpdateTests(IsolatedAsyncioTestCase):
         self.worker._record_agent_transcript = AsyncMock()
         self.worker._activate_invoked_turn('MiRA')
         self.worker._arm_tool_acknowledgement()
+        self.addCleanup(self.worker._cancel_turn_ack_timer)
 
     async def test_typed_progress_arrives_before_blocked_tool_finishes_then_final(self):
         release = asyncio.Event()
@@ -188,3 +189,65 @@ class ConversationUpdateTests(IsolatedAsyncioTestCase):
             release.set()
             await asyncio.gather(*list(self.worker._tool_ack_tasks))
         self.assertEqual(heard, ['First update.', 'Second update.'])
+
+    async def test_slow_no_tool_turn_gets_one_acknowledgement_before_model_returns(self):
+        delivered = asyncio.Event()
+        self.worker._ack_delay_seconds = 0.01
+        async def send(*args, **kwargs):
+            delivered.set()
+        with patch.object(self.worker, 'send', side_effect=send) as send_mock:
+            self.worker._arm_tool_acknowledgement()
+            await asyncio.wait_for(delivered.wait(), 1)
+            self.assertTrue(self.worker._invoked_turn_active)
+            self.assertFalse(self.worker.schedule_tool_acknowledgement())
+            send_mock.assert_awaited_once()
+            self.assertTrue(send_mock.call_args.kwargs['metadata']['_interim_send'])
+
+    async def test_fast_final_and_natural_progress_suppress_timer_acknowledgement(self):
+        self.worker._ack_delay_seconds = 0.01
+        token = mod._text_only_turn.set(True)
+        try:
+            for metadata in ({}, {'_interim_send': True}):
+                self.publish.reset_mock()
+                self.worker._arm_tool_acknowledgement()
+                await self.worker.send('test-room', 'Here is the answer.', metadata=metadata)
+                await asyncio.sleep(0.04)
+                chat = [c for c in self.publish.call_args_list if c.kwargs.get('topic') == 'hermes-chat']
+                self.assertEqual(len(chat), 1)
+        finally:
+            mod._text_only_turn.reset(token)
+
+    async def test_timer_keeps_profile_scope_for_voice(self):
+        from contextvars import ContextVar
+        from contextlib import contextmanager
+        profile = ContextVar('test_profile', default='base')
+        @contextmanager
+        def scope(source):
+            token = profile.set('john')
+            try:
+                yield
+            finally:
+                profile.reset(token)
+        observed = []
+        async def send(*args, **kwargs):
+            observed.append(profile.get())
+        async def slow_model(*args):
+            await asyncio.sleep(0.04)
+        self.worker.gateway_runner = SimpleNamespace(_profile_scope_for_source=scope)
+        self.worker._ack_delay_seconds = 0.01
+        event = SimpleNamespace(source=SimpleNamespace())
+        with patch.object(mod.BasePlatformAdapter, '_process_message_background', side_effect=slow_model), \
+                patch.object(self.worker, 'send', side_effect=send):
+            await self.worker._process_message_background(event, 'test-session')
+        self.assertEqual(observed, ['john'])
+        self.assertEqual(profile.get(), 'base')
+
+    async def test_explicit_press_invalidates_final_audio_waiting_for_playback(self):
+        await self.worker._playback_lock.acquire()
+        task = asyncio.create_task(self.worker.play_tts('test-room', 'old.mp3', caption='Old answer.'))
+        await asyncio.sleep(0)
+        self.worker._interrupt_playback('owner', explicit=True)
+        self.worker._playback_lock.release()
+        with patch.object(self.worker, '_decode_audio_to_pcm') as decode:
+            await task
+            decode.assert_not_called()

@@ -114,3 +114,18 @@ class RunnerVoiceTests(IsolatedAsyncioTestCase):
         with patch.object(self.worker, "_decode_audio_to_pcm") as decode:
             await self.worker.play_tts("test-room", "unknown.wav")
             decode.assert_not_called()
+
+    async def test_push_to_talk_during_synthesis_discards_old_audio_but_next_reply_can_speak(self):
+        worker = self.worker
+        async def original(event, text):
+            worker._interrupt_playback('owner', explicit=True)
+            await worker.play_tts('test-room', 'late.mp3')
+        runner = SimpleNamespace(_send_voice_reply=original)
+        mod._install_runner_voice_preparation(runner)
+        with patch.object(worker, '_decode_audio_to_pcm') as decode:
+            await self.invoke(runner, 'Old answer.')
+            decode.assert_not_called()
+        worker.prepare_tts_text('New answer.')
+        with patch.object(worker, '_decode_audio_to_pcm', return_value=b'\0' * 1920):
+            await worker.play_tts('test-room', 'new.mp3')
+        worker._audio_source.capture_frame.assert_awaited_once()
